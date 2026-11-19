@@ -1,0 +1,14 @@
+node_modules/
+dist/
+target/
+.env
+master.key
+*.log*
+*.db*
+*.sqlite
+/accounts/
+/data/
+/.gemini/
+/unused/
+/logs/
+.DS_Store

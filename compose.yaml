@@ -1,0 +1,78 @@
+name: multi-acp-gateway
+
+services:
+  proxy:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime
+    pull_policy: missing
+    init: true
+    restart: unless-stopped
+    ports:
+      - "${GATEWAY_BIND_IP:-127.0.0.1}:${GATEWAY_PORT:-1990}:1990"
+    environment:
+      DATA_DIR: /data
+      WEB_DIR: /app/web/dist
+      BIND_ADDR: 0.0.0.0:1990
+      TRUST_PROXY: "${TRUST_PROXY:-0}"
+      RUST_LOG: "${RUST_LOG:-multi_acp_gateway=info}"
+      UPDATER_URL: http://updater:9000/
+      UPDATER_TOKEN_FILE: /control/token
+    group_add:
+      - "${GATEWAY_GID:-10001}"
+    volumes:
+      - gateway-data:/data
+      - update-control:/control:ro
+      - type: bind
+        source: ./.env
+        target: /app/.env
+        bind:
+          create_host_path: false
+    depends_on:
+      updater:
+        condition: service_healthy
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
+    stop_grace_period: 30s
+
+  updater:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: updater
+    init: true
+    restart: unless-stopped
+    environment:
+      UPDATER_PROJECT_NAME: "${COMPOSE_PROJECT_NAME:-multi-acp-gateway}"
+      UPDATER_SERVICE: proxy
+      DOCKER_CONFIG: /updates/docker
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - gateway-data:/app-data
+      - update-control:/control
+      - update-state:/updates
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    cap_drop:
+      - ALL
+    cap_add:
+      - DAC_OVERRIDE
+      - CHOWN
+      - FOWNER
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
+    stop_grace_period: 45s
+
+volumes:
+  gateway-data:
+  update-control:
+  update-state:

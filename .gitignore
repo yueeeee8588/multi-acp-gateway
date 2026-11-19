@@ -1,0 +1,12 @@
+**/target/
+**/data/
+**/node_modules/
+**/dist/
+*.log*
+*.db*
+master.key
+.env
+/.gemini/
+/unused/
+**/.gemini/
+**/unused/
