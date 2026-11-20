@@ -1,5 +1,6 @@
 pub mod acp_proxy;
 pub mod api;
+pub mod autostart;
 pub mod network;
 pub mod playground;
 pub mod profiles;
@@ -50,6 +51,7 @@ pub struct App {
     pub sticky_bindings: Mutex<HashMap<String, StickyBinding>>,
     pub cache_settling_completed: Mutex<HashMap<String, std::time::Instant>>,
     pub web_dir: std::path::PathBuf,
+    pub autostart_sync: std::sync::atomic::AtomicBool,
 }
 pub type Shared = Arc<App>;
 pub type ApiResult<T> = Result<axum::Json<T>, ApiError>;
@@ -385,5 +387,6 @@ pub fn new_app(data_dir: &std::path::Path, web_dir: std::path::PathBuf) -> Resul
         sticky_bindings: Mutex::new(initial_sticky_affinities),
         cache_settling_completed: Mutex::new(HashMap::new()),
         web_dir,
+        autostart_sync: std::sync::atomic::AtomicBool::new(false),
     }))
 }

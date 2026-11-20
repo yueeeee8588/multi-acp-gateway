@@ -280,6 +280,108 @@ async fn settings_round_trip_preserves_omitted_cache_settling_delay() {
 }
 
 #[tokio::test]
+async fn settings_round_trip_preserves_omitted_autostart_enabled() {
+    let (_dir, state) = fixture();
+    let cookie = setup(&state).await;
+    let (status, initial, _) =
+        request(&state, "GET", "/api/settings", Value::Null, &cookie, "/").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(initial["autostart_enabled"], true);
+    assert_eq!(initial["autostart_supported"], cfg!(windows));
+
+    let mut input = json!({
+        "security_path": "", "max_retries": 2, "failure_threshold": 2,
+        "cooldown_seconds": 60, "request_timeout_seconds": 120, "retention_days": 7,
+        "autostart_enabled": false,
+    });
+    let (status, saved, _) =
+        request(&state, "PUT", "/api/settings", input.clone(), &cookie, "/").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(saved["autostart_enabled"], false);
+
+    input.as_object_mut().unwrap().remove("autostart_enabled");
+    let (status, preserved, _) =
+        request(&state, "PUT", "/api/settings", input.clone(), &cookie, "/").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(preserved["autostart_enabled"], false);
+
+    input["autostart_enabled"] = json!(true);
+    let (status, reenabled, _) =
+        request(&state, "PUT", "/api/settings", input, &cookie, "/").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(reenabled["autostart_enabled"], true);
+}
+
+#[tokio::test]
+async fn settings_autostart_sync_uses_isolated_startup_dir() {
+    struct EnvGuard {
+        key: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.previous {
+                    Some(val) => std::env::set_var(self.key, val),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
+
+    let startup_temp = tempfile::tempdir().unwrap();
+    let _guard = EnvGuard {
+        key: "GATEWAY_STARTUP_DIR",
+        previous: std::env::var_os("GATEWAY_STARTUP_DIR"),
+    };
+    unsafe {
+        std::env::set_var("GATEWAY_STARTUP_DIR", startup_temp.path());
+    }
+
+    let (_dir, state) = fixture();
+    state
+        .autostart_sync
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    let cookie = setup(&state).await;
+
+    let mut input = json!({
+        "security_path": "", "max_retries": 2, "failure_threshold": 2,
+        "cooldown_seconds": 60, "request_timeout_seconds": 120, "retention_days": 7,
+        "autostart_enabled": true,
+    });
+    let (status, saved, _) =
+        request(&state, "PUT", "/api/settings", input.clone(), &cookie, "/").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(saved["autostart_enabled"], true);
+    if cfg!(windows) {
+        assert!(
+            startup_temp
+                .path()
+                .join(multi_acp_gateway::autostart::GATEWAY_8046_SCRIPT)
+                .is_file()
+        );
+    }
+
+    input["autostart_enabled"] = json!(false);
+    let (status, disabled, _) =
+        request(&state, "PUT", "/api/settings", input, &cookie, "/").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(disabled["autostart_enabled"], false);
+    assert!(
+        !startup_temp
+            .path()
+            .join(multi_acp_gateway::autostart::GATEWAY_8046_SCRIPT)
+            .exists()
+    );
+    assert!(
+        !startup_temp
+            .path()
+            .join(multi_acp_gateway::autostart::ACP_8048_SCRIPT)
+            .exists()
+    );
+}
+
+#[tokio::test]
 async fn security_entry_hides_console_and_administration() {
     let (_dir, s) = fixture();
     let c = setup(&s).await;

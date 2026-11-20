@@ -207,6 +207,8 @@ export type Settings = {
   request_timeout_seconds: number;
   cache_settling_delay_ms: number;
   retention_days: number;
+  autostart_enabled: boolean;
+  autostart_supported?: boolean;
 };
 export type Release = {
   tag: string;

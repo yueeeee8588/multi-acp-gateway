@@ -240,6 +240,10 @@ fn default_cache_settling_delay_ms() -> u32 {
     1000
 }
 
+fn default_autostart_enabled() -> bool {
+    true
+}
+
 pub(crate) const MAX_CACHE_SETTLING_DELAY_MS: u32 = 5000;
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -252,6 +256,8 @@ pub struct Settings {
     pub retention_days: u32,
     #[serde(default = "default_cache_settling_delay_ms")]
     pub cache_settling_delay_ms: u32,
+    #[serde(default = "default_autostart_enabled")]
+    pub autostart_enabled: bool,
     #[serde(default = "default_armor_mode")]
     pub armor_mode: String,
     #[serde(default)]
@@ -273,6 +279,7 @@ impl Default for Settings {
             request_timeout_seconds: 120,
             retention_days: 7,
             cache_settling_delay_ms: default_cache_settling_delay_ms(),
+            autostart_enabled: default_autostart_enabled(),
             armor_mode: "standard".into(),
             global_prompt: String::new(),
             custom_template_prompts: BTreeMap::new(),

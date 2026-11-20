@@ -7,6 +7,7 @@ import {
   KeyRound,
   LockKeyhole,
   PlugZap,
+  Power,
   Route,
   Save,
   ShieldCheck,
@@ -29,6 +30,7 @@ function settingsWithDefaults(settings: Settings): Settings {
   return {
     ...settings,
     cache_settling_delay_ms: settings.cache_settling_delay_ms ?? 1000,
+    autostart_enabled: settings.autostart_enabled ?? true,
   };
 }
 
@@ -422,6 +424,41 @@ export function SettingsPage({
                     <span>ms</span>
                   </span>
                 </Field>
+              </div>
+            </div>
+          </section>
+          <section className="settings-section">
+            <div className="settings-section-heading">
+              <span className="settings-icon">
+                <Power size={20} />
+              </span>
+              <div>
+                <h2>开机自启动</h2>
+                <p>登录系统时自动后台启动网关与 ACP 后端</p>
+              </div>
+              <Badge
+                variant={form.autostart_enabled ? "green" : "neutral"}
+                dot
+              >
+                {form.autostart_enabled ? "已开启" : "未开启"}
+              </Badge>
+            </div>
+            <div className="settings-section-body">
+              <div className="setting-toggle-row">
+                <span>
+                  <strong>启用开机自启动</strong>
+                  <small>
+                    默认开启；保存后将联动管理 8046 网关与 8048 ACP 后端的 Windows 启动脚本
+                    {form.autostart_supported === false
+                      ? "（当前为非 Windows 环境，仅保存配置）"
+                      : ""}
+                  </small>
+                </span>
+                <Toggle
+                  label=""
+                  checked={form.autostart_enabled}
+                  onChange={(enabled) => update("autostart_enabled", enabled)}
+                />
               </div>
             </div>
           </section>

@@ -1053,6 +1053,8 @@ fn settings_public(settings: &Settings, site_key: &str, turnstile_enabled: bool)
         "request_timeout_seconds": settings.request_timeout_seconds,
         "retention_days": settings.retention_days,
         "cache_settling_delay_ms": settings.cache_settling_delay_ms,
+        "autostart_enabled": settings.autostart_enabled,
+        "autostart_supported": crate::autostart::is_supported(),
     })
 }
 
@@ -1070,6 +1072,8 @@ pub struct SettingsInput {
     pub retention_days: u32,
     #[serde(default)]
     pub cache_settling_delay_ms: Option<u32>,
+    #[serde(default)]
+    pub autostart_enabled: Option<bool>,
 }
 pub async fn save_settings(
     State(s): State<Shared>,
@@ -1154,10 +1158,22 @@ pub async fn save_settings(
         s.save_turnstile_keys(&site_key, &secret_key)
             .map_err(|error| ApiError(StatusCode::INTERNAL_SERVER_ERROR, error))?;
     }
+    let next_autostart = input
+        .autostart_enabled
+        .unwrap_or(existing_settings.autostart_enabled);
+    if input.autostart_enabled.is_some()
+        && s.autostart_sync.load(std::sync::atomic::Ordering::Relaxed)
+    {
+        crate::autostart::apply(next_autostart)
+            .map_err(|error| ApiError(StatusCode::INTERNAL_SERVER_ERROR, error))?;
+    }
     let settings = s.store.update(|c| {
         settings.cache_settling_delay_ms = input
             .cache_settling_delay_ms
             .unwrap_or(c.settings.cache_settling_delay_ms);
+        settings.autostart_enabled = input
+            .autostart_enabled
+            .unwrap_or(c.settings.autostart_enabled);
         c.settings = settings.clone();
         Ok(settings)
     })?;
