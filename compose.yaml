@@ -19,6 +19,8 @@ services:
       RUST_LOG: "${RUST_LOG:-multi_acp_gateway=info}"
       UPDATER_URL: http://updater:9000/
       UPDATER_TOKEN_FILE: /control/token
+      UPDATER_REPO: "${UPDATER_REPO:-yueeeee8588/multi-acp-gateway}"
+      GITHUB_TOKEN: "${GITHUB_TOKEN:-}"
     group_add:
       - "${GATEWAY_GID:-10001}"
     volumes:
@@ -53,6 +55,8 @@ services:
       UPDATER_PROJECT_NAME: "${COMPOSE_PROJECT_NAME:-multi-acp-gateway}"
       UPDATER_SERVICE: proxy
       DOCKER_CONFIG: /updates/docker
+      UPDATER_REPO: "${UPDATER_REPO:-yueeeee8588/multi-acp-gateway}"
+      GITHUB_TOKEN: "${GITHUB_TOKEN:-}"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - gateway-data:/app-data

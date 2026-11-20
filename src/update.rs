@@ -20,7 +20,7 @@ use tokio::{
     sync::Mutex,
 };
 
-const DEFAULT_REPO: &str = "your-org/multi-acp-gateway";
+const DEFAULT_REPO: &str = "yueeeee8588/multi-acp-gateway";
 fn repository_slug() -> String {
     std::env::var("UPDATER_REPO")
         .ok()
@@ -1423,7 +1423,7 @@ mod tests {
                     }
                     Json(json!({
                         "tag_name": "v999.0.0", "draft": false, "prerelease": false,
-                        "html_url": "https://github.com/your-org/multi-acp-gateway/releases/tag/v999.0.0"
+                        "html_url": "https://github.com/yueeeee8588/multi-acp-gateway/releases/tag/v999.0.0"
                     })).into_response()
                 }
             }),
@@ -1884,12 +1884,12 @@ mod tests {
     }
     #[test]
     fn rejects_nonofficial_and_prerelease_metadata() {
-        let mut release = json!({"tag_name":"v1.2.3","draft":false,"prerelease":false,"html_url":"https://github.com/your-org/multi-acp-gateway/releases/tag/v1.2.3","body":"notes"});
+        let mut release = json!({"tag_name":"v1.2.3","draft":false,"prerelease":false,"html_url":"https://github.com/yueeeee8588/multi-acp-gateway/releases/tag/v1.2.3","body":"notes"});
         let parsed = parse_release(&release).unwrap();
         assert_eq!(parsed.version, "1.2.3");
         assert_eq!(
             parsed.url,
-            "https://github.com/your-org/multi-acp-gateway/releases/tag/v1.2.3"
+            "https://github.com/yueeeee8588/multi-acp-gateway/releases/tag/v1.2.3"
         );
         release["draft"] = json!(true);
         assert!(parse_release(&release).is_err());
@@ -1901,10 +1901,10 @@ mod tests {
             "https://evil.invalid/",
             "https://github.com/other/multi-acp-gateway/releases/tag/v1.2.3",
             "https://github.com/other/other-repo/releases/tag/v1.2.3",
-            "https://github.com/your-org/multi-acp-gateway/releases/tag/v1.2.4",
-            "https://github.com/your-org/multi-acp-gateway/releases/tag/v1.2.3?download=1",
-            "https://github.com/your-org/multi-acp-gateway/releases/tag/v1.2.3#fragment",
-            "https://github.com.evil.invalid/your-org/multi-acp-gateway/releases/tag/v1.2.3",
+            "https://github.com/yueeeee8588/multi-acp-gateway/releases/tag/v1.2.4",
+            "https://github.com/yueeeee8588/multi-acp-gateway/releases/tag/v1.2.3?download=1",
+            "https://github.com/yueeeee8588/multi-acp-gateway/releases/tag/v1.2.3#fragment",
+            "https://github.com.evil.invalid/yueeeee8588/multi-acp-gateway/releases/tag/v1.2.3",
         ] {
             release["html_url"] = json!(url);
             assert!(parse_release(&release).is_err(), "{url}");

@@ -39,3 +39,9 @@
 | `WEB_DIR` | `web/dist` | 前端构建产物目录 |
 | `ACP_UPSTREAM_BASE` | `http://127.0.0.1:8048` | ACP 伴生服务地址 |
 | `RUST_LOG` | `multi_acp_gateway=info` | 日志级别过滤 |
+
+## GitHub 源码在线更新
+
+- **本地直跑模式**：可在控制台「系统更新」页点击「检查更新」，直接从 GitHub 拉取最新正式版（`releases/latest`）与更新日志。
+- **Docker Compose 模式**：执行 `docker compose up -d` 会自动启用 `updater` 伴生服务（`gateway-sync`），在控制台「系统更新」页验证管理员密码后，即可一键完成「获取源码 → 构建镜像 → 部署版本 → 健康验证（失败自动回滚）」。
+- **切换更新源与令牌**：如果 Fork 了本仓库，可在 `.env` 中通过 `UPDATER_REPO=owner/repo` 切换更新源；如需避免 GitHub API 未认证请求触发速率限制，也可在 `.env` 中补充 `GITHUB_TOKEN`。

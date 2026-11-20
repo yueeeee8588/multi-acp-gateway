@@ -306,7 +306,10 @@ export function SystemUpdates({
         {status && !status.configured && (
           <div className="update-notice">
             <AlertTriangle size={16} />
-            <span>此部署尚未启用更新服务</span>
+            <span>
+              当前为本地直跑模式，未启用 Docker 自动更新服务（仍可点击「检查更新」查看
+              GitHub 最新正式版；如需一键热更新，请使用 Docker Compose 部署）
+            </span>
           </div>
         )}
         <ErrorBox message={error || status?.error || ""} />
