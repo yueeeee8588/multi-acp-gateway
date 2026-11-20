@@ -62,6 +62,15 @@ function mergeRequestAttemptList(
   return next;
 }
 
+export interface AcpRefreshResult {
+  ok: boolean;
+  error?: string;
+}
+
+export interface AcpRefreshOptions {
+  onComplete?: (result: AcpRefreshResult) => void;
+}
+
 export interface AcpGatewayState {
   accounts: AccountRecord[];
   exits: ExitGroup[];
@@ -71,7 +80,7 @@ export interface AcpGatewayState {
   sseConnected: boolean;
   loading: boolean;
   error: string | null;
-  refreshAll: () => Promise<void>;
+  refreshAll: (options?: AcpRefreshOptions) => Promise<void>;
 }
 
 export function useAcpGateway(enabled: boolean): AcpGatewayState {
@@ -92,7 +101,7 @@ export function useAcpGateway(enabled: boolean): AcpGatewayState {
     };
   }, []);
 
-  const refreshAll = useCallback(async () => {
+  const refreshAll = useCallback(async (options?: AcpRefreshOptions) => {
     setLoading(true);
     setError(null);
     const results = await Promise.allSettled([
@@ -120,12 +129,16 @@ export function useAcpGateway(enabled: boolean): AcpGatewayState {
     );
     if (firstRejected) {
       const reason = firstRejected.reason;
-      setError(
-        reason instanceof Error ? reason.message : 'ACP 网关数据加载失败'
-      );
+      const errMsg =
+        reason instanceof Error ? reason.message : 'ACP 网关数据加载失败';
+      setError(errMsg);
+      setLoading(false);
+      options?.onComplete?.({ ok: false, error: errMsg });
+      return;
     }
 
     setLoading(false);
+    options?.onComplete?.({ ok: true });
   }, []);
 
   useEffect(() => {

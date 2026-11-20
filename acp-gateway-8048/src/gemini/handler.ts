@@ -312,26 +312,36 @@ export async function refreshModelCatalogOnce(fetcher: ModelsFetcher = modelsFet
   }
 }
 
+export function isForceRefresh(url: URL): boolean {
+  const val = url.searchParams.get('refresh')?.trim().toLowerCase();
+  return val === '1' || val === 'true';
+}
+
 /** Refresh the cached catalog off the request path; single-flight per process. */
-function refreshModelsInBackground(): void {
-  if (modelsRefreshInFlight) return;
-  modelsRefreshInFlight = refreshModelCatalogOnce().finally(() => {
-    modelsRefreshInFlight = null;
-  });
+function refreshModelsInBackground(): Promise<void> {
+  if (!modelsRefreshInFlight) {
+    modelsRefreshInFlight = refreshModelCatalogOnce().finally(() => {
+      modelsRefreshInFlight = null;
+    });
+  }
+  return modelsRefreshInFlight;
 }
 
 /**
- * Return the model catalog immediately. Discovery must never sit on the
- * request path: when the cache is stale (or forceRefresh is set) a background
- * refresh is kicked off and the current/static list is returned right away.
- * That keeps GET /v1beta/models responsive even if agy.exe hangs or the Bun
- * runtime panics mid-spawn.
+ * Return the model catalog.
+ * - When `forceRefresh` is false (default), discovery never sits on the request
+ *   path: when the cache is stale a background refresh is kicked off and the
+ *   current/static list is returned right away.
+ * - When `forceRefresh` is true (e.g. `?refresh=1`), waits for the single-flight
+ *   discovery (bounded by MODEL_DISCOVERY_TIMEOUT_MS) before returning.
  */
 export async function discoverAgyModels(forceRefresh = false): Promise<ReturnType<typeof buildModelEntry>[]> {
   const now = Date.now();
   const isFresh = cachedModels !== null && now - cachedModelsAt < MODEL_DISCOVERY_TTL_MS;
-  if (forceRefresh || !isFresh) {
-    refreshModelsInBackground();
+  if (forceRefresh) {
+    await refreshModelsInBackground();
+  } else if (!isFresh) {
+    void refreshModelsInBackground();
   }
   const base = cachedModels ?? SUPPORTED_GEMINI_MODELS;
   const limitsMap = getModelLimitsMap();
@@ -629,7 +639,7 @@ export function createGeminiHandler(deps: GeminiHandlerDeps = {}) {
 
     // GET /v1beta/models
     if (req.method === 'GET' && (url.pathname === '/v1beta/models' || url.pathname === '/v1beta/models/')) {
-      return Response.json({ models: await discoverAgyModels() });
+      return Response.json({ models: await discoverAgyModels(isForceRefresh(url)) });
     }
 
     // GET /v1beta/models/{model}

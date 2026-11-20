@@ -29,6 +29,7 @@ import { createOpenAiHandler } from './openai/handler';
 import {
   createGeminiHandler,
   discoverAgyModels,
+  isForceRefresh,
   type GeminiHandlerDeps,
   type ModelLimitEntry,
   type ModelLimitsMap,
@@ -589,7 +590,7 @@ export function createApp(options: AppOptions = {}) {
 
       // The 8046 console proxies this read-only catalog after console authentication.
       if (req.method === 'GET' && url.pathname === '/api/models/catalog') {
-        return Response.json({ models: await discoverAgyModels() });
+        return Response.json({ models: await discoverAgyModels(isForceRefresh(url)) });
       }
 
       // GET /api/models/limits

@@ -496,8 +496,13 @@ export function updateModelLimits(
   });
 }
 
-export async function fetchAcpModelCatalog(): Promise<GeminiModelItem[]> {
-  const res = await requestJson<GeminiModelsResponse>('/api/models/catalog');
+export async function fetchAcpModelCatalog(options?: {
+  refresh?: boolean;
+}): Promise<GeminiModelItem[]> {
+  const path = options?.refresh
+    ? '/api/models/catalog?refresh=1'
+    : '/api/models/catalog';
+  const res = await requestJson<GeminiModelsResponse>(path);
   return Array.isArray(res.models) ? res.models : [];
 }
 

@@ -45,6 +45,18 @@ export function AcpConsolePage({
     [notify],
   );
 
+  const handleRefresh = useCallback(() => {
+    void acp.refreshAll({
+      onComplete: ({ ok, error }) => {
+        if (ok) {
+          acpNotify("已刷新账号、风控、日志与配置", "success");
+        } else {
+          acpNotify(error || "ACP 控制台刷新失败", "error");
+        }
+      },
+    });
+  }, [acp.refreshAll, acpNotify]);
+
   return (
     <div className="acp-console-page">
       <div className="page-heading acp-console-heading">
@@ -76,7 +88,7 @@ export function AcpConsolePage({
             </Badge>
             <Button
               type="button"
-              onClick={() => void acp.refreshAll()}
+              onClick={handleRefresh}
               disabled={acp.loading}
             >
               <RefreshCw size={15} className={acp.loading ? "spin" : ""} />

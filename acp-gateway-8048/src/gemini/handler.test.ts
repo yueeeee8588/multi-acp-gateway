@@ -8,6 +8,7 @@ import {
   applyGenerationConfigGuardrails,
   createGeminiHandler,
   discoverAgyModels,
+  isForceRefresh,
   parseAgyModelsOutput,
   refreshModelCatalogOnce,
   resetModelCatalogCacheForTest,
@@ -1236,16 +1237,82 @@ describe('agy models dynamic catalog replacement', () => {
     }
   });
 
-  it('keeps discoverAgyModels non-blocking when upstream fetcher hangs', async () => {
+  it('keeps discoverAgyModels(false) non-blocking when upstream fetcher hangs', async () => {
     resetModelCatalogCacheForTest();
     try {
       setModelsFetcherForTest(() => new Promise<string[]>(() => {}));
       const started = Date.now();
-      const models = await discoverAgyModels(true);
+      const models = await discoverAgyModels(false);
       const elapsedMs = Date.now() - started;
 
       expect(elapsedMs).toBeLessThan(200);
       expect(models.length).toBe(SUPPORTED_GEMINI_MODELS.length);
+    } finally {
+      setModelsFetcherForTest(null);
+      resetModelCatalogCacheForTest();
+    }
+  });
+
+  it('parses refresh=1 and refresh=true in isForceRefresh', () => {
+    expect(isForceRefresh(new URL('http://localhost/api/models/catalog?refresh=1'))).toBe(true);
+    expect(isForceRefresh(new URL('http://localhost/api/models/catalog?refresh=true'))).toBe(true);
+    expect(isForceRefresh(new URL('http://localhost/api/models/catalog?refresh=TRUE'))).toBe(true);
+    expect(isForceRefresh(new URL('http://localhost/api/models/catalog?refresh=0'))).toBe(false);
+    expect(isForceRefresh(new URL('http://localhost/api/models/catalog?refresh=false'))).toBe(false);
+    expect(isForceRefresh(new URL('http://localhost/api/models/catalog'))).toBe(false);
+  });
+
+  it('awaits single-flight discovery when discoverAgyModels(true) is called and supports ?refresh=1 endpoints', async () => {
+    resetModelCatalogCacheForTest();
+    let fetchCalls = 0;
+    try {
+      // Seed stale/initial cache first
+      await refreshModelCatalogOnce(async () => ['gemini-4-argon-low']);
+      expect((await discoverAgyModels()).map((m) => m.name)).toEqual(['models/gemini-4-argon-low']);
+
+      // Subsequent force refresh awaits the new fetcher and deduplicates concurrent callers
+      setModelsFetcherForTest(async () => {
+        fetchCalls += 1;
+        await Bun.sleep(25);
+        return ['gemini-4-hydrogen-medium', 'gemini-4-neon-high'];
+      });
+
+      const [first, second] = await Promise.all([
+        discoverAgyModels(true),
+        discoverAgyModels(true),
+      ]);
+      expect(fetchCalls).toBe(1);
+      expect(first.map((m) => m.name)).toEqual([
+        'models/gemini-4-hydrogen-medium',
+        'models/gemini-4-neon-high',
+        'models/gemini-4-neon',
+      ]);
+      expect(second.map((m) => m.name)).toEqual(first.map((m) => m.name));
+
+      // Verify HTTP routes pass ?refresh=1 through to discoverAgyModels(true)
+      const app = createApp();
+      setModelsFetcherForTest(async () => {
+        fetchCalls += 1;
+        await Bun.sleep(15);
+        return ['gemini-3.8-flash-high'];
+      });
+
+      const catalogRes = await app.fetch(new Request('http://localhost:8048/api/models/catalog?refresh=1'));
+      expect(catalogRes.status).toBe(200);
+      const catalogJson = await catalogRes.json() as { models: Array<{ name: string }> };
+      expect(catalogJson.models.map((m) => m.name)).toEqual(['models/gemini-3.8-flash-high']);
+      expect(fetchCalls).toBe(2);
+
+      setModelsFetcherForTest(async () => {
+        fetchCalls += 1;
+        await Bun.sleep(15);
+        return ['gemini-4-argon-high'];
+      });
+      const v1betaRes = await app.fetch(new Request('http://localhost:8048/v1beta/models?refresh=true'));
+      expect(v1betaRes.status).toBe(200);
+      const v1betaJson = await v1betaRes.json() as { models: Array<{ name: string }> };
+      expect(v1betaJson.models.map((m) => m.name)).toEqual(['models/gemini-4-argon-high']);
+      expect(fetchCalls).toBe(3);
     } finally {
       setModelsFetcherForTest(null);
       resetModelCatalogCacheForTest();

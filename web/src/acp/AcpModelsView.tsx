@@ -104,22 +104,33 @@ export function AcpModelsView({
     [notify]
   );
 
-  const loadModels = useCallback(async (): Promise<GeminiModelItem[] | null> => {
-    setLoading(true);
-    setErrorMsg("");
-    try {
-      const list = await fetchAcpModelCatalog();
-      setModels(list);
-      return list;
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : "加载模型目录失败";
-      setErrorMsg(msg);
-      notify(msg, "error");
-      return null;
-    } finally {
-      setLoading(false);
-    }
-  }, [notify]);
+  const loadModels = useCallback(
+    async (options?: {
+      forceRefresh?: boolean;
+      notifyOnSuccess?: boolean;
+    }): Promise<GeminiModelItem[] | null> => {
+      setLoading(true);
+      setErrorMsg("");
+      try {
+        const list = await fetchAcpModelCatalog({
+          refresh: options?.forceRefresh,
+        });
+        setModels(list);
+        if (options?.notifyOnSuccess) {
+          notify(`已刷新模型目录，共 ${list.length} 个模型`, "success");
+        }
+        return list;
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : "加载模型目录失败";
+        setErrorMsg(msg);
+        notify(msg, "error");
+        return null;
+      } finally {
+        setLoading(false);
+      }
+    },
+    [notify]
+  );
 
   useEffect(() => {
     void loadModels();
@@ -252,10 +263,12 @@ export function AcpModelsView({
           <p>查看 ACP Worker 支持的 Gemini 原生模型目录，支持筛选与 Token 上限覆盖配置</p>
         </div>
         <Button
-          onClick={() => void loadModels()}
+          onClick={() =>
+            void loadModels({ forceRefresh: true, notifyOnSuccess: true })
+          }
           busy={loading}
         >
-          <RefreshCw size={15} className={loading ? "spin" : undefined} />
+          {!loading && <RefreshCw size={15} />}
           刷新目录
         </Button>
       </div>
@@ -263,7 +276,12 @@ export function AcpModelsView({
       {errorMsg && (
         <div className="inline-error">
           <ErrorBox message={errorMsg} />
-          <Button onClick={() => void loadModels()} busy={loading}>
+          <Button
+            onClick={() =>
+              void loadModels({ forceRefresh: true, notifyOnSuccess: true })
+            }
+            busy={loading}
+          >
             重试
           </Button>
         </div>
