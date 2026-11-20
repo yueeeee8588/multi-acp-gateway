@@ -18,6 +18,7 @@ import {
   Select,
 } from "../components";
 import type { Notice } from "../components";
+import { useMinSpin } from "../useMinSpin";
 import { fetchAcpModelCatalog, updateModelLimits } from "./api";
 import type { GeminiModelItem } from "./types";
 
@@ -90,6 +91,8 @@ export function AcpModelsView({
 }: AcpModelsViewProps) {
   const [models, setModels] = useState<GeminiModelItem[]>([]);
   const [loading, setLoading] = useState(false);
+  const [manualRefreshing, setManualRefreshing] = useState(false);
+  const refreshSpinning = useMinSpin(manualRefreshing);
   const [errorMsg, setErrorMsg] = useState("");
   const [searchQuery, setSearchQuery] = useState("");
   const [selectedMethod, setSelectedMethod] = useState<string>("all");
@@ -108,8 +111,10 @@ export function AcpModelsView({
     async (options?: {
       forceRefresh?: boolean;
       notifyOnSuccess?: boolean;
+      manual?: boolean;
     }): Promise<GeminiModelItem[] | null> => {
       setLoading(true);
+      if (options?.manual) setManualRefreshing(true);
       setErrorMsg("");
       try {
         const list = await fetchAcpModelCatalog({
@@ -127,6 +132,7 @@ export function AcpModelsView({
         return null;
       } finally {
         setLoading(false);
+        if (options?.manual) setManualRefreshing(false);
       }
     },
     [notify]
@@ -264,11 +270,11 @@ export function AcpModelsView({
         </div>
         <Button
           onClick={() =>
-            void loadModels({ forceRefresh: true, notifyOnSuccess: true })
+            void loadModels({ forceRefresh: true, notifyOnSuccess: true, manual: true })
           }
-          busy={loading}
+          disabled={loading}
         >
-          {!loading && <RefreshCw size={15} />}
+          <RefreshCw size={15} className={refreshSpinning ? "spin" : undefined} />
           刷新目录
         </Button>
       </div>
@@ -278,10 +284,11 @@ export function AcpModelsView({
           <ErrorBox message={errorMsg} />
           <Button
             onClick={() =>
-              void loadModels({ forceRefresh: true, notifyOnSuccess: true })
+              void loadModels({ forceRefresh: true, notifyOnSuccess: true, manual: true })
             }
-            busy={loading}
+            disabled={loading}
           >
+            <RefreshCw size={15} className={refreshSpinning ? "spin" : undefined} />
             重试
           </Button>
         </div>

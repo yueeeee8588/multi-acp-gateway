@@ -5,6 +5,7 @@ import { AlertCircle, Check, ChevronDown, KeyRound, Link, LoaderCircle, Plus, Re
 import { api, errorMessage, time } from "./api";
 import type { AccountProviderBinding, ProviderAccountKey, ProviderAccountKeys, ProviderBinding, ProviderKeyCreated, ProviderKeyGroup, ProviderKeyGroups, ProviderSummary } from "./api";
 import { Badge, Button, ErrorBox, Modal } from "./components";
+import { useMinSpin } from "./useMinSpin";
 import "./account-import.css";
 
 export type ProviderAccountSelection = { binding: ProviderBinding; endpoint: string; accountName: string; replaceFields: boolean };
@@ -224,6 +225,8 @@ export function ProviderAccountImport({ accountId, savedBinding, initialBinding,
   const [creatingFor, setCreatingFor] = useState<ProviderSummary | null>(null);
   const [createdNotice, setCreatedNotice] = useState("");
   const pendingCreatedKey = useRef<CreatedKeySelection | null>(null);
+  const providerSpin = useMinSpin(providerLoading);
+  const keysSpin = useMinSpin(keysLoading || bindingLoading);
   const selectedProvider = providers.find((provider) => provider.id === providerId);
   const providerUnavailable = selectedProvider?.status === "not_authenticated";
   const selectedKey = keyData?.keys.find((key) => key.id === keyId);
@@ -328,14 +331,14 @@ export function ProviderAccountImport({ accountId, savedBinding, initialBinding,
     : "";
   return <section className="account-provider-import" aria-label="服务提供商账号来源">
     <div className="account-import-field">
-      <div className="account-import-heading"><span>选择服务提供商</span><Button type="button" className="small-button" disabled={disabled || keysLoading || bindingLoading || Boolean(creatingFor)} busy={providerLoading} onClick={refreshProviders}>{!providerLoading && <RefreshCw size={14} />}刷新站点</Button></div>
+      <div className="account-import-heading"><span>选择服务提供商</span><Button type="button" className="small-button" disabled={disabled || providerLoading || keysLoading || bindingLoading || Boolean(creatingFor)} onClick={refreshProviders}><RefreshCw size={14} className={providerSpin ? "spin" : undefined} />刷新站点</Button></div>
       <ImportPicker kind="provider" options={providers.map((provider) => ({ id: provider.id, name: provider.name, detail: provider.status === "not_authenticated" ? `${provider.base_url} · 未登录，暂不可导入` : provider.base_url, badge: provider.official ? `官方 · ${provider.status === "connected" ? "已连接" : provider.status === "error" ? "同步失败" : provider.status === "unverified" ? "待同步" : "未登录"}` : provider.kind === "sub2api" ? "Sub2API" : "New API", available: provider.status !== "not_authenticated" }))} value={providerId} label="选择服务提供商" placeholder={providerId ? "原服务提供商不可用" : "选择服务提供商"} detail="选择已添加的站点" loading={providerLoading} disabled={disabled || keysLoading || bindingLoading || Boolean(creatingFor)} onChange={chooseProvider} />
       <ErrorBox message={providerError} />
       {!providerLoading && !providerError && !providers.length && <p className="account-import-note"><AlertCircle size={16} />请先在“服务提供商”中添加站点，然后刷新列表。</p>}
       {!providerLoading && !providerError && providerId && !selectedProvider && <p className="account-import-note is-error"><AlertCircle size={16} />原服务提供商已删除，请重新选择。</p>}
     </div>
     <div className="account-import-field">
-      <div className="account-import-heading"><span>选择 API 密钥</span><Button type="button" className="small-button" disabled={disabled || providerLoading || !providerId || providerUnavailable || Boolean(creatingFor)} busy={keysLoading || bindingLoading} onClick={refreshKeys}>{!keysLoading && !bindingLoading && <RefreshCw size={14} />}刷新密钥</Button></div>
+      <div className="account-import-heading"><span>选择 API 密钥</span><Button type="button" className="small-button" disabled={disabled || providerLoading || keysLoading || bindingLoading || !providerId || providerUnavailable || Boolean(creatingFor)} onClick={refreshKeys}><RefreshCw size={14} className={keysSpin ? "spin" : undefined} />刷新密钥</Button></div>
       <ImportPicker kind="key" options={(keyData?.keys || []).map((key) => ({ id: key.id, name: key.name || "未命名密钥", detail: `${key.group_name || "站点未返回分组"} · 倍率 ${key.group_multiplier == null ? "—" : `${key.group_multiplier}×`}`, badge: keyStatus(key), available: key.available }))} value={keyId} label="选择 API 密钥" placeholder={keyId ? "原绑定密钥不可用" : "选择 API 密钥"} detail={providerId ? "选择用于此账号的上游密钥" : "请先选择服务提供商"} loading={keysLoading || bindingLoading} disabled={disabled || providerLoading || !selectedProvider || providerUnavailable || Boolean(providerError) || Boolean(creatingFor)} onChange={chooseKey} onCreate={keyData && !keysError ? openCreateKey : undefined} />
       {createdNotice && <p className="account-import-note account-key-created" role="status"><Check size={16} />{createdNotice}</p>}
       <ErrorBox message={keysError || (savedSelection ? bindingError : "")} />

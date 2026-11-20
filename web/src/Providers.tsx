@@ -5,6 +5,7 @@ import { api, errorMessage, time } from "./api";
 import type { ProviderAuthRequirements } from "./api";
 import { Badge, Button, Confirm, Empty, ErrorBox, Field, IconButton, Modal, ModalForm, SearchInput } from "./components";
 import type { Notice } from "./components";
+import { useMinSpin } from "./useMinSpin";
 import "./providers.css";
 
 type ProviderKind = "sub2api" | "newapi";
@@ -336,6 +337,7 @@ function ProviderForm({ provider, onClose, onSaved, notify }: { provider?: Provi
 }
 
 function ProviderCard({ provider, busy, onRefresh, onEdit, onDelete }: { provider: Provider; busy: boolean; onRefresh: () => void; onEdit: () => void; onDelete: () => void }) {
+  const refreshSpin = useMinSpin(busy);
   const awaitingLogin = Boolean(provider.official && !hasCredentials(provider));
   const multiplier = provider.price_multiplier ?? 1;
   const metrics = [
@@ -354,7 +356,7 @@ function ProviderCard({ provider, busy, onRefresh, onEdit, onDelete }: { provide
     {(provider.notes || provider.total_usage != null) && <div className="provider-card-details">{provider.notes && <p title={provider.notes}>{provider.notes}</p>}{provider.total_usage != null && <span>累计消费 <strong>{money(provider.total_usage)}</strong></span>}</div>}
     {awaitingLogin && <div className="provider-login-state" role="status"><span><KeyRound size={19} /></span><div><strong>尚未登录，统计暂不可用</strong><p>配置站点登录凭据后，即可读取余额与用量。</p><p><Button className="small-button" onClick={onEdit} disabled={busy}><KeyRound size={14} />配置登录</Button></p></div></div>}
     {provider.status === "error" && !awaitingLogin && <div className="provider-sync-error" role="status"><AlertCircle size={15} /><span>{provider.last_error || "同步失败，请检查站点和登录凭据后重试。"}{provider.last_synced_at ? " · 当前保留上次成功获取的数据" : ""}</span></div>}
-    <div className={`provider-card-footer${awaitingLogin ? " is-official" : ""}`}><span>{awaitingLogin ? <><ShieldCheck size={13} />官方预置 · 固定置顶</> : busy ? <><LoaderCircle size={13} className="spin" />正在同步站点…</> : <><span className={`provider-sync-dot ${provider.status}`} />{provider.last_synced_at ? `更新于 ${time(provider.last_synced_at)}` : "尚未获取统计数据"}</>}</span><div><a className="provider-visit" href={provider.base_url} target="_blank" rel="noopener noreferrer">登录站点<ArrowUpRight size={14} /></a>{!awaitingLogin && <Button className="small-button" busy={busy} onClick={onRefresh}>{!busy && <RefreshCw size={13} />}刷新</Button>}</div></div>
+    <div className={`provider-card-footer${awaitingLogin ? " is-official" : ""}`}><span>{awaitingLogin ? <><ShieldCheck size={13} />官方预置 · 固定置顶</> : busy ? <><LoaderCircle size={13} className="spin" />正在同步站点…</> : <><span className={`provider-sync-dot ${provider.status}`} />{provider.last_synced_at ? `更新于 ${time(provider.last_synced_at)}` : "尚未获取统计数据"}</>}</span><div><a className="provider-visit" href={provider.base_url} target="_blank" rel="noopener noreferrer">登录站点<ArrowUpRight size={14} /></a>{!awaitingLogin && <Button className="small-button" disabled={busy} onClick={onRefresh}><RefreshCw size={13} className={refreshSpin ? "spin" : undefined} />刷新</Button>}</div></div>
   </article>;
 }
 
@@ -407,11 +409,13 @@ export function ProvidersPage({ revision = 0, notify, onLoadingChange }: { revis
     try { for (const provider of refreshable) if (await refresh(provider, true)) success += 1; await reload(); notify(success === refreshable.length ? "已配置的服务提供商已同步" : `已同步 ${success} / ${refreshable.length} 个服务提供商，失败站点保留上次数据`, success !== refreshable.length); }
     finally { setRefreshingAll(false); }
   }
+  const refreshAllSpin = useMinSpin(refreshingAll);
+  const reloadSpin = useMinSpin(loading);
   return <>
     <div className="page-heading provider-page-heading"><div><div className="eyebrow">PROVIDER MANAGEMENT</div><h1>服务提供商<span className="title-count">{providers.length}</span></h1></div><Button className="primary" onClick={() => setEditing("new")}><Plus size={17} />添加服务提供商</Button></div>
     <div className="list-summary provider-overview"><div><span className="summary-icon"><Server size={19} /></span><span>服务提供商<strong>{providers.length}</strong></span></div><div><span className="summary-icon"><ShieldCheck size={19} /></span><span>已连接<strong>{providers.filter((provider) => provider.status === "connected").length}<small> / {providers.length}</small></strong></span></div><div className="provider-balance-summary"><span className="summary-icon"><Wallet size={19} /></span><span>余额总计<strong>{money(totalBalance, "CNY")}</strong></span></div></div>
-    <div className="provider-list-toolbar"><SearchInput value={search} onChange={setSearch} placeholder="搜索站点名称、地址或备注…" /><div className="provider-toolbar-options"><ProviderPlatformFilter value={filter} onChange={setFilter} /><Button onClick={() => void refreshAll()} busy={refreshingAll} disabled={loading || refreshable.length === 0 || refreshing.length > 0}>{!refreshingAll && <RefreshCw size={15} />}全部刷新</Button></div></div>
-    {error && <div className="provider-load-error"><ErrorBox message={error} /><Button className="small-button" onClick={() => void reload()} busy={loading}>重新加载</Button></div>}
+    <div className="provider-list-toolbar"><SearchInput value={search} onChange={setSearch} placeholder="搜索站点名称、地址或备注…" /><div className="provider-toolbar-options"><ProviderPlatformFilter value={filter} onChange={setFilter} /><Button onClick={() => void refreshAll()} disabled={refreshingAll || loading || refreshable.length === 0 || refreshing.length > 0}><RefreshCw size={15} className={refreshAllSpin ? "spin" : undefined} />全部刷新</Button></div></div>
+    {error && <div className="provider-load-error"><ErrorBox message={error} /><Button className="small-button" onClick={() => void reload()} disabled={loading}><RefreshCw size={14} className={reloadSpin ? "spin" : undefined} />重新加载</Button></div>}
     {loading && providers.length === 0 ? <div className="provider-loading" role="status"><LoaderCircle size={22} className="spin" /><span>正在加载服务提供商…</span></div> : filtered.length ? <div className="provider-list" aria-busy={loading || refreshingAll}>{filtered.map((provider) => <ProviderCard key={provider.id} provider={provider} busy={refreshing.includes(provider.id)} onRefresh={() => void refreshOne(provider)} onEdit={() => setEditing(provider)} onDelete={() => setDeleting(provider)} />)}</div> : !error && <section className="data-section provider-empty"><Empty title={search || filter !== "all" ? "没有匹配的服务提供商" : "连接你的第一个服务提供商"} detail={search || filter !== "all" ? "试试其他关键词，或切换到全部平台。" : "支持 Sub2API 和 New API，登录后即可集中查看余额与消费。"} action={search || filter !== "all" ? <Button onClick={() => { setSearch(""); setFilter("all"); }}>清除筛选</Button> : <Button className="primary" onClick={() => setEditing("new")}><Plus size={16} />添加服务提供商</Button>} /></section>}
     {providers.length > 0 && <div className="provider-list-caption"><span>共 {providers.length} 个服务提供商{filtered.length !== providers.length ? ` · 显示 ${filtered.length} 个` : ""}</span><span>金额按各站点充值倍率换算</span></div>}
     {editing && <ProviderForm provider={editing === "new" ? undefined : editing} onClose={() => setEditing(null)} onSaved={reload} notify={notify} />}

@@ -34,6 +34,7 @@ import { useAcpGateway } from "./acp/useAcpGateway";
 import { PromoBanner } from "./PromoBanner";
 import { Mascot } from "./Mascot";
 import { useUpdateCheck } from "./useUpdateCheck";
+import { useMinSpin } from "./useMinSpin";
 import { version } from "../package.json";
 
 const Playground = lazy(() => import("./Playground").then((module) => ({ default: module.Playground })));
@@ -408,6 +409,9 @@ export default function App() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [refreshing, setRefreshing] = useState(false);
+  const bootSpin = useMinSpin(loading);
+  const refreshSpin = useMinSpin(refreshing);
+  const pageLoadSpin = useMinSpin(pageLoading);
   const [revision, setRevision] = useState(0);
   const [updateFocusRequest, setUpdateFocusRequest] = useState(0);
   const updateCheck = useUpdateCheck(!!state);
@@ -529,6 +533,7 @@ export default function App() {
       if (page === "acp") {
         await acp.refreshAll();
       }
+      notify("数据已刷新");
     } catch (failure) {
       notify(errorMessage(failure), true);
     } finally {
@@ -566,8 +571,8 @@ export default function App() {
         <div className="full-loading">
           <Brand />
           <ErrorBox message={error} />
-          <Button onClick={() => void boot()}>
-            <RefreshCw size={16} />
+          <Button disabled={loading || bootSpin} onClick={() => void boot()}>
+            <RefreshCw size={16} className={bootSpin ? "spin" : undefined} />
             重新连接
           </Button>
         </div>
@@ -683,7 +688,7 @@ export default function App() {
               disabled={refreshing || pageLoading}
               onClick={() => void refresh()}
             >
-              <RefreshCw size={17} className={refreshing ? "spin" : ""} />
+              <RefreshCw size={17} className={refreshSpin ? "spin" : undefined} />
             </IconButton>
             <span className="user-avatar" title={state.username}>
               {state.username?.slice(0, 1).toUpperCase() || "A"}
@@ -696,8 +701,8 @@ export default function App() {
         <main className={`main-content${page === "playground" ? " playground-main" : ""}`}>
           {pageError && <div className="page-load-error" role="alert">
             <ErrorBox message={`未能更新${activePage.label}：${pageError}`} />
-            <Button className="small-button" onClick={() => void navigate(page, true)}>
-              <RefreshCw size={15} />重新加载
+            <Button className="small-button" disabled={pageLoading || pageLoadSpin} onClick={() => void navigate(page, true)}>
+              <RefreshCw size={15} className={pageLoadSpin ? "spin" : undefined} />重新加载
             </Button>
           </div>}
           {/* Keep page effects mounted so requests can finish while the content is hidden. */}

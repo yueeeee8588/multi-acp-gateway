@@ -7,6 +7,7 @@ import { AcpLiveLogsSection } from "./AcpLiveLogsSection";
 import { AcpModelsView } from "./AcpModelsView";
 import { AcpSettingsView } from "./AcpSettingsView";
 import type { AcpGatewayState } from "./useAcpGateway";
+import { useMinSpin } from "../useMinSpin";
 
 type AcpTab = "accounts" | "models" | "logs" | "settings";
 
@@ -31,6 +32,8 @@ export function AcpConsolePage({
   onLoadingChange,
 }: AcpConsolePageProps) {
   const [tab, setTab] = useState<AcpTab>("accounts");
+  const [manualRefreshing, setManualRefreshing] = useState(false);
+  const refreshSpinning = useMinSpin(manualRefreshing);
 
   useEffect(() => {
     const initialLoading =
@@ -46,8 +49,10 @@ export function AcpConsolePage({
   );
 
   const handleRefresh = useCallback(() => {
+    setManualRefreshing(true);
     void acp.refreshAll({
       onComplete: ({ ok, error }) => {
+        setManualRefreshing(false);
         if (ok) {
           acpNotify("已刷新账号、风控、日志与配置", "success");
         } else {
@@ -91,7 +96,7 @@ export function AcpConsolePage({
               onClick={handleRefresh}
               disabled={acp.loading}
             >
-              <RefreshCw size={15} className={acp.loading ? "spin" : ""} />
+              <RefreshCw size={15} className={refreshSpinning ? "spin" : undefined} />
               刷新
             </Button>
           </div>

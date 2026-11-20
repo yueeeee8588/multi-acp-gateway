@@ -29,6 +29,7 @@ import {
   SearchInput,
   Select,
 } from "../components";
+import { useMinSpin } from "../useMinSpin";
 import {
   AccountEditModal,
   BatchProxyModal,
@@ -103,6 +104,16 @@ type RowAction = "account" | "quota";
 interface PendingActions {
   global: GlobalAction | null;
   rows: ReadonlyMap<string, RowAction>;
+}
+
+function MinSpinRefreshIcon({ active, size }: { active: boolean; size: number }) {
+  const spinning = useMinSpin(active);
+  return <RefreshCw size={size} className={spinning ? "spin" : undefined} />;
+}
+
+function MinSpinGaugeIcon({ active, size }: { active: boolean; size: number }) {
+  const spinning = useMinSpin(active);
+  return <Gauge size={size} className={spinning ? "spin" : undefined} />;
 }
 
 function formatTime(ts: number | null): string {
@@ -600,10 +611,16 @@ export function AcpAccountsView({
 
   const [actions, setActions] = useState<PendingActions>(() => ({ global: null, rows: new Map() }));
   const actionsRef = useRef(actions);
+  const [batchActionKind, setBatchActionKind] = useState<"enable" | "disable" | "refresh" | null>(null);
   const globalBusy = actions.global !== null;
   const batchBlocked = globalBusy || actions.rows.size > 0;
   const refreshingQuotas = actions.global === "quota";
   const detectingTiers = actions.global === "tiers";
+  const refreshAllSpinning = useMinSpin(actions.global === "refresh");
+  const refreshQuotasSpinning = useMinSpin(refreshingQuotas);
+  const batchRefreshSpinning = useMinSpin(
+    actions.global === "batch" && batchActionKind === "refresh"
+  );
   const [now, setNow] = useState(Date.now);
 
   useEffect(() => {
@@ -791,12 +808,34 @@ export function AcpAccountsView({
   async function handleRefreshAll() {
     if (!beginGlobalAction("refresh")) return;
     try {
-      for (const acc of accounts) {
-        if (acc.status === "disabled") continue;
-        await refreshAccount(acc.id).catch(() => {});
+      const enabledAccounts = accounts.filter((acc) => acc.status !== "disabled");
+      if (enabledAccounts.length === 0) {
+        notify("没有可刷新的启用账号");
+        return;
       }
-      notify("已完成全部账号刷新", "success");
+      let succeeded = 0;
+      let failed = 0;
+      let lastError = "";
+      for (const acc of enabledAccounts) {
+        try {
+          await refreshAccount(acc.id);
+          succeeded += 1;
+        } catch (err) {
+          failed += 1;
+          lastError = err instanceof Error ? err.message : "刷新失败";
+        }
+      }
+      if (failed === 0) {
+        notify(`已完成全部账号刷新（共 ${succeeded} 个）`, "success");
+      } else {
+        notify(
+          `账号刷新完成 · 成功 ${succeeded} 个 · 失败 ${failed} 个${lastError ? `（${lastError}）` : ""}`,
+          "error"
+        );
+      }
       await onRefresh();
+    } catch (err) {
+      notify(err instanceof Error ? err.message : "刷新全部账号失败", "error");
     } finally {
       finishGlobalAction();
     }
@@ -958,19 +997,45 @@ export function AcpAccountsView({
   ) {
     const ids = Array.from(selectedIds);
     if (ids.length === 0 || !beginGlobalAction("batch")) return;
+    setBatchActionKind(action);
+    const actionLabel =
+      action === "enable"
+        ? "批量启用"
+        : action === "disable"
+          ? "批量停用"
+          : "批量刷新";
     try {
+      let succeeded = 0;
+      let failed = 0;
+      let lastError = "";
       for (const id of ids) {
-        if (action === "enable") {
-          await updateAccount(id, { status: "ready" }).catch(() => {});
-        } else if (action === "disable") {
-          await updateAccount(id, { status: "disabled" }).catch(() => {});
-        } else if (action === "refresh") {
-          await refreshAccount(id).catch(() => {});
+        try {
+          if (action === "enable") {
+            await updateAccount(id, { status: "ready" });
+          } else if (action === "disable") {
+            await updateAccount(id, { status: "disabled" });
+          } else if (action === "refresh") {
+            await refreshAccount(id);
+          }
+          succeeded += 1;
+        } catch (err) {
+          failed += 1;
+          lastError = err instanceof Error ? err.message : "请求失败";
         }
       }
-      notify(`已完成批量操作 (${ids.length})`, "success");
+      if (failed === 0) {
+        notify(`已完成${actionLabel}（共 ${succeeded} 个）`, "success");
+      } else {
+        notify(
+          `${actionLabel}完成 · 成功 ${succeeded} 个 · 失败 ${failed} 个${lastError ? `（${lastError}）` : ""}`,
+          "error"
+        );
+      }
       await onRefresh();
+    } catch (err) {
+      notify(err instanceof Error ? err.message : `${actionLabel}失败`, "error");
     } finally {
+      setBatchActionKind(null);
       finishGlobalAction();
     }
   }
@@ -1061,17 +1126,16 @@ export function AcpAccountsView({
             onClick={() => void handleRefreshAll()}
             disabled={batchBlocked}
           >
-            <RefreshCw size={15} className={actions.global === "refresh" ? "spin" : undefined} />
+            <RefreshCw size={15} className={refreshAllSpinning ? "spin" : undefined} />
             刷新全部
           </Button>
           <Button
             onClick={() => void handleRefreshAllQuotas()}
-            busy={refreshingQuotas}
             aria-busy={refreshingQuotas}
             disabled={batchBlocked}
             title="采集全部启用账号的三号池剩余用量"
           >
-            {!refreshingQuotas && <Gauge size={15} />}
+            <Gauge size={15} className={refreshQuotasSpinning ? "spin" : undefined} />
             {refreshingQuotas ? "刷新用量中…" : "刷新用量"}
           </Button>
           <Button
@@ -1286,6 +1350,7 @@ export function AcpAccountsView({
                 disabled={batchBlocked}
                 onClick={() => void handleBatchAction("refresh")}
               >
+                <RefreshCw size={15} className={batchRefreshSpinning ? "spin" : undefined} />
                 批量刷新
               </Button>
               <Button
@@ -1650,7 +1715,7 @@ export function AcpAccountsView({
                         whiteSpace: "nowrap",
                       }}
                     >
-                      <Gauge size={12} className={quotaBusy ? "spin" : undefined} />
+                      <MinSpinGaugeIcon active={quotaBusy} size={12} />
                       <span>用量</span>
                     </button>
                     <button
@@ -1676,7 +1741,7 @@ export function AcpAccountsView({
                         whiteSpace: "nowrap",
                       }}
                     >
-                      <RefreshCw size={12} className={rowAction === "account" ? "spin" : undefined} />
+                      <MinSpinRefreshIcon active={rowAction === "account"} size={12} />
                       <span>刷新</span>
                     </button>
                     <button
@@ -1991,14 +2056,14 @@ export function AcpAccountsView({
                             disabled={rowBusy}
                             onClick={() => void handleRefreshAccountQuota(acc)}
                           >
-                            <Gauge size={15} className={quotaBusy ? "spin" : undefined} />
+                            <MinSpinGaugeIcon active={quotaBusy} size={15} />
                           </IconButton>
                           <IconButton
                             title="刷新"
                             disabled={rowBusy}
                             onClick={() => void handleRefreshOne(acc)}
                           >
-                            <RefreshCw size={15} className={rowAction === "account" ? "spin" : undefined} />
+                            <MinSpinRefreshIcon active={rowAction === "account"} size={15} />
                           </IconButton>
                           <IconButton
                             title="编辑"

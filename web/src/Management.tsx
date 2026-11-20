@@ -41,6 +41,7 @@ import type { Notice } from "./components";
 import { GroupSelect } from "./GroupSelect";
 import { ProviderAccountImport } from "./ProviderAccountImport";
 import type { ProviderAccountSelection } from "./ProviderAccountImport";
+import { useMinSpin } from "./useMinSpin";
 
 export type PageProps = {
   state: State;
@@ -875,6 +876,7 @@ function AccountForm({
   const [enabled, setEnabled] = useState(account?.enabled ?? true);
   const [busy, setBusy] = useState(false);
   const [discovering, setDiscovering] = useState(false);
+  const discoverSpin = useMinSpin(discovering);
   const [error, setError] = useState("");
   const canReuseApiKey = Boolean(account?.has_api_key && !account.provider_binding);
   const hasCredentials = importSource === "provider" ? providerReady && Boolean(providerBinding) : Boolean(secret.trim()) || canReuseApiKey;
@@ -1118,11 +1120,10 @@ function AccountForm({
             <Button
               type="button"
               className="small-button"
-              busy={discovering}
-              disabled={busy || testingProxy || !endpoint || !hasCredentials}
+              disabled={busy || discovering || testingProxy || !endpoint || !hasCredentials}
               onClick={() => void discover()}
             >
-              <RefreshCw size={14} />
+              <RefreshCw size={14} className={discoverSpin ? "spin" : undefined} />
               获取模型
             </Button>
           </div>

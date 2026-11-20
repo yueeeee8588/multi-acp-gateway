@@ -10,6 +10,7 @@ import {
   ModalForm,
   Select,
 } from "../components";
+import { useMinSpin } from "../useMinSpin";
 import {
   createAccount,
   fetchChromeProfiles,
@@ -329,6 +330,7 @@ export function ChromeScanModal({
   notify,
 }: ChromeScanModalProps) {
   const [scanning, setScanning] = useState(false);
+  const scanSpinning = useMinSpin(scanning);
   const [authorizing, setAuthorizing] = useState(false);
   const [scanResult, setScanResult] = useState<ChromeProfilesResult | null>(
     null
@@ -341,7 +343,7 @@ export function ChromeScanModal({
 
   const busy = scanning || authorizing;
 
-  const scanProfiles = useCallback(async () => {
+  const scanProfiles = useCallback(async (options?: { manual?: boolean }) => {
     setScanning(true);
     setError("");
     setOauthResult(null);
@@ -355,12 +357,19 @@ export function ChromeScanModal({
           res.profiles.filter((p) => !p.alreadyAdded).map((p) => p.profileDir)
         );
       }
+      if (options?.manual) {
+        notify(`扫描完成，共发现 ${res.profiles.length} 个账号配置`, "success");
+      }
     } catch (err) {
-      setError(err instanceof Error ? err.message : "扫描 Chrome 账号失败");
+      const msg = err instanceof Error ? err.message : "扫描 Chrome 账号失败";
+      setError(msg);
+      if (options?.manual) {
+        notify(msg, "error");
+      }
     } finally {
       setScanning(false);
     }
-  }, []);
+  }, [notify]);
 
   useEffect(() => {
     void scanProfiles();
@@ -695,9 +704,9 @@ export function ChromeScanModal({
         <Button
           type="button"
           disabled={busy}
-          onClick={() => void scanProfiles()}
+          onClick={() => void scanProfiles({ manual: true })}
         >
-          <RefreshCw size={15} className={scanning ? "spin" : undefined} />
+          <RefreshCw size={15} className={scanSpinning ? "spin" : undefined} />
           重新扫描
         </Button>
         <Button type="button" disabled={busy} onClick={onClose}>

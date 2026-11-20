@@ -13,6 +13,7 @@ import { api, errorMessage, number, tokenCount } from "./api";
 import type { RequestLog, RequestLogExport, RequestLogPage, State } from "./api";
 import { Badge, Button, Confirm, Empty, ErrorBox } from "./components";
 import type { Notice } from "./components";
+import { useMinSpin } from "./useMinSpin";
 
 function duration(milliseconds: number | null | undefined) {
   if (milliseconds === null || milliseconds === undefined) return "—";
@@ -337,11 +338,15 @@ export function RequestLogs({
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [refresh, setRefresh] = useState(0);
+  const [manualRefreshing, setManualRefreshing] = useState(false);
   const [exporting, setExporting] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [deleting, setDeleting] = useState(false);
   const [deleteError, setDeleteError] = useState("");
   const requestSequence = useRef(0);
+  const manualRefreshRef = useRef(false);
+  const refreshSpin = useMinSpin(manualRefreshing);
+  const reloadSpin = useMinSpin(loading);
   useEffect(() => { onLoadingChange?.(loading); }, [loading, onLoadingChange]);
   useEffect(() => {
     const sequence = ++requestSequence.current;
@@ -356,17 +361,37 @@ export function RequestLogs({
           return;
         }
         setData(result);
+        if (manualRefreshRef.current) {
+          manualRefreshRef.current = false;
+          notify("已刷新调用日志");
+        }
       })
       .catch((failure) => {
-        if (sequence === requestSequence.current) setError(errorMessage(failure));
+        if (sequence === requestSequence.current) {
+          const message = errorMessage(failure);
+          setError(message);
+          if (manualRefreshRef.current) {
+            manualRefreshRef.current = false;
+            notify(message, true);
+          }
+        }
       })
       .finally(() => {
-        if (sequence === requestSequence.current) setLoading(false);
+        if (sequence === requestSequence.current) {
+          setLoading(false);
+          setManualRefreshing(false);
+        }
       });
     return () => {
       requestSequence.current++;
     };
-  }, [page, revision, refresh]);
+  }, [page, revision, refresh, notify]);
+
+  function triggerManualRefresh() {
+    manualRefreshRef.current = true;
+    setManualRefreshing(true);
+    setRefresh((value) => value + 1);
+  }
 
   async function exportLogs() {
     setExporting(true);
@@ -423,8 +448,8 @@ export function RequestLogs({
             <p>默认保留最近 7 天{retentionDays !== 7 ? ` · 当前保留 ${retentionDays} 天` : ""} · 过期自动清理</p>
           </div>
           <div className="log-page-actions">
-            <Button onClick={() => setRefresh((value) => value + 1)} disabled={busy}>
-              <RefreshCw size={15} className={loading ? "spin" : ""} />刷新
+            <Button onClick={triggerManualRefresh} disabled={busy}>
+              <RefreshCw size={15} className={refreshSpin ? "spin" : undefined} />刷新
             </Button>
             <Button onClick={() => void exportLogs()} busy={exporting} disabled={deleting}>
               {!exporting && <Download size={15} />}导出 JSON
@@ -447,7 +472,14 @@ export function RequestLogs({
         {loading ? (
           <Empty title="正在加载调用日志" />
         ) : error ? (
-          <Empty title="调用日志加载失败" action={<Button onClick={() => setRefresh((value) => value + 1)}>重新加载</Button>} />
+          <Empty
+            title="调用日志加载失败"
+            action={
+              <Button disabled={busy} onClick={() => setRefresh((value) => value + 1)}>
+                <RefreshCw size={15} className={reloadSpin ? "spin" : undefined} />重新加载
+              </Button>
+            }
+          />
         ) : currentData?.items.length ? (
           <ol className="request-log-list">
             {currentData.items.map((row) => <LogRow key={row.id} row={row} state={state} />)}

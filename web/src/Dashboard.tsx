@@ -36,6 +36,7 @@ import type { State, Stats } from "./api";
 import { Badge, Button, ErrorBox, IconButton } from "./components";
 import type { Notice } from "./components";
 import { RequestLogs } from "./RequestLogs";
+import { useMinSpin } from "./useMinSpin";
 
 // Chart colours mirror the .series-* legend classes in style.css.
 const CHART = {
@@ -73,6 +74,7 @@ export function Dashboard({
   const [error, setError] = useState("");
   const [retry, setRetry] = useState(0);
   const [metric, setMetric] = useState<"tokens" | "requests">("tokens");
+  const retrySpin = useMinSpin(loading);
   useEffect(() => { onLoadingChange?.(loading); }, [loading, onLoadingChange]);
   useEffect(() => {
     let cancelled = false;
@@ -207,8 +209,8 @@ export function Dashboard({
       {error && (
         <div className="inline-error">
           <ErrorBox message={error} />
-          <Button onClick={() => setRetry((value) => value + 1)}>
-            <RefreshCw size={15} />
+          <Button disabled={loading} onClick={() => setRetry((value) => value + 1)}>
+            <RefreshCw size={15} className={retrySpin ? "spin" : undefined} />
             重试
           </Button>
         </div>

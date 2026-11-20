@@ -18,6 +18,7 @@ import type { Release, UpdateJob, UpdateStatus } from "./api";
 import { Badge, Button, ErrorBox, Field, Modal } from "./components";
 import type { Notice } from "./components";
 import type { UpdateCheck } from "./useUpdateCheck";
+import { useMinSpin } from "./useMinSpin";
 
 const stages = [
   { id: "fetching", label: "获取源码" },
@@ -60,6 +61,7 @@ export function SystemUpdates({
   const [status, setStatus] = useState<UpdateStatus | null>(updateCheck.status);
   const [error, setError] = useState("");
   const [checking, setChecking] = useState(false);
+  const checkSpin = useMinSpin(checking);
   const [reconnecting, setReconnecting] = useState(false);
   const [confirmation, setConfirmation] = useState<Release | null>(null);
   const [password, setPassword] = useState("");
@@ -158,9 +160,17 @@ export function SystemUpdates({
     setChecking(true);
     setError("");
     try {
-      acceptStatus(await requestLatest());
+      const next = await requestLatest();
+      acceptStatus(next);
+      if (next.update_available && next.latest?.tag) {
+        notify(`发现新版本 ${next.latest.tag}`);
+      } else {
+        notify("当前已是最新版本");
+      }
     } catch (failure) {
-      setError(errorMessage(failure));
+      const message = errorMessage(failure);
+      setError(message);
+      notify(message, true);
     } finally {
       setChecking(false);
     }
@@ -259,10 +269,9 @@ export function SystemUpdates({
             <Button
               type="button"
               onClick={() => void checkLatest()}
-              busy={checking}
-              disabled={running}
+              disabled={checking || running}
             >
-              {!checking && <RefreshCw size={15} />}
+              <RefreshCw size={15} className={checkSpin ? "spin" : undefined} />
               检查更新
             </Button>
             <Button

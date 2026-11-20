@@ -10,14 +10,16 @@ import {
 } from "lucide-react";
 import { errorMessage, number as formatNumber, tokenCount } from "../api";
 import { Badge, Button, Empty, SearchInput, Select } from "../components";
+import { useMinSpin } from "../useMinSpin";
 import { cancelRequest } from "./api";
 import type { CooldownRecord, RequestAttempt, RequestLog } from "./types";
+import type { AcpRefreshOptions } from "./useAcpGateway";
 
 export interface AcpLiveLogsSectionProps {
   requests: RequestLog[];
   cooldowns: CooldownRecord[];
   sseConnected: boolean;
-  onRefresh: () => Promise<void>;
+  onRefresh: (options?: AcpRefreshOptions) => Promise<void>;
   notify: (msg: string, kind?: "success" | "error") => void;
   defaultOpen?: boolean;
 }
@@ -582,6 +584,7 @@ export function AcpLiveLogsSection({
   const [pageSize, setPageSize] = useState<number>(20);
   const [page, setPage] = useState(1);
   const [refreshing, setRefreshing] = useState(false);
+  const refreshSpinning = useMinSpin(refreshing);
   const [expandedIds, setExpandedIds] = useState<Set<string>>(() => new Set());
   const [cancellingIds, setCancellingIds] = useState<Set<string>>(() => new Set());
 
@@ -677,9 +680,17 @@ export function AcpLiveLogsSection({
     if (refreshing) return;
     setRefreshing(true);
     try {
-      await onRefresh();
+      await onRefresh({
+        onComplete: ({ ok, error }) => {
+          if (ok) {
+            notify("已刷新实时日志", "success");
+          } else {
+            notify(error || "刷新实时日志失败", "error");
+          }
+        },
+      });
     } catch (err) {
-      notify(errorMessage(err), "error");
+      notify(errorMessage(err) || "刷新实时日志失败", "error");
     } finally {
       setRefreshing(false);
     }
@@ -813,7 +824,7 @@ export function AcpLiveLogsSection({
                 onClick={() => void handleRefresh()}
                 style={{ height: 38, padding: "0 14px", fontSize: 12 }}
               >
-                <RefreshCw size={14} className={refreshing ? "spin" : ""} />
+                <RefreshCw size={14} className={refreshSpinning ? "spin" : undefined} />
                 刷新
               </Button>
             </div>
