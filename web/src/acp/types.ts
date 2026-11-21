@@ -227,6 +227,8 @@ export type RoutingStrategy =
   | 'cache-first'
   | 'performance-first';
 
+export type QuotaCooldownScope = 'family' | 'account';
+
 export type AcpSensitiveWordScope = 'all' | 'system' | 'messages' | 'tools';
 
 export interface AcpSensitiveWordRule {
@@ -252,6 +254,19 @@ export interface GatewayConfig {
   cooldownStepsMinutes: number[];
   maxImagesPerRequest: number;
   maxLogsRetained: number;
+  strictProxyBinding?: boolean;
+  blockOnExitIpDrift?: boolean;
+  maxConcurrencyPerExitIp?: number;
+  minExitIpRequestIntervalMs?: number;
+  minAccountRequestIntervalMs?: number;
+  requestJitterMs?: number;
+  maxWorkerSpawnsPerMinute?: number;
+  quotaCooldownScope?: QuotaCooldownScope;
+  excludeDefaultComponents?: boolean;
+  accountFailover?: boolean;
+  maxQuotaAccountSwitches?: number;
+  policyBlockCooldownMs?: number;
+  maxInternal429RetriesBeforeCancel?: number;
   sensitiveFilterEnabled?: boolean;
   sensitiveWords?: AcpSensitiveWordRule[];
 }

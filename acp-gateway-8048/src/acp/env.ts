@@ -183,17 +183,18 @@ export function buildIsolatedAgyEnv(opts: BuildIsolatedAgyEnvOptions): Record<st
     env.Path = env.PATH;
   }
 
-  if (opts.proxyUrl) {
-    env.HTTP_PROXY = opts.proxyUrl;
-    env.HTTPS_PROXY = opts.proxyUrl;
-    env.ALL_PROXY = opts.proxyUrl;
-    env.http_proxy = opts.proxyUrl;
-    env.https_proxy = opts.proxyUrl;
-    env.all_proxy = opts.proxyUrl;
+  const normalizedProxy = opts.proxyUrl?.trim();
+  if (normalizedProxy) {
+    env.HTTP_PROXY = normalizedProxy;
+    env.HTTPS_PROXY = normalizedProxy;
+    env.ALL_PROXY = normalizedProxy;
+    env.http_proxy = normalizedProxy;
+    env.https_proxy = normalizedProxy;
+    env.all_proxy = normalizedProxy;
 
-    const mergedNoProxy = mergeNoProxy(env.NO_PROXY || env.no_proxy);
-    env.NO_PROXY = mergedNoProxy;
-    env.no_proxy = mergedNoProxy;
+    const loopbackNoProxy = LOOPBACK_NO_PROXY_ENTRIES.join(",");
+    env.NO_PROXY = loopbackNoProxy;
+    env.no_proxy = loopbackNoProxy;
   }
 
   return env;

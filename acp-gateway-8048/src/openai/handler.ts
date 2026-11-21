@@ -311,6 +311,7 @@ export function createOpenAiHandler(deps: OpenAiHandlerDeps = {}) {
 
     const excludeAccountIds: string[] = [];
     let nonQuotaSwitches = 0;
+    let quotaSwitches = 0;
     let modelSelectionSwitches = 0;
     let attemptIndex = 0;
     let earliestRetryAt: number | undefined;
@@ -690,7 +691,65 @@ export function createOpenAiHandler(deps: OpenAiHandlerDeps = {}) {
             };
           }
 
-          if (!classified.isQuotaError) {
+          const isAccountFailoverError =
+            classified.isQuotaError ||
+            classified.status === 401 ||
+            classified.status === 402 ||
+            classified.status === 403 ||
+            classified.status === 429 ||
+            classified.reasonCode === 'QUOTA_EXHAUSTED' ||
+            classified.reasonCode === 'RESOURCE_EXHAUSTED' ||
+            classified.reasonCode === 'AUTH_REQUIRED' ||
+            classified.reasonCode === 'RESTRICTED' ||
+            classified.reasonCode === 'VALIDATION_REQUIRED';
+
+          const getQuotaRetryHeaders = (): Record<string, string> | undefined => {
+            if (classified.status !== 429 && !classified.isQuotaError) {
+              return undefined;
+            }
+            const seconds =
+              failResult?.retryAfterSeconds !== undefined
+                ? Math.max(1, failResult.retryAfterSeconds)
+                : earliestRetryAt !== undefined
+                  ? Math.max(1, Math.ceil((earliestRetryAt - Date.now()) / 1000))
+                  : typeof classified.retryAfterMs === 'number' && Number.isFinite(classified.retryAfterMs)
+                    ? Math.max(1, Math.ceil(classified.retryAfterMs / 1000))
+                    : Math.max(1, Math.round((config.cooldownStepsMinutes[0] ?? 1) * 60));
+            return { 'Retry-After': String(seconds) };
+          };
+
+          if (!config.accountFailover && isAccountFailoverError) {
+            eventBus.finishRequest(requestId, { state: 'failed', httpStatus: classified.status });
+            return {
+              errorResponse: openAiJsonError(
+                classified.status,
+                classified.reasonText,
+                undefined,
+                undefined,
+                getQuotaRetryHeaders(),
+              ),
+            };
+          }
+
+          if (classified.isQuotaError) {
+            quotaSwitches += 1;
+            if (quotaSwitches > config.maxQuotaAccountSwitches) {
+              const retryHeaders =
+                earliestRetryAt !== undefined
+                  ? { 'Retry-After': String(Math.max(1, Math.ceil((earliestRetryAt - Date.now()) / 1000))) }
+                  : getQuotaRetryHeaders();
+              eventBus.finishRequest(requestId, { state: 'failed', httpStatus: classified.status });
+              return {
+                errorResponse: openAiJsonError(
+                  classified.status,
+                  classified.reasonText,
+                  undefined,
+                  undefined,
+                  retryHeaders,
+                ),
+              };
+            }
+          } else {
             nonQuotaSwitches += 1;
             if (nonQuotaSwitches > config.maxAccountSwitches) {
               eventBus.finishRequest(requestId, { state: 'failed', httpStatus: classified.status });

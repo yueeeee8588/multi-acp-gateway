@@ -90,6 +90,7 @@ interface AcpSessionRow {
   model: string;
   system_hash: string;
   tools_hash: string;
+  sensitive_filter_fingerprint: string;
   committed_hashes_json: string;
   updated_at: number;
 }
@@ -101,6 +102,7 @@ export interface AcpSessionRecord {
   model: string;
   systemHash: string;
   toolsHash: string;
+  sensitiveFilterFingerprint?: string;
   committedHashes: string[];
   updatedAt: number;
 }
@@ -129,6 +131,7 @@ function rowToAcpSession(row: AcpSessionRow): AcpSessionRecord | null {
     model: row.model,
     systemHash: row.system_hash,
     toolsHash: row.tools_hash,
+    sensitiveFilterFingerprint: row.sensitive_filter_fingerprint ?? '',
     committedHashes,
     updatedAt: row.updated_at,
   };
@@ -359,6 +362,7 @@ export class GatewayStore {
         model TEXT NOT NULL,
         system_hash TEXT NOT NULL,
         tools_hash TEXT NOT NULL,
+        sensitive_filter_fingerprint TEXT NOT NULL DEFAULT '',
         committed_hashes_json TEXT NOT NULL,
         updated_at INTEGER NOT NULL
       );
@@ -385,6 +389,15 @@ export class GatewayStore {
     }
     if (!requestLogColumns.some((c) => c.name === 'cached_tokens')) {
       this.db.exec(`ALTER TABLE request_logs ADD COLUMN cached_tokens INTEGER;`);
+    }
+
+    const acpSessionColumns = this.db
+      .query<{ name: string }, []>('PRAGMA table_info(acp_sessions)')
+      .all();
+    if (!acpSessionColumns.some((c) => c.name === 'sensitive_filter_fingerprint')) {
+      this.db.exec(
+        `ALTER TABLE acp_sessions ADD COLUMN sensitive_filter_fingerprint TEXT NOT NULL DEFAULT '';`
+      );
     }
   }
 
@@ -712,14 +725,15 @@ export class GatewayStore {
     this.db
       .query(
         `INSERT INTO acp_sessions (
-          sticky_key, session_id, account_id, model, system_hash, tools_hash, committed_hashes_json, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+          sticky_key, session_id, account_id, model, system_hash, tools_hash, sensitive_filter_fingerprint, committed_hashes_json, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(sticky_key) DO UPDATE SET
           session_id = excluded.session_id,
           account_id = excluded.account_id,
           model = excluded.model,
           system_hash = excluded.system_hash,
           tools_hash = excluded.tools_hash,
+          sensitive_filter_fingerprint = excluded.sensitive_filter_fingerprint,
           committed_hashes_json = excluded.committed_hashes_json,
           updated_at = excluded.updated_at`
       )
@@ -730,6 +744,7 @@ export class GatewayStore {
         record.model,
         record.systemHash,
         record.toolsHash,
+        record.sensitiveFilterFingerprint ?? '',
         JSON.stringify(record.committedHashes),
         record.updatedAt
       );

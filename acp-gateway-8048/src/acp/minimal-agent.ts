@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import { getConfig } from "../config/settings";
 
 export const AGY_BRIDGE_AGENT_NAME = "agy-8048-bridge";
 
@@ -7,7 +8,7 @@ export interface MinimalAgentOptions {
   minimal?: boolean;
 }
 
-export function buildAgentDefinitionContent(minimal = true): string {
+export function buildAgentDefinitionContent(minimal = false): string {
   const lines = [
     "---",
     `name: ${AGY_BRIDGE_AGENT_NAME}`,
@@ -29,10 +30,15 @@ export function ensureMinimalAgentDefinition(
   workspaceDir: string,
   options?: MinimalAgentOptions,
 ): string {
+  const envOverride = process.env.AGY_8048_MINIMAL_AGENT;
   const minimal =
-    options?.minimal !== undefined
-      ? options.minimal
-      : process.env.AGY_8048_MINIMAL_AGENT !== "0";
+    envOverride === "1"
+      ? true
+      : envOverride === "0"
+        ? false
+        : options?.minimal !== undefined
+          ? options.minimal
+          : getConfig().excludeDefaultComponents;
 
   const agentDir = path.join(workspaceDir, ".agents", "agents", AGY_BRIDGE_AGENT_NAME);
   const agentPath = path.join(agentDir, "agent.md");

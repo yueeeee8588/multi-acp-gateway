@@ -1,6 +1,7 @@
 import { store } from '../db/store';
 import type {
   GatewayConfig,
+  QuotaCooldownScope,
   RoutingStrategy,
   SensitiveWordRule,
   SensitiveWordScope,
@@ -19,6 +20,81 @@ const VALID_ROUTING_STRATEGIES = new Set<RoutingStrategy>([
   'cache-first',
   'performance-first',
 ]);
+
+const VALID_QUOTA_COOLDOWN_SCOPES = new Set<QuotaCooldownScope>([
+  'family',
+  'account',
+]);
+
+export const RISK_CONTROL_LIMITS = {
+  maxConcurrencyPerExitIp: { min: 0, max: 64 },
+  minExitIpRequestIntervalMs: { min: 0, max: 10000 },
+  minAccountRequestIntervalMs: { min: 0, max: 30000 },
+  requestJitterMs: { min: 0, max: 10000 },
+  maxWorkerSpawnsPerMinute: { min: 0, max: 120 },
+  maxQuotaAccountSwitches: { min: 0, max: 10 },
+  policyBlockCooldownMs: { min: 60_000, max: 604_800_000 },
+  maxInternal429RetriesBeforeCancel: { min: 1, max: 8 },
+} as const;
+
+function normalizeBoolean(value: unknown, fallback: boolean): boolean {
+  return typeof value === 'boolean' ? value : fallback;
+}
+
+function normalizeBoundedInt(
+  value: unknown,
+  min: number,
+  max: number,
+  fallback: number,
+): number {
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    return fallback;
+  }
+  const rounded = Math.round(value);
+  return Math.min(max, Math.max(min, rounded));
+}
+
+function normalizeQuotaCooldownScope(
+  value: unknown,
+  fallback: QuotaCooldownScope,
+): QuotaCooldownScope {
+  return typeof value === 'string' && VALID_QUOTA_COOLDOWN_SCOPES.has(value as QuotaCooldownScope)
+    ? (value as QuotaCooldownScope)
+    : fallback;
+}
+
+export function validateRiskControlPatch(patch: Record<string, unknown>): void {
+  for (const field of [
+    'strictProxyBinding',
+    'blockOnExitIpDrift',
+    'excludeDefaultComponents',
+    'accountFailover',
+  ] as const) {
+    if (field in patch && patch[field] !== undefined && typeof patch[field] !== 'boolean') {
+      throw new Error(`${field} must be a boolean`);
+    }
+  }
+
+  for (const [field, { min, max }] of Object.entries(RISK_CONTROL_LIMITS) as Array<
+    [keyof typeof RISK_CONTROL_LIMITS, { min: number; max: number }]
+  >) {
+    if (field in patch && patch[field] !== undefined) {
+      const value = patch[field];
+      if (typeof value !== 'number' || !Number.isInteger(value) || value < min || value > max) {
+        throw new Error(`${field} must be an integer between ${min} and ${max}`);
+      }
+    }
+  }
+
+  if ('quotaCooldownScope' in patch && patch.quotaCooldownScope !== undefined) {
+    if (
+      typeof patch.quotaCooldownScope !== 'string' ||
+      !VALID_QUOTA_COOLDOWN_SCOPES.has(patch.quotaCooldownScope as QuotaCooldownScope)
+    ) {
+      throw new Error("quotaCooldownScope must be 'family' or 'account'");
+    }
+  }
+}
 
 function normalizeRoutingStrategy(
   value: unknown,
@@ -123,6 +199,19 @@ export const DEFAULT_CONFIG: GatewayConfig = {
   // alt=sse 下"只出思考不出正文"时最多等多久就先放行 200（并起 : keepalive 心跳）。
   streamThoughtEarlyReleaseMs: 3000,
   cacheSettlingDelayMs: 1000,
+  strictProxyBinding: true,
+  blockOnExitIpDrift: false,
+  maxConcurrencyPerExitIp: 4,
+  minExitIpRequestIntervalMs: 250,
+  minAccountRequestIntervalMs: 500,
+  requestJitterMs: 300,
+  maxWorkerSpawnsPerMinute: 12,
+  quotaCooldownScope: 'family',
+  excludeDefaultComponents: false,
+  accountFailover: false,
+  maxQuotaAccountSwitches: 1,
+  policyBlockCooldownMs: 21_600_000,
+  maxInternal429RetriesBeforeCancel: 2,
   sensitiveFilterEnabled: false,
   sensitiveWords: [],
 };
@@ -195,6 +284,74 @@ export function getConfig(): GatewayConfig {
           saved.cacheSettlingDelayMs,
           DEFAULT_CONFIG.cacheSettlingDelayMs,
         ),
+        strictProxyBinding: normalizeBoolean(
+          saved.strictProxyBinding,
+          DEFAULT_CONFIG.strictProxyBinding,
+        ),
+        blockOnExitIpDrift: normalizeBoolean(
+          saved.blockOnExitIpDrift,
+          DEFAULT_CONFIG.blockOnExitIpDrift,
+        ),
+        maxConcurrencyPerExitIp: normalizeBoundedInt(
+          saved.maxConcurrencyPerExitIp,
+          RISK_CONTROL_LIMITS.maxConcurrencyPerExitIp.min,
+          RISK_CONTROL_LIMITS.maxConcurrencyPerExitIp.max,
+          DEFAULT_CONFIG.maxConcurrencyPerExitIp,
+        ),
+        minExitIpRequestIntervalMs: normalizeBoundedInt(
+          saved.minExitIpRequestIntervalMs,
+          RISK_CONTROL_LIMITS.minExitIpRequestIntervalMs.min,
+          RISK_CONTROL_LIMITS.minExitIpRequestIntervalMs.max,
+          DEFAULT_CONFIG.minExitIpRequestIntervalMs,
+        ),
+        minAccountRequestIntervalMs: normalizeBoundedInt(
+          saved.minAccountRequestIntervalMs,
+          RISK_CONTROL_LIMITS.minAccountRequestIntervalMs.min,
+          RISK_CONTROL_LIMITS.minAccountRequestIntervalMs.max,
+          DEFAULT_CONFIG.minAccountRequestIntervalMs,
+        ),
+        requestJitterMs: normalizeBoundedInt(
+          saved.requestJitterMs,
+          RISK_CONTROL_LIMITS.requestJitterMs.min,
+          RISK_CONTROL_LIMITS.requestJitterMs.max,
+          DEFAULT_CONFIG.requestJitterMs,
+        ),
+        maxWorkerSpawnsPerMinute: normalizeBoundedInt(
+          saved.maxWorkerSpawnsPerMinute,
+          RISK_CONTROL_LIMITS.maxWorkerSpawnsPerMinute.min,
+          RISK_CONTROL_LIMITS.maxWorkerSpawnsPerMinute.max,
+          DEFAULT_CONFIG.maxWorkerSpawnsPerMinute,
+        ),
+        quotaCooldownScope: normalizeQuotaCooldownScope(
+          saved.quotaCooldownScope,
+          DEFAULT_CONFIG.quotaCooldownScope,
+        ),
+        excludeDefaultComponents: normalizeBoolean(
+          saved.excludeDefaultComponents,
+          DEFAULT_CONFIG.excludeDefaultComponents,
+        ),
+        accountFailover: normalizeBoolean(
+          saved.accountFailover,
+          DEFAULT_CONFIG.accountFailover,
+        ),
+        maxQuotaAccountSwitches: normalizeBoundedInt(
+          saved.maxQuotaAccountSwitches,
+          RISK_CONTROL_LIMITS.maxQuotaAccountSwitches.min,
+          RISK_CONTROL_LIMITS.maxQuotaAccountSwitches.max,
+          DEFAULT_CONFIG.maxQuotaAccountSwitches,
+        ),
+        policyBlockCooldownMs: normalizeBoundedInt(
+          saved.policyBlockCooldownMs,
+          RISK_CONTROL_LIMITS.policyBlockCooldownMs.min,
+          RISK_CONTROL_LIMITS.policyBlockCooldownMs.max,
+          DEFAULT_CONFIG.policyBlockCooldownMs,
+        ),
+        maxInternal429RetriesBeforeCancel: normalizeBoundedInt(
+          saved.maxInternal429RetriesBeforeCancel,
+          RISK_CONTROL_LIMITS.maxInternal429RetriesBeforeCancel.min,
+          RISK_CONTROL_LIMITS.maxInternal429RetriesBeforeCancel.max,
+          DEFAULT_CONFIG.maxInternal429RetriesBeforeCancel,
+        ),
         sensitiveFilterEnabled:
           typeof saved.sensitiveFilterEnabled === 'boolean'
             ? saved.sensitiveFilterEnabled
@@ -256,6 +413,93 @@ export function updateConfig(patch: Partial<GatewayConfig>): GatewayConfig {
         ? patch.streamThoughtEarlyReleaseMs
         : current.streamThoughtEarlyReleaseMs,
     cacheSettlingDelayMs: nextCacheSettlingDelayMs,
+    strictProxyBinding: normalizeBoolean(patch.strictProxyBinding, current.strictProxyBinding),
+    blockOnExitIpDrift: normalizeBoolean(patch.blockOnExitIpDrift, current.blockOnExitIpDrift),
+    maxConcurrencyPerExitIp:
+      'maxConcurrencyPerExitIp' in patch && patch.maxConcurrencyPerExitIp !== undefined
+        ? normalizeBoundedInt(
+            patch.maxConcurrencyPerExitIp,
+            RISK_CONTROL_LIMITS.maxConcurrencyPerExitIp.min,
+            RISK_CONTROL_LIMITS.maxConcurrencyPerExitIp.max,
+            current.maxConcurrencyPerExitIp,
+          )
+        : current.maxConcurrencyPerExitIp,
+    minExitIpRequestIntervalMs:
+      'minExitIpRequestIntervalMs' in patch && patch.minExitIpRequestIntervalMs !== undefined
+        ? normalizeBoundedInt(
+            patch.minExitIpRequestIntervalMs,
+            RISK_CONTROL_LIMITS.minExitIpRequestIntervalMs.min,
+            RISK_CONTROL_LIMITS.minExitIpRequestIntervalMs.max,
+            current.minExitIpRequestIntervalMs,
+          )
+        : current.minExitIpRequestIntervalMs,
+    minAccountRequestIntervalMs:
+      'minAccountRequestIntervalMs' in patch && patch.minAccountRequestIntervalMs !== undefined
+        ? normalizeBoundedInt(
+            patch.minAccountRequestIntervalMs,
+            RISK_CONTROL_LIMITS.minAccountRequestIntervalMs.min,
+            RISK_CONTROL_LIMITS.minAccountRequestIntervalMs.max,
+            current.minAccountRequestIntervalMs,
+          )
+        : current.minAccountRequestIntervalMs,
+    requestJitterMs:
+      'requestJitterMs' in patch && patch.requestJitterMs !== undefined
+        ? normalizeBoundedInt(
+            patch.requestJitterMs,
+            RISK_CONTROL_LIMITS.requestJitterMs.min,
+            RISK_CONTROL_LIMITS.requestJitterMs.max,
+            current.requestJitterMs,
+          )
+        : current.requestJitterMs,
+    maxWorkerSpawnsPerMinute:
+      'maxWorkerSpawnsPerMinute' in patch && patch.maxWorkerSpawnsPerMinute !== undefined
+        ? normalizeBoundedInt(
+            patch.maxWorkerSpawnsPerMinute,
+            RISK_CONTROL_LIMITS.maxWorkerSpawnsPerMinute.min,
+            RISK_CONTROL_LIMITS.maxWorkerSpawnsPerMinute.max,
+            current.maxWorkerSpawnsPerMinute,
+          )
+        : current.maxWorkerSpawnsPerMinute,
+    quotaCooldownScope: normalizeQuotaCooldownScope(
+      patch.quotaCooldownScope,
+      current.quotaCooldownScope,
+    ),
+    excludeDefaultComponents: normalizeBoolean(
+      patch.excludeDefaultComponents,
+      current.excludeDefaultComponents,
+    ),
+    accountFailover: normalizeBoolean(
+      patch.accountFailover,
+      current.accountFailover,
+    ),
+    maxQuotaAccountSwitches:
+      'maxQuotaAccountSwitches' in patch && patch.maxQuotaAccountSwitches !== undefined
+        ? normalizeBoundedInt(
+            patch.maxQuotaAccountSwitches,
+            RISK_CONTROL_LIMITS.maxQuotaAccountSwitches.min,
+            RISK_CONTROL_LIMITS.maxQuotaAccountSwitches.max,
+            current.maxQuotaAccountSwitches,
+          )
+        : current.maxQuotaAccountSwitches,
+    policyBlockCooldownMs:
+      'policyBlockCooldownMs' in patch && patch.policyBlockCooldownMs !== undefined
+        ? normalizeBoundedInt(
+            patch.policyBlockCooldownMs,
+            RISK_CONTROL_LIMITS.policyBlockCooldownMs.min,
+            RISK_CONTROL_LIMITS.policyBlockCooldownMs.max,
+            current.policyBlockCooldownMs,
+          )
+        : current.policyBlockCooldownMs,
+    maxInternal429RetriesBeforeCancel:
+      'maxInternal429RetriesBeforeCancel' in patch &&
+      patch.maxInternal429RetriesBeforeCancel !== undefined
+        ? normalizeBoundedInt(
+            patch.maxInternal429RetriesBeforeCancel,
+            RISK_CONTROL_LIMITS.maxInternal429RetriesBeforeCancel.min,
+            RISK_CONTROL_LIMITS.maxInternal429RetriesBeforeCancel.max,
+            current.maxInternal429RetriesBeforeCancel,
+          )
+        : current.maxInternal429RetriesBeforeCancel,
     sensitiveFilterEnabled: nextSensitiveFilterEnabled,
     sensitiveWords: nextSensitiveWords,
   };
@@ -308,4 +552,18 @@ export function getPublicConfig(): GatewayConfig {
     apiKey: maskApiKey(cfg.apiKey),
     defaultProxy: maskProxyUrl(cfg.defaultProxy),
   };
+}
+
+export function resolveEffectiveProxy(
+  accountProxyUrl?: string | null,
+  config?: Pick<GatewayConfig, 'defaultProxy'>,
+): string | undefined {
+  const accountProxy = typeof accountProxyUrl === 'string' ? accountProxyUrl.trim() : '';
+  if (accountProxy) {
+    return accountProxy;
+  }
+  const fallbackSource = config ?? getConfig();
+  const defaultProxy =
+    typeof fallbackSource.defaultProxy === 'string' ? fallbackSource.defaultProxy.trim() : '';
+  return defaultProxy || undefined;
 }

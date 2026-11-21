@@ -179,6 +179,29 @@ export function detectAccountTiers(): Promise<DetectAllTiersResult> {
   });
 }
 
+export interface OpenAccountUrlResult {
+  ok: boolean;
+  launched: boolean;
+  reason?: 'chrome_not_found' | 'profile_not_found';
+  profileDir?: string;
+  profileName?: string;
+  email?: string;
+  url?: string;
+}
+
+export function openAccountUrlInChrome(
+  id: string,
+  url: string
+): Promise<OpenAccountUrlResult> {
+  return requestJson<OpenAccountUrlResult>(
+    `/api/accounts/${encodeURIComponent(id)}/open-url`,
+    {
+      method: 'POST',
+      body: JSON.stringify({ url }),
+    }
+  );
+}
+
 export function loginAccount(
   id: string
 ): Promise<{ ok: boolean; message?: string; account?: AccountRecord }> {
@@ -189,13 +212,32 @@ export function loginAccount(
   }>(`/api/accounts/${encodeURIComponent(id)}/login`, { method: 'POST' });
 }
 
-export function refreshAccount(id: string): Promise<AccountRecord> {
-  return requestJson<AccountRecord>(
-    `/api/accounts/${encodeURIComponent(id)}/refresh`,
-    {
-      method: 'POST',
+const REFRESH_ACCOUNT_TIMEOUT_MS = 70_000;
+
+export async function refreshAccount(id: string): Promise<AccountRecord> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => {
+    controller.abort();
+  }, REFRESH_ACCOUNT_TIMEOUT_MS);
+  try {
+    return await requestJson<AccountRecord>(
+      `/api/accounts/${encodeURIComponent(id)}/refresh`,
+      {
+        method: 'POST',
+        signal: controller.signal,
+      }
+    );
+  } catch (err) {
+    if (
+      (err instanceof Error || err instanceof DOMException) &&
+      err.name === 'AbortError'
+    ) {
+      throw new AcpApiError('刷新超时（70s）', 408);
     }
-  );
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 export function refreshAccountQuota(id: string): Promise<AccountRecord> {

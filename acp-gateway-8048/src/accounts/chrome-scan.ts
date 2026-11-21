@@ -421,3 +421,87 @@ export async function authorizeChromeProfiles(
 
   return { ok: true, imported, skipped, errors };
 }
+
+export type OpenUrlInAccountChromeResult =
+  | {
+      ok: true;
+      launched: false;
+      reason: "chrome_not_found";
+    }
+  | {
+      ok: true;
+      launched: false;
+      reason: "profile_not_found";
+      email: string;
+    }
+  | {
+      ok: true;
+      launched: true;
+      profileDir: string;
+      profileName: string;
+      email: string;
+      url: string;
+    };
+
+export interface OpenUrlInAccountChromeDeps {
+  scan?: typeof scanChromeProfiles;
+  spawn?: (
+    cmd: string[],
+    options: { stdout: "ignore"; stderr: "ignore"; stdin: "ignore" }
+  ) => unknown;
+}
+
+/**
+ * 按账号邮箱匹配本机 Chrome Profile，并以该 Profile 启动 Chrome 打开目标 URL。
+ */
+export function openUrlInAccountChrome(
+  email: string,
+  targetUrl: string,
+  deps?: OpenUrlInAccountChromeDeps
+): OpenUrlInAccountChromeResult {
+  const safeUrl = typeof targetUrl === "string" ? targetUrl.trim() : "";
+  if (!safeUrl) {
+    throw new Error("URL is required");
+  }
+  if (/[\r\n\0]/.test(safeUrl)) {
+    throw new Error("URL contains invalid control characters");
+  }
+  if (!/^https?:\/\//i.test(safeUrl)) {
+    throw new Error("URL must start with http:// or https://");
+  }
+
+  const scan = deps?.scan ?? scanChromeProfiles;
+  const { chromeAvailable, chromePath, profiles } = scan();
+  if (!chromeAvailable || !chromePath) {
+    return { ok: true, launched: false, reason: "chrome_not_found" as const };
+  }
+
+  const normalizedEmail = typeof email === "string" ? email.trim().toLowerCase() : "";
+  if (!normalizedEmail) {
+    return { ok: true, launched: false, reason: "profile_not_found" as const, email };
+  }
+
+  const matched = profiles.find(
+    (p) => typeof p.email === "string" && p.email.trim().toLowerCase() === normalizedEmail
+  );
+  if (!matched) {
+    return { ok: true, launched: false, reason: "profile_not_found" as const, email };
+  }
+
+  const spawnFn = deps?.spawn ?? ((cmd, options) => Bun.spawn(cmd, options));
+  spawnFn([chromePath, `--profile-directory=${matched.profileDir}`, safeUrl], {
+    stdout: "ignore",
+    stderr: "ignore",
+    stdin: "ignore",
+  });
+
+  return {
+    ok: true,
+    launched: true,
+    profileDir: matched.profileDir,
+    profileName: matched.name || matched.gaiaName || matched.profileDir,
+    email: matched.email,
+    url: safeUrl,
+  };
+}
+

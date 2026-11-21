@@ -13,7 +13,9 @@ import {
   sumStepUsage,
   type ModelUsageCursor,
 } from "./step-usage";
-import { getConfig } from "../config/settings";
+import { getConfig, resolveEffectiveProxy } from "../config/settings";
+import { checkProxyReachable } from "../accounts/exit-probe";
+import { accountScheduler } from "../accounts/scheduler";
 import {
   applySensitiveFilterToContents,
   applySensitiveFilterToText,
@@ -24,6 +26,7 @@ import {
 } from "./sensitive-filter";
 import type {
   AccountRecord,
+  GatewayConfig,
   GeminiContent,
   GeminiGenerateRequest,
   GeminiPart,
@@ -42,13 +45,17 @@ export type WorkerErrorCode =
   | "CANCELLED";
 
 const CLI_API_ERROR_PREFIX_RE = /^\s*⚠\s*API error\s*\(attempt\s+\d+\):/i;
+const CLI_BARE_API_ERROR_PREFIX_RE = /^\s*(?:⚠\s*)?API error\s*\(attempt\s+\d+\)\s*:/i;
+const CLI_WARNING_PREFIX_RE = /^\s*⚠\s+/;
+const RETRY_429_HINT_RE =
+  /^\s*(?:retrying\b.*\b(?:429|resource_exhausted|rate[_\s-]?limit|quota|too many requests)\b|(?:429|resource_exhausted)\b.*\bretrying\b)/i;
 
 const FAST_ABORT_ERROR_CODES: ReadonlySet<WorkerErrorCode> = new Set([
   "CAPACITY_UNAVAILABLE",
-  "QUOTA_EXHAUSTED",
   "AUTH_REQUIRED",
   "VALIDATION_REQUIRED",
   "RESTRICTED",
+  "TRANSPORT_ERROR",
 ]);
 
 export class WorkerError extends Error {
@@ -117,6 +124,7 @@ export type AcpTransportFactory = (opts: {
 export interface PrewarmedTransportOptions {
   transport: AcpTransport;
   envHomeDir?: string;
+  boundProxyUrl?: string;
   initCaps?: unknown;
   bindHandlers?: (handlers: {
     onUpdate: (params: Record<string, unknown>) => void;
@@ -136,6 +144,8 @@ export interface WorkerOptions {
   stickyKey?: string;
   persistedSession?: AcpSessionSnapshot | null;
   onSessionStateChange?: (snapshot: AcpSessionSnapshot | null) => void;
+  onWorkerSpawn?: (accountId: string) => void;
+  tryAcquireWorkerSpawn?: (accountId: string) => boolean;
   sessionTtlMs?: number;
   prewarmedTransport?: PrewarmedTransportOptions | null;
 }
@@ -420,6 +430,12 @@ export function classifyUpstreamError(
   if (
     lower.includes("account restricted") ||
     lower.includes("permission_denied") ||
+    lower.includes("violation of terms") ||
+    lower.includes("service has been disabled") ||
+    lower.includes("account has been disabled") ||
+    lower.includes("account suspended") ||
+    lower.includes("account banned") ||
+    lower.includes("submit an appeal") ||
     /\b403\b/.test(lower)
   ) {
     return { code: "RESTRICTED", upstreamStatus: 403 };
@@ -446,6 +462,23 @@ export function classifyUpstreamError(
     };
   }
 
+  if (
+    lower.includes("unexpected eof") ||
+    /\beof\b/.test(lower) ||
+    lower.includes("connection reset") ||
+    lower.includes("econnreset") ||
+    lower.includes("broken pipe") ||
+    lower.includes("epipe") ||
+    lower.includes("no such host") ||
+    lower.includes("dial tcp") ||
+    lower.includes("tls handshake timeout") ||
+    lower.includes("i/o timeout") ||
+    lower.includes("context deadline exceeded") ||
+    lower.includes("socket hang up")
+  ) {
+    return { code: "TRANSPORT_ERROR", upstreamStatus: 502 };
+  }
+
   return null;
 }
 
@@ -465,9 +498,11 @@ export class AgySessionWorker {
   private readonly stickyKey?: string;
   private persistedSession: AcpSessionSnapshot | null;
   private readonly onSessionStateChange?: (snapshot: AcpSessionSnapshot | null) => void;
+  private readonly tryAcquireWorkerSpawn: (accountId: string) => boolean;
   private readonly sessionTtlMs: number;
 
   private transport: AcpTransport | null = null;
+  private boundProxyUrl: string | undefined = undefined;
   private sessionId: string | null = null;
   private broker: SessionToolBroker | null = null;
   private registeredMcp: { token: string; url: string; unregister: () => void } | null = null;
@@ -484,6 +519,7 @@ export class AgySessionWorker {
 
   // Per-turn collection state
   private activeTurnParts: GeminiPart[] = [];
+  private internal429RetryCount = 0;
   private activeTurnCallbacks?: WorkerStreamCallbacks;
   private activeSoftErrorAbort?: (err: WorkerError) => void;
   private activeToolBatchResolve?: () => void;
@@ -515,6 +551,14 @@ export class AgySessionWorker {
     this.stickyKey = opts.stickyKey;
     this.persistedSession = opts.persistedSession ?? null;
     this.onSessionStateChange = opts.onSessionStateChange;
+    this.tryAcquireWorkerSpawn =
+      opts.tryAcquireWorkerSpawn ??
+      (opts.onWorkerSpawn
+        ? (accountId) => {
+            opts.onWorkerSpawn!(accountId);
+            return true;
+          }
+        : (accountId) => accountScheduler.tryConsumeWorkerSpawn(accountId));
     this.sessionTtlMs = opts.sessionTtlMs ?? DEFAULT_SESSION_TTL_MS;
     if (opts.prewarmedTransport) {
       this.adoptPrewarmedTransport(
@@ -522,6 +566,7 @@ export class AgySessionWorker {
         opts.prewarmedTransport.envHomeDir,
         {
           initCaps: opts.prewarmedTransport.initCaps,
+          boundProxyUrl: opts.prewarmedTransport.boundProxyUrl,
           bindHandlers: opts.prewarmedTransport.bindHandlers,
         },
       );
@@ -533,6 +578,7 @@ export class AgySessionWorker {
     envHomeDir?: string,
     options?: {
       initCaps?: unknown;
+      boundProxyUrl?: string;
       bindHandlers?: PrewarmedTransportOptions["bindHandlers"];
     },
   ): void {
@@ -542,9 +588,14 @@ export class AgySessionWorker {
     this.prewarmedTransport = {
       transport,
       envHomeDir,
+      boundProxyUrl: options?.boundProxyUrl,
       initCaps: options?.initCaps,
       bindHandlers: options?.bindHandlers,
     };
+  }
+
+  getBoundProxyUrl(): string | undefined {
+    return this.boundProxyUrl;
   }
 
   get isBusy(): boolean {
@@ -562,10 +613,19 @@ export class AgySessionWorker {
    */
   canReuse(
     request: GeminiGenerateRequest,
-    configSnapshot?: SensitiveFilterConfig,
+    configSnapshot?: SensitiveFilterConfig & Partial<Pick<GatewayConfig, "defaultProxy">>,
+    accountOverride?: AccountRecord,
   ): boolean {
     if (!this.isAlive) return false;
     const config = configSnapshot ?? getConfig();
+    const gatewayConfig =
+      configSnapshot && "defaultProxy" in configSnapshot && typeof configSnapshot.defaultProxy === "string"
+        ? { defaultProxy: configSnapshot.defaultProxy }
+        : getConfig();
+    const expectedProxy = resolveEffectiveProxy((accountOverride ?? this.account).proxyUrl, gatewayConfig);
+    if (expectedProxy !== this.boundProxyUrl) {
+      return false;
+    }
     const nextSensitiveFingerprint = computeSensitiveFilterFingerprint(config);
     if (nextSensitiveFingerprint !== this.sensitiveFilterFingerprint) {
       return false;
@@ -648,6 +708,7 @@ export class AgySessionWorker {
     this.busy = true;
     this.lastUsedAt = Date.now();
     this.activeTurnParts = [];
+    this.internal429RetryCount = 0;
     this.activeTurnCallbacks = callbacks;
     this.activeTurnTimings = {
       coldStart: false,
@@ -1026,7 +1087,9 @@ export class AgySessionWorker {
     this.prewarmedTransport = null;
     await this.resetAndClose();
 
-    const config = configSnapshot ?? getConfig();
+    const gatewayConfig = getConfig();
+    const config = configSnapshot ?? gatewayConfig;
+    const effectiveProxy = resolveEffectiveProxy(this.account.proxyUrl, gatewayConfig);
     const declarations = applySensitiveFilterToTools(
       collectToolDeclarations(request),
       config,
@@ -1079,7 +1142,8 @@ export class AgySessionWorker {
     const canAdoptPrewarmed =
       prewarmed !== null &&
       prewarmed.transport.isAlive() &&
-      (prewarmed.envHomeDir === undefined || prewarmed.envHomeDir === this.account.homeDir);
+      (prewarmed.envHomeDir === undefined || prewarmed.envHomeDir === this.account.homeDir) &&
+      prewarmed.boundProxyUrl === effectiveProxy;
 
     if (canAdoptPrewarmed && prewarmed) {
       prewarmed.bindHandlers?.({
@@ -1087,10 +1151,25 @@ export class AgySessionWorker {
         onExit: (code, stderr) => this.handleExit(code, stderr),
       });
       this.transport = prewarmed.transport;
+      this.boundProxyUrl = prewarmed.boundProxyUrl;
       initCaps = prewarmed.initCaps;
     } else {
       if (prewarmed) {
         void prewarmed.transport.close().catch(() => {});
+      }
+
+      if (effectiveProxy && gatewayConfig.strictProxyBinding) {
+        const reach = await checkProxyReachable(effectiveProxy);
+        if (!reach.ok) {
+          await this.resetAndClose();
+          throw new WorkerError(
+            `Proxy unreachable (strictProxyBinding=true): ${reach.error ?? effectiveProxy}`,
+            {
+              code: "TRANSPORT_ERROR",
+              rawError: reach.error,
+            },
+          );
+        }
       }
 
       const spawnStart = performance.now();
@@ -1098,7 +1177,7 @@ export class AgySessionWorker {
       const binaryPath = resolveAgyBinary(this.agyPath);
       const env = buildIsolatedAgyEnv({
         homeDir: this.account.homeDir,
-        proxyUrl: this.account.proxyUrl || undefined,
+        proxyUrl: effectiveProxy,
         agyPath: binaryPath,
       });
       const args = buildAgyWorkerArgs({
@@ -1106,6 +1185,18 @@ export class AgySessionWorker {
         workspaceDir: this.workspaceDir,
       });
 
+      if (!this.tryAcquireWorkerSpawn(this.account.id)) {
+        await this.resetAndClose();
+        throw new WorkerError(
+          `Worker spawn rate limit exceeded for account ${this.account.id}`,
+          {
+            code: "SOFT_ERROR",
+            upstreamStatus: 503,
+          },
+        );
+      }
+
+      this.boundProxyUrl = effectiveProxy;
       this.transport = this.transportFactory({
         binaryPath,
         args,
@@ -1316,17 +1407,39 @@ export class AgySessionWorker {
       this.recordFirstEventTiming();
       this.resetIdleTimer();
 
-      // Antigravity CLI emits `⚠ API error (attempt N): ...` as the very first agent_message_chunk
-      // before retrying locally for minutes. Intercept ONLY when no effective output has been seen yet.
-      if (
-        type === "agent_message_chunk" &&
-        this.activeTurnParts.length === 0 &&
-        CLI_API_ERROR_PREFIX_RE.test(text)
-      ) {
-        const classified = classifyUpstreamError(text);
-        if (classified && FAST_ABORT_ERROR_CODES.has(classified.code)) {
-          this.abortTurnImmediately(text, classified);
-          return;
+      // Antigravity CLI emits `⚠ API error (attempt N): ...` (or bare retry hints) when upstream
+      // transport/API fails and retries locally. Never let this CLI warning leak into model output.
+      if (type === "agent_message_chunk") {
+        const isApiErrorNotice =
+          CLI_API_ERROR_PREFIX_RE.test(text) || CLI_BARE_API_ERROR_PREFIX_RE.test(text);
+        const isCliWarning = CLI_WARNING_PREFIX_RE.test(text);
+        const isRetry429Hint = RETRY_429_HINT_RE.test(text);
+
+        if (isApiErrorNotice || isCliWarning || isRetry429Hint) {
+          const classified = classifyUpstreamError(text);
+          if (classified?.code === "QUOTA_EXHAUSTED") {
+            this.handleInternal429Retry(text, classified);
+            return;
+          }
+          if (isApiErrorNotice) {
+            const fallbackClassified = classified ?? {
+              code: "TRANSPORT_ERROR" as const,
+              upstreamStatus: 502,
+            };
+            if (!this.activeTurnParts.some(isEffectiveOutputPart)) {
+              this.abortTurnImmediately(text, fallbackClassified);
+            }
+            return;
+          }
+          if (
+            isCliWarning &&
+            !this.activeTurnParts.some(isEffectiveOutputPart) &&
+            classified &&
+            FAST_ABORT_ERROR_CODES.has(classified.code)
+          ) {
+            this.abortTurnImmediately(text, classified);
+            return;
+          }
         }
       }
 
@@ -1357,12 +1470,59 @@ export class AgySessionWorker {
         code: "SOFT_ERROR" as const,
         upstreamStatus: 502,
       };
-      if (classified.code === "CAPACITY_UNAVAILABLE") {
+      if (classified.code === "QUOTA_EXHAUSTED") {
+        if (this.handleInternal429Retry(msg, classified)) {
+          return;
+        }
+      }
+      if (
+        classified.code === "CAPACITY_UNAVAILABLE" ||
+        classified.code === "TRANSPORT_ERROR"
+      ) {
         this.abortTurnImmediately(msg, classified);
         return;
       }
       this.scheduleSoftErrorCutoff(msg, classified);
     }
+  }
+
+  private handleInternal429Retry(
+    rawText: string,
+    classified: { code: WorkerErrorCode; upstreamStatus: number; retryAfterMs?: number },
+  ): boolean {
+    this.internal429RetryCount += 1;
+    if (this.activeTurnParts.some(isEffectiveOutputPart)) {
+      return false;
+    }
+    const threshold = getConfig().maxInternal429RetriesBeforeCancel;
+    if (this.internal429RetryCount < threshold) {
+      return false;
+    }
+
+    this.clearSoftErrorTimer();
+    const err = new WorkerError(rawText, {
+      code: classified.code,
+      upstreamStatus: classified.upstreamStatus,
+      retryAfterMs: classified.retryAfterMs,
+      rawError: rawText,
+    });
+    const abort = this.activeSoftErrorAbort;
+    this.activeSoftErrorAbort = undefined;
+    const transport = this.transport;
+    const sessionId = this.sessionId;
+    if (transport && sessionId) {
+      this.sessionId = null;
+      void transport
+        .cancel(sessionId)
+        .catch(() => {})
+        .finally(() => {
+          void this.resetAndClose();
+        });
+    } else {
+      void this.resetAndClose();
+    }
+    abort?.(err);
+    return true;
   }
 
   private abortTurnImmediately(
@@ -1451,6 +1611,7 @@ export class AgySessionWorker {
     this.clearIdleTimer();
     this.inFlightPromptPromise = null;
     this.activeTurnOpen = false;
+    this.internal429RetryCount = 0;
     this.unemittedToolCalls = [];
     this.activeToolBatchResolve = undefined;
     this.awaitingTools.clear();
@@ -1477,6 +1638,7 @@ export class AgySessionWorker {
     if (this.transport) {
       const t = this.transport;
       this.transport = null;
+      this.boundProxyUrl = undefined;
       const sid = this.sessionId;
       this.sessionId = null;
       try {
@@ -1484,5 +1646,6 @@ export class AgySessionWorker {
         await t.close();
       } catch {}
     }
+    this.boundProxyUrl = undefined;
   }
 }

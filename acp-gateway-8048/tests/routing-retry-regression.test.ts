@@ -472,4 +472,230 @@ describe('Routing lease ownership, mixed concurrency & three-protocol retry regr
     expect(scheduler.getReservedCount('acc-solo')).toBe(0);
     expect(activeMap.get('acc-solo') ?? 0).toBe(0);
   });
+
+  it('prevents cascading pool exhaustion when accountFailover is false across Gemini, OpenAI, and Anthropic', async () => {
+    const accounts = [
+      makeAccount('acc-1', { concurrencyLimit: 2 }),
+      makeAccount('acc-2', { concurrencyLimit: 2 }),
+      makeAccount('acc-3', { concurrencyLimit: 2 }),
+    ];
+    const errorCases = [
+      { code: 'QUOTA_EXHAUSTED' as const, upstreamStatus: 429, label: '429' },
+      { code: 'AUTH_REQUIRED' as const, upstreamStatus: 401, label: '401' },
+      { code: 'RESTRICTED' as const, upstreamStatus: 403, label: '403' },
+      { code: 'SOFT_ERROR' as const, upstreamStatus: 402, label: '402' },
+    ];
+
+    for (const errCase of errorCases) {
+      // Reset accounts & cooldowns per scenario
+      for (const acc of accounts) {
+        db.upsertAccount({ ...acc, status: 'ready' });
+        db.deleteCooldown(acc.id, 'gemini-4-hydrogen', 'family');
+        db.deleteCooldown(acc.id, '*', 'global');
+      }
+
+      spies.push(
+        spyOn(settings, 'getConfig').mockImplementation(() =>
+          makeConfig({
+            accountFailover: false,
+            routingStrategy: 'performance-first',
+          }),
+        ),
+      );
+
+      const scheduler = new AccountScheduler({ dbStore: db });
+      const adaptedScheduler = createLeaseSchedulerAdapter(scheduler);
+
+      const protocolCalls: Array<{
+        name: string;
+        invoke: () => Promise<Response | null>;
+      }> = [
+        {
+          name: 'gemini',
+          invoke: () =>
+            createGeminiHandler({
+              scheduler: adaptedScheduler,
+              workerPool: makeFailingPool(),
+            })(
+              new Request('http://localhost/v1beta/models/gemini-4-hydrogen:generateContent', {
+                method: 'POST',
+                body: JSON.stringify({
+                  contents: [{ role: 'user', parts: [{ text: 'hi' }] }],
+                }),
+              }),
+              new URL('http://localhost/v1beta/models/gemini-4-hydrogen:generateContent'),
+            ),
+        },
+        {
+          name: 'openai',
+          invoke: () =>
+            createOpenAiHandler({
+              scheduler: adaptedScheduler,
+              workerPool: makeFailingPool(),
+            })(
+              new Request('http://localhost/v1/chat/completions', {
+                method: 'POST',
+                body: JSON.stringify({
+                  model: 'gemini-4-hydrogen',
+                  messages: [{ role: 'user', content: 'hi' }],
+                }),
+              }),
+              new URL('http://localhost/v1/chat/completions'),
+            ),
+        },
+        {
+          name: 'anthropic',
+          invoke: () =>
+            createAnthropicHandler({
+              scheduler: adaptedScheduler,
+              workerPool: makeFailingPool(),
+            })(
+              new Request('http://localhost/v1/messages', {
+                method: 'POST',
+                body: JSON.stringify({
+                  model: 'gemini-4-hydrogen',
+                  max_tokens: 64,
+                  messages: [{ role: 'user', content: 'hi' }],
+                }),
+              }),
+              new URL('http://localhost/v1/messages'),
+            ),
+        },
+      ];
+
+      let touchedAccounts: string[] = [];
+      function makeFailingPool(): WorkerPoolLike {
+        return {
+          async acquire({ account, sessionHash }) {
+            touchedAccounts.push(account.id);
+            return {
+              id: `${account.id}:${sessionHash}`,
+              accountId: account.id,
+              async generate() {
+                throw new WorkerError(`Simulated ${errCase.label}`, {
+                  code: errCase.code,
+                  upstreamStatus: errCase.upstreamStatus,
+                });
+              },
+            };
+          },
+          release() {},
+        };
+      }
+
+      for (const proto of protocolCalls) {
+        for (const acc of accounts) {
+          db.upsertAccount({ ...acc, status: 'ready' });
+          db.deleteCooldown(acc.id, 'gemini-4-hydrogen', 'family');
+          db.deleteCooldown(acc.id, '*', 'global');
+        }
+        touchedAccounts = [];
+        const res = await proto.invoke();
+        expect(res?.status).toBe(errCase.upstreamStatus);
+        expect(touchedAccounts.length).toBe(1);
+        const touchedId = touchedAccounts[0]!;
+        const untouchedCooldowns = db
+          .listCooldowns(Date.now())
+          .filter((c) => c.accountId !== touchedId);
+        expect(untouchedCooldowns.length).toBe(0);
+      }
+
+      spies.pop()?.mockRestore();
+    }
+  });
+
+  it('caps 429/quota switches at maxQuotaAccountSwitches when accountFailover is true across all three protocols', async () => {
+    const accounts = [
+      makeAccount('acc-q1', { concurrencyLimit: 2 }),
+      makeAccount('acc-q2', { concurrencyLimit: 2 }),
+      makeAccount('acc-q3', { concurrencyLimit: 2 }),
+    ];
+
+    spies.push(
+      spyOn(settings, 'getConfig').mockImplementation(() =>
+        makeConfig({
+          accountFailover: true,
+          maxQuotaAccountSwitches: 1,
+          routingStrategy: 'performance-first',
+        }),
+      ),
+    );
+
+    const runProtocol = async (
+      buildHandler: (scheduler: SchedulerLike, workerPool: WorkerPoolLike) => Promise<Response | null>,
+    ) => {
+      for (const acc of accounts) {
+        db.upsertAccount({ ...acc, status: 'ready' });
+        db.deleteCooldown(acc.id, 'gemini-4-hydrogen', 'family');
+        db.deleteCooldown(acc.id, '*', 'global');
+      }
+      const scheduler = new AccountScheduler({ dbStore: db });
+      const adaptedScheduler = createLeaseSchedulerAdapter(scheduler);
+      const touched: string[] = [];
+      const workerPool: WorkerPoolLike = {
+        async acquire({ account, sessionHash }) {
+          touched.push(account.id);
+          return {
+            id: `${account.id}:${sessionHash}`,
+            accountId: account.id,
+            async generate() {
+              throw new WorkerError('Rate limit exceeded', {
+                code: 'QUOTA_EXHAUSTED',
+                upstreamStatus: 429,
+              });
+            },
+          };
+        },
+        release() {},
+      };
+
+      const res = await buildHandler(adaptedScheduler, workerPool);
+      expect(res?.status).toBe(429);
+      // maxQuotaAccountSwitches = 1 -> 1 initial attempt + 1 switch = 2 attempts; 3rd account untouched
+      expect(touched.length).toBe(2);
+      const untouched = accounts.find((a) => !touched.includes(a.id));
+      expect(untouched).toBeDefined();
+      const untouchedCooldowns = db
+        .listCooldowns(Date.now())
+        .filter((c) => c.accountId === untouched!.id);
+      expect(untouchedCooldowns.length).toBe(0);
+    };
+
+    await runProtocol((scheduler, workerPool) =>
+      createGeminiHandler({ scheduler, workerPool })(
+        new Request('http://localhost/v1beta/models/gemini-4-hydrogen:generateContent', {
+          method: 'POST',
+          body: JSON.stringify({ contents: [{ role: 'user', parts: [{ text: 'hi' }] }] }),
+        }),
+        new URL('http://localhost/v1beta/models/gemini-4-hydrogen:generateContent'),
+      ),
+    );
+
+    await runProtocol((scheduler, workerPool) =>
+      createOpenAiHandler({ scheduler, workerPool })(
+        new Request('http://localhost/v1/chat/completions', {
+          method: 'POST',
+          body: JSON.stringify({
+            model: 'gemini-4-hydrogen',
+            messages: [{ role: 'user', content: 'hi' }],
+          }),
+        }),
+        new URL('http://localhost/v1/chat/completions'),
+      ),
+    );
+
+    await runProtocol((scheduler, workerPool) =>
+      createAnthropicHandler({ scheduler, workerPool })(
+        new Request('http://localhost/v1/messages', {
+          method: 'POST',
+          body: JSON.stringify({
+            model: 'gemini-4-hydrogen',
+            max_tokens: 64,
+            messages: [{ role: 'user', content: 'hi' }],
+          }),
+        }),
+        new URL('http://localhost/v1/messages'),
+      ),
+    );
+  });
 });

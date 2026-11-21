@@ -1,7 +1,8 @@
 import { randomUUID } from 'node:crypto';
+import { checkProxyReachable } from '../accounts/exit-probe';
 import { buildIsolatedAgyEnv, resolveAgyBinary } from '../acp/env';
 import { WorkerError, type WorkerModelSelection } from '../acp/worker';
-import { getConfig } from '../config/settings';
+import { getConfig, resolveEffectiveProxy } from '../config/settings';
 import { store } from '../db/store';
 import { eventBus } from '../logs/events';
 import type {
@@ -241,44 +242,55 @@ function spawnAgyModelsList(): Promise<string[]> {
       resolve(ids);
     };
 
-    try {
-      const readyAccount = store.listAccounts().find((acc) => acc.status === 'ready');
-      if (!readyAccount) {
-        settle([]);
-        return;
-      }
-      const binaryPath = resolveAgyBinary();
-      const env = buildIsolatedAgyEnv({
-        homeDir: readyAccount.homeDir,
-        proxyUrl: readyAccount.proxyUrl || undefined,
-        agyPath: binaryPath,
-      });
-      proc = Bun.spawn([binaryPath, 'models'], {
-        env,
-        stdout: 'pipe',
-        stderr: 'pipe',
-      });
-      timer = setTimeout(() => {
-        try {
-          proc?.kill();
-        } catch {
-          // ignore
+    void (async () => {
+      try {
+        const readyAccount = store.listAccounts().find((acc) => acc.status === 'ready');
+        if (!readyAccount) {
+          settle([]);
+          return;
         }
-        settle([]);
-      }, MODEL_DISCOVERY_TIMEOUT_MS);
-      if (proc.stdout && typeof proc.stdout !== 'number') {
-        new Response(proc.stdout)
-          .text()
-          .then((stdout) => settle(parseAgyModelsOutput(stdout)))
-          .catch(() => settle([]));
-      } else {
+        const cfg = getConfig();
+        const effectiveProxy = resolveEffectiveProxy(readyAccount.proxyUrl, cfg);
+        if (effectiveProxy && cfg.strictProxyBinding) {
+          const reach = await checkProxyReachable(effectiveProxy);
+          if (!reach.ok) {
+            settle([]);
+            return;
+          }
+        }
+        const binaryPath = resolveAgyBinary();
+        const env = buildIsolatedAgyEnv({
+          homeDir: readyAccount.homeDir,
+          proxyUrl: effectiveProxy,
+          agyPath: binaryPath,
+        });
+        proc = Bun.spawn([binaryPath, 'models'], {
+          env,
+          stdout: 'pipe',
+          stderr: 'pipe',
+        });
+        timer = setTimeout(() => {
+          try {
+            proc?.kill();
+          } catch {
+            // ignore
+          }
+          settle([]);
+        }, MODEL_DISCOVERY_TIMEOUT_MS);
+        if (proc.stdout && typeof proc.stdout !== 'number') {
+          new Response(proc.stdout)
+            .text()
+            .then((stdout) => settle(parseAgyModelsOutput(stdout)))
+            .catch(() => settle([]));
+        } else {
+          settle([]);
+        }
+        // Never surface the child's exit as an unhandled rejection.
+        void proc.exited.catch(() => {});
+      } catch {
         settle([]);
       }
-      // Never surface the child's exit as an unhandled rejection.
-      void proc.exited.catch(() => {});
-    } catch {
-      settle([]);
-    }
+    })();
   });
 }
 
@@ -734,6 +746,7 @@ export function createGeminiHandler(deps: GeminiHandlerDeps = {}) {
 
       const excludeAccountIds: string[] = [];
       let nonQuotaSwitches = 0;
+      let quotaSwitches = 0;
       let modelSelectionSwitches = 0;
       let attemptIndex = 0;
       let earliestRetryAt: number | undefined;
@@ -1073,7 +1086,63 @@ export function createGeminiHandler(deps: GeminiHandlerDeps = {}) {
               return { errorResponse: jsonError(classified.status, classified.reasonText, classified.reasonCode) };
             }
 
-            if (!classified.isQuotaError) {
+            const isAccountFailoverError =
+              classified.isQuotaError ||
+              classified.status === 401 ||
+              classified.status === 402 ||
+              classified.status === 403 ||
+              classified.status === 429 ||
+              classified.reasonCode === 'QUOTA_EXHAUSTED' ||
+              classified.reasonCode === 'RESOURCE_EXHAUSTED' ||
+              classified.reasonCode === 'AUTH_REQUIRED' ||
+              classified.reasonCode === 'RESTRICTED' ||
+              classified.reasonCode === 'VALIDATION_REQUIRED';
+
+            const getQuotaRetryHeaders = (): Record<string, string> | undefined => {
+              if (classified.status !== 429 && !classified.isQuotaError) {
+                return undefined;
+              }
+              const seconds =
+                failResult?.retryAfterSeconds !== undefined
+                  ? Math.max(1, failResult.retryAfterSeconds)
+                  : earliestRetryAt !== undefined
+                    ? Math.max(1, Math.ceil((earliestRetryAt - Date.now()) / 1000))
+                    : typeof classified.retryAfterMs === 'number' && Number.isFinite(classified.retryAfterMs)
+                      ? Math.max(1, Math.ceil(classified.retryAfterMs / 1000))
+                      : Math.max(1, Math.round((config.cooldownStepsMinutes[0] ?? 1) * 60));
+              return { 'Retry-After': String(seconds) };
+            };
+
+            if (!config.accountFailover && isAccountFailoverError) {
+              eventBus.finishRequest(requestId, { state: 'failed', httpStatus: classified.status });
+              return {
+                errorResponse: jsonError(
+                  classified.status,
+                  classified.reasonText,
+                  classified.reasonCode,
+                  getQuotaRetryHeaders(),
+                ),
+              };
+            }
+
+            if (classified.isQuotaError) {
+              quotaSwitches += 1;
+              if (quotaSwitches > config.maxQuotaAccountSwitches) {
+                const retryHeaders =
+                  earliestRetryAt !== undefined
+                    ? { 'Retry-After': String(Math.max(1, Math.ceil((earliestRetryAt - Date.now()) / 1000))) }
+                    : getQuotaRetryHeaders();
+                eventBus.finishRequest(requestId, { state: 'failed', httpStatus: classified.status });
+                return {
+                  errorResponse: jsonError(
+                    classified.status,
+                    classified.reasonText,
+                    classified.reasonCode,
+                    retryHeaders,
+                  ),
+                };
+              }
+            } else {
               nonQuotaSwitches += 1;
               if (nonQuotaSwitches > config.maxAccountSwitches) {
                 eventBus.finishRequest(requestId, { state: 'failed', httpStatus: classified.status });

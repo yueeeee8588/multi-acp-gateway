@@ -10,6 +10,9 @@ import { buildAgyWorkerArgs, buildIsolatedAgyEnv, getDataRoot, resolveAgyBinary 
 import { ensureMinimalAgentDefinition } from "./minimal-agent";
 import { LoopbackMcpServer } from "./loopback-mcp";
 import { store } from "../db/store";
+import { getConfig, resolveEffectiveProxy } from "../config/settings";
+import { checkProxyReachable } from "../accounts/exit-probe";
+import { accountScheduler } from "../accounts/scheduler";
 import type { AccountRecord, GeminiContent, GeminiGenerateRequest } from "../types";
 
 export interface AcpWorkerPoolOptions {
@@ -23,6 +26,8 @@ export interface AcpWorkerPoolOptions {
   prewarmPerAccount?: number;
   maxPrewarmTotal?: number;
   maxConcurrentStarts?: number;
+  onWorkerSpawn?: (accountId: string) => void;
+  tryAcquireWorkerSpawn?: (accountId: string) => boolean;
 }
 
 interface PoolEntry {
@@ -36,6 +41,7 @@ interface PoolEntry {
 interface PrewarmEntry {
   accountId: string;
   homeDir: string;
+  boundProxyUrl?: string;
   transport: AcpTransport;
   initCaps: unknown;
   createdAt: number;
@@ -76,6 +82,7 @@ export class AcpWorkerPool {
   private readonly prewarmPerAccount: number;
   private readonly maxPrewarmTotal: number;
   private readonly maxConcurrentStarts: number;
+  private readonly tryAcquireWorkerSpawn: (accountId: string) => boolean;
   private activeStarts = 0;
   private readonly startQueue: Array<() => void> = [];
   private shuttingDown = false;
@@ -91,6 +98,16 @@ export class AcpWorkerPool {
     this.prewarmPerAccount = Math.max(0, opts.prewarmPerAccount ?? DEFAULT_PREWARM_PER_ACCOUNT);
     this.maxPrewarmTotal = Math.max(0, opts.maxPrewarmTotal ?? DEFAULT_MAX_PREWARM_TOTAL);
     this.maxConcurrentStarts = Math.max(1, opts.maxConcurrentStarts ?? DEFAULT_MAX_CONCURRENT_STARTS);
+    this.tryAcquireWorkerSpawn =
+      opts.tryAcquireWorkerSpawn ??
+      (opts.onWorkerSpawn
+        ? (accountId) => {
+            opts.onWorkerSpawn!(accountId);
+            return true;
+          }
+        : (accountId) => accountScheduler.tryConsumeWorkerSpawn(accountId));
+
+    store.pruneAcpSessions();
 
     const intervalMs = opts.cleanupIntervalMs ?? 30_000;
     this.cleanupTimer = setInterval(() => {
@@ -118,7 +135,7 @@ export class AcpWorkerPool {
     const stickyKey = `${account.id}:${model}:${resolvedSessionKey}`;
 
     let entry = this.entries.get(stickyKey);
-    if (entry && !entry.inUse && entry.worker.canReuse(request)) {
+    if (entry && !entry.inUse && entry.worker.canReuse(request, undefined, account)) {
       entry.inUse = true;
       this.syncActiveCount(account.id);
       return {
@@ -138,7 +155,8 @@ export class AcpWorkerPool {
       ? stickyKey
       : `${stickyKey}:${Date.now()}:${Math.random().toString(36).slice(2, 6)}`;
     const persistedSession = isPrimarySlot ? store.getAcpSession(stickyKey) : undefined;
-    const prewarmed = this.takePrewarmedTransport(account.id, account.homeDir);
+    const expectedProxy = resolveEffectiveProxy(account.proxyUrl);
+    const prewarmed = this.takePrewarmedTransport(account.id, account.homeDir, expectedProxy);
 
     const worker = new AgySessionWorker({
       account,
@@ -150,10 +168,12 @@ export class AcpWorkerPool {
       transportFactory: this.transportFactory,
       stickyKey,
       persistedSession,
+      tryAcquireWorkerSpawn: this.tryAcquireWorkerSpawn,
       prewarmedTransport: prewarmed
         ? {
             transport: prewarmed.transport,
             envHomeDir: prewarmed.homeDir,
+            boundProxyUrl: prewarmed.boundProxyUrl,
             initCaps: prewarmed.initCaps,
             bindHandlers: prewarmed.bindHandlers,
           }
@@ -168,6 +188,7 @@ export class AcpWorkerPool {
                 model,
                 systemHash: snapshot.systemHash,
                 toolsHash: snapshot.toolsHash,
+                sensitiveFilterFingerprint: snapshot.sensitiveFilterFingerprint ?? "",
                 committedHashes: snapshot.committedHashes,
                 updatedAt: snapshot.updatedAt,
               });
@@ -277,7 +298,11 @@ export class AcpWorkerPool {
     }
   }
 
-  private takePrewarmedTransport(accountId: string, homeDir: string): PrewarmEntry | null {
+  private takePrewarmedTransport(
+    accountId: string,
+    homeDir: string,
+    expectedProxy?: string,
+  ): PrewarmEntry | null {
     const list = this.prewarmed.get(accountId);
     if (!list || list.length === 0) return null;
 
@@ -286,7 +311,11 @@ export class AcpWorkerPool {
       if (list.length === 0) {
         this.prewarmed.delete(accountId);
       }
-      if (candidate.homeDir === homeDir && candidate.transport.isAlive()) {
+      if (
+        candidate.homeDir === homeDir &&
+        candidate.boundProxyUrl === expectedProxy &&
+        candidate.transport.isAlive()
+      ) {
         candidate.adopted = true;
         return candidate;
       }
@@ -337,13 +366,22 @@ export class AcpWorkerPool {
       return await this.withStartLimit(async () => {
         if (this.shuttingDown) return false;
 
+        const cfg = getConfig();
+        const effectiveProxy = resolveEffectiveProxy(account.proxyUrl, cfg);
+        if (effectiveProxy && cfg.strictProxyBinding) {
+          const reach = await checkProxyReachable(effectiveProxy);
+          if (!reach.ok) {
+            return false;
+          }
+        }
+
         const factory = this.transportFactory ?? defaultTransportFactory;
         const workspaceDir = this.workspaceDir ?? getDataRoot();
         ensureMinimalAgentDefinition(workspaceDir);
         const binaryPath = resolveAgyBinary(this.agyPath);
         const env = buildIsolatedAgyEnv({
           homeDir: account.homeDir,
-          proxyUrl: account.proxyUrl || undefined,
+          proxyUrl: effectiveProxy,
           agyPath: binaryPath,
         });
         const args = buildAgyWorkerArgs({
@@ -357,6 +395,9 @@ export class AcpWorkerPool {
         } = {};
         let entryRef: PrewarmEntry | null = null;
 
+        if (!this.tryAcquireWorkerSpawn(account.id)) {
+          return false;
+        }
         transport = factory({
           binaryPath,
           args,
@@ -393,6 +434,7 @@ export class AcpWorkerPool {
         const entry: PrewarmEntry = {
           accountId: account.id,
           homeDir: account.homeDir,
+          boundProxyUrl: effectiveProxy,
           transport,
           initCaps,
           createdAt: Date.now(),

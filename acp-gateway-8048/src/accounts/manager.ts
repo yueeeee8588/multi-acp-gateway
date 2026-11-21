@@ -4,10 +4,10 @@ import os from "node:os";
 import path from "node:path";
 import { AcpConnection } from "../acp/connection";
 import { buildAgyWorkerArgs, buildIsolatedAgyEnv, ensureIsolatedHomeStructure, getDataRoot, resolveAgyBinary } from "../acp/env";
-import { getConfig } from "../config/settings";
+import { getConfig, resolveEffectiveProxy } from "../config/settings";
 import { store } from "../db/store";
 import { eventBus } from "../logs/events";
-import { probeAccountExit } from "./exit-probe";
+import { checkProxyReachable, detectExitIpDrift, probeAccountExit } from "./exit-probe";
 import { fetchAccountQuota } from "./quota";
 import type { AccountQuotaSnapshot, AccountRecord, AccountStatus, AccountTier } from "../types";
 
@@ -65,17 +65,21 @@ export function classifyAcpProbeError(
 ): { status: AccountStatus; reason: string } {
   const msg = err instanceof Error ? err.message : String(err);
   const lower = msg.toLowerCase();
-  const reason = msg.slice(0, 200);
+  const reason = msg.slice(0, 1000);
 
-  if (/401|auth|unauthorized|unauthenticated|invalid_grant|login|token/.test(lower)) {
-    return { status: "auth_required", reason };
-  }
   if (
-    /403|forbidden|restricted|validation_required|verify your account|account verification|violation of terms|disabled|suspended|banned/.test(
+    /403|forbidden|restricted|validation_required|verify your account|account verification|violation of terms|service has been disabled|account has been disabled|suspended|banned|submit an appeal/.test(
       lower
     )
   ) {
     return { status: "restricted", reason };
+  }
+  if (
+    /401|unauthorized|unauthenticated|invalid_grant|invalid_client|unauthorized_client|please login|not logged in|invalid credentials/.test(
+      lower
+    )
+  ) {
+    return { status: "auth_required", reason };
   }
   return { status: currentStatus, reason };
 }
@@ -546,13 +550,20 @@ export class AccountManager {
     const existing = store.getAccount(id);
     if (!existing) return null;
 
+    const nextStatusReason =
+      patch.statusReason !== undefined
+        ? patch.statusReason
+        : patch.status === "ready"
+          ? ""
+          : existing.statusReason;
+
     const next: AccountRecord = {
       ...existing,
       label: patch.label !== undefined ? patch.label : existing.label,
       email: patch.email !== undefined ? patch.email : existing.email,
       proxyUrl: patch.proxyUrl !== undefined ? patch.proxyUrl : existing.proxyUrl,
       status: patch.status !== undefined ? patch.status : existing.status,
-      statusReason: patch.statusReason !== undefined ? patch.statusReason : existing.statusReason,
+      statusReason: nextStatusReason,
       tier: patch.tier !== undefined ? (patch.tier === "pro" ? "pro" : "standard") : existing.tier,
       concurrencyLimit:
         patch.concurrencyLimit !== undefined ? patch.concurrencyLimit : existing.concurrencyLimit,
@@ -560,6 +571,12 @@ export class AccountManager {
     };
 
     store.upsertAccount(next);
+    if (patch.status === "ready") {
+      const deleted = store.deleteCooldown(id, "*", "global");
+      if (deleted) {
+        eventBus.emit("cooldowns", store.listCooldowns(Date.now()));
+      }
+    }
     this.emitAccounts();
     return next;
   }
@@ -899,7 +916,7 @@ export class AccountManager {
     const binaryPath = resolveAgyBinary(cfg.agyPath);
     const env = buildIsolatedAgyEnv({
       homeDir: acc.homeDir,
-      proxyUrl: acc.proxyUrl || cfg.defaultProxy || undefined,
+      proxyUrl: resolveEffectiveProxy(acc.proxyUrl, cfg),
       agyPath: binaryPath,
     });
 
@@ -941,34 +958,76 @@ export class AccountManager {
     if (!acc) return null;
 
     const cfg = getConfig();
-    const proxy = acc.proxyUrl || cfg.defaultProxy || undefined;
+    const proxy = resolveEffectiveProxy(acc.proxyUrl, cfg);
+    if (proxy && cfg.strictProxyBinding) {
+      const reach = await checkProxyReachable(proxy);
+      if (!reach.ok) {
+        throw new Error(`Proxy unreachable (strictProxyBinding=true): ${reach.error ?? proxy}`);
+      }
+    }
+
     const probe = await (acpProbeDeps.probeExit ?? probeAccountExit)(proxy, 4000);
+    const probeOk = probe.probeOk ?? Boolean(probe.exitIp?.trim());
+    if (!probeOk) {
+      console.warn(
+        `[exit-probe] exit IP probe failed for account=${acc.id}: ${probe.error ?? "empty exit IP"}`,
+      );
+    }
+
+    const drift = probeOk
+      ? detectExitIpDrift(
+          { exitIp: acc.exitIp, exitCountry: acc.exitCountry },
+          { exitIp: probe.exitIp, exitCountry: probe.exitCountry },
+        )
+      : null;
+    if (drift?.drifted) {
+      console.warn(
+        `[risk-control] exit IP drift detected for account=${acc.id}: ${drift.previousExitIp} -> ${drift.currentExitIp}`,
+      );
+    }
+
     const now = Date.now();
 
     const saveResult = (
       status: AccountStatus,
       statusReason: string,
       detectedTier?: AccountTier | null,
-      quotaSnapshot?: AccountQuotaSnapshot | null
+      quotaSnapshot?: AccountQuotaSnapshot | null,
+      preserveExitBaseline = false
     ): AccountRecord => {
+      const effectiveReason =
+        !probeOk && status === "ready" && !statusReason
+          ? `Exit IP probe failed (keeping cached IP): ${probe.error ?? "unknown"}`
+          : statusReason;
+      const shouldUpdateExit = probeOk && !preserveExitBaseline;
       const updated: AccountRecord = {
         ...acc,
         ...(detectedTier ? { tier: detectedTier } : {}),
         ...(quotaSnapshot !== undefined ? { quota: quotaSnapshot } : {}),
-        exitIp: probe.exitIp || acc.exitIp,
-        exitCountry: probe.exitCountry || acc.exitCountry,
+        exitIp: shouldUpdateExit ? probe.exitIp : acc.exitIp,
+        exitCountry: shouldUpdateExit ? (probe.exitCountry || acc.exitCountry) : acc.exitCountry,
         status,
-        statusReason,
-        lastVerifiedAt: now,
+        statusReason: effectiveReason,
+        lastVerifiedAt: shouldUpdateExit ? now : acc.lastVerifiedAt,
         updatedAt: now,
       };
       store.upsertAccount(updated);
+      if (status === "ready") {
+        const deleted = store.deleteCooldown(acc.id, "*", "global");
+        if (deleted) {
+          eventBus.emit("cooldowns", store.listCooldowns(now));
+        }
+      }
       this.emitAccounts();
       return updated;
     };
 
     if (acc.status === "disabled") {
       return saveResult("disabled", acc.statusReason);
+    }
+
+    if (drift?.drifted && cfg.blockOnExitIpDrift) {
+      return saveResult("restricted", drift.reason!, undefined, undefined, true);
     }
 
     // 1. 检查 OAuth token 文件是否存在且含 refresh_token
@@ -1026,6 +1085,12 @@ export class AccountManager {
         agyPath: binaryPath,
       });
 
+      let rejectProbeUpdate: ((err: Error) => void) | null = null;
+      const updateErrorPromise = new Promise<never>((_, reject) => {
+        rejectProbeUpdate = reject;
+      });
+      updateErrorPromise.catch(() => {});
+
       const createConn =
         acpProbeDeps.createConnection ?? ((opts) => new AcpConnection(opts));
       conn = createConn({
@@ -1033,7 +1098,30 @@ export class AccountManager {
         args,
         cwd,
         env,
-        onUpdate: () => {},
+        onUpdate: (params) => {
+          const update = (params.update ?? params) as Record<string, unknown>;
+          const sessionUpdate =
+            typeof update.sessionUpdate === "string" ? update.sessionUpdate : "";
+          if (sessionUpdate === "error") {
+            const msg =
+              typeof update.message === "string"
+                ? update.message
+                : JSON.stringify(update);
+            rejectProbeUpdate?.(new Error(msg));
+            return;
+          }
+          if (sessionUpdate === "agent_message_chunk") {
+            const content = update.content as Record<string, unknown> | undefined;
+            const text = typeof content?.text === "string" ? content.text : "";
+            if (
+              text &&
+              /^\s*⚠\s+/.test(text) &&
+              classifyAcpProbeError(text, "ready").status !== "ready"
+            ) {
+              rejectProbeUpdate?.(new Error(text));
+            }
+          }
+        },
         onExit: () => {},
       });
 
@@ -1065,6 +1153,7 @@ export class AccountManager {
           });
         })(),
         timeoutPromise,
+        updateErrorPromise,
       ]);
 
       return saveResult("ready", "", detectedTier, quotaSnapshot);
@@ -1134,7 +1223,7 @@ export class AccountManager {
         return;
       }
 
-      const proxy = acc.proxyUrl || cfg.defaultProxy || undefined;
+      const proxy = resolveEffectiveProxy(acc.proxyUrl, cfg);
       try {
         const tokenFetchInit: RequestInit & { proxy?: string } = {
           method: "POST",
@@ -1280,7 +1369,7 @@ export class AccountManager {
     if (!acc) return null;
 
     const cfg = getConfig();
-    const proxy = acc.proxyUrl || cfg.defaultProxy || undefined;
+    const proxy = resolveEffectiveProxy(acc.proxyUrl, cfg);
     const emptyPools = {
       gemini_flagship: null,
       gemini_flash: null,

@@ -9,14 +9,15 @@ import {
   RotateCcw,
   Save,
   Server,
+  ShieldAlert,
   ShieldCheck,
   SlidersHorizontal,
   X,
 } from 'lucide-react';
-import { Badge, Button, ErrorBox, Field, IconButton, Select } from '../components';
+import { Badge, Button, ErrorBox, Field, IconButton, Select, Toggle } from '../components';
 import { AcpSensitiveFilterPanel } from './AcpSensitiveFilterPanel';
 import { updateConfig } from './api';
-import type { GatewayConfig, RoutingStrategy } from './types';
+import type { GatewayConfig, QuotaCooldownScope, RoutingStrategy } from './types';
 
 export interface AcpSettingsViewProps {
   config: GatewayConfig | null;
@@ -24,10 +25,55 @@ export interface AcpSettingsViewProps {
   notify: (msg: string, kind?: 'success' | 'error') => void;
 }
 
+const RISK_CONTROL_DEFAULTS = {
+  strictProxyBinding: true,
+  blockOnExitIpDrift: false,
+  maxConcurrencyPerExitIp: 4,
+  minExitIpRequestIntervalMs: 250,
+  minAccountRequestIntervalMs: 500,
+  requestJitterMs: 300,
+  maxWorkerSpawnsPerMinute: 12,
+  quotaCooldownScope: 'family' as QuotaCooldownScope,
+  excludeDefaultComponents: false,
+  accountFailover: false,
+  maxQuotaAccountSwitches: 1,
+  policyBlockCooldownMs: 21_600_000,
+  maxInternal429RetriesBeforeCancel: 2,
+};
+
+function withRiskControlDefaults(cfg: GatewayConfig) {
+  return {
+    strictProxyBinding: cfg.strictProxyBinding ?? RISK_CONTROL_DEFAULTS.strictProxyBinding,
+    blockOnExitIpDrift: cfg.blockOnExitIpDrift ?? RISK_CONTROL_DEFAULTS.blockOnExitIpDrift,
+    maxConcurrencyPerExitIp:
+      cfg.maxConcurrencyPerExitIp ?? RISK_CONTROL_DEFAULTS.maxConcurrencyPerExitIp,
+    minExitIpRequestIntervalMs:
+      cfg.minExitIpRequestIntervalMs ?? RISK_CONTROL_DEFAULTS.minExitIpRequestIntervalMs,
+    minAccountRequestIntervalMs:
+      cfg.minAccountRequestIntervalMs ?? RISK_CONTROL_DEFAULTS.minAccountRequestIntervalMs,
+    requestJitterMs: cfg.requestJitterMs ?? RISK_CONTROL_DEFAULTS.requestJitterMs,
+    maxWorkerSpawnsPerMinute:
+      cfg.maxWorkerSpawnsPerMinute ?? RISK_CONTROL_DEFAULTS.maxWorkerSpawnsPerMinute,
+    quotaCooldownScope: cfg.quotaCooldownScope ?? RISK_CONTROL_DEFAULTS.quotaCooldownScope,
+    excludeDefaultComponents:
+      cfg.excludeDefaultComponents ?? RISK_CONTROL_DEFAULTS.excludeDefaultComponents,
+    accountFailover:
+      cfg.accountFailover ?? RISK_CONTROL_DEFAULTS.accountFailover,
+    maxQuotaAccountSwitches:
+      cfg.maxQuotaAccountSwitches ?? RISK_CONTROL_DEFAULTS.maxQuotaAccountSwitches,
+    policyBlockCooldownMs:
+      cfg.policyBlockCooldownMs ?? RISK_CONTROL_DEFAULTS.policyBlockCooldownMs,
+    maxInternal429RetriesBeforeCancel:
+      cfg.maxInternal429RetriesBeforeCancel ??
+      RISK_CONTROL_DEFAULTS.maxInternal429RetriesBeforeCancel,
+  };
+}
+
 function cloneConfig(cfg: GatewayConfig): GatewayConfig {
   return {
     ...cfg,
     cacheSettlingDelayMs: cfg.cacheSettlingDelayMs ?? 1000,
+    ...withRiskControlDefaults(cfg),
     apiKey: '',
     defaultProxy: '',
     cooldownStepsMinutes: [...cfg.cooldownStepsMinutes],
@@ -125,6 +171,47 @@ export function AcpSettingsView({
       if (currentDraft.maxLogsRetained === prev.maxLogsRetained) {
         next.maxLogsRetained = config.maxLogsRetained;
       }
+      const prevRisk = withRiskControlDefaults(prev);
+      const nextRisk = withRiskControlDefaults(config);
+      if ((currentDraft.strictProxyBinding ?? prevRisk.strictProxyBinding) === prevRisk.strictProxyBinding) {
+        next.strictProxyBinding = nextRisk.strictProxyBinding;
+      }
+      if ((currentDraft.blockOnExitIpDrift ?? prevRisk.blockOnExitIpDrift) === prevRisk.blockOnExitIpDrift) {
+        next.blockOnExitIpDrift = nextRisk.blockOnExitIpDrift;
+      }
+      if ((currentDraft.maxConcurrencyPerExitIp ?? prevRisk.maxConcurrencyPerExitIp) === prevRisk.maxConcurrencyPerExitIp) {
+        next.maxConcurrencyPerExitIp = nextRisk.maxConcurrencyPerExitIp;
+      }
+      if ((currentDraft.minExitIpRequestIntervalMs ?? prevRisk.minExitIpRequestIntervalMs) === prevRisk.minExitIpRequestIntervalMs) {
+        next.minExitIpRequestIntervalMs = nextRisk.minExitIpRequestIntervalMs;
+      }
+      if ((currentDraft.minAccountRequestIntervalMs ?? prevRisk.minAccountRequestIntervalMs) === prevRisk.minAccountRequestIntervalMs) {
+        next.minAccountRequestIntervalMs = nextRisk.minAccountRequestIntervalMs;
+      }
+      if ((currentDraft.requestJitterMs ?? prevRisk.requestJitterMs) === prevRisk.requestJitterMs) {
+        next.requestJitterMs = nextRisk.requestJitterMs;
+      }
+      if ((currentDraft.maxWorkerSpawnsPerMinute ?? prevRisk.maxWorkerSpawnsPerMinute) === prevRisk.maxWorkerSpawnsPerMinute) {
+        next.maxWorkerSpawnsPerMinute = nextRisk.maxWorkerSpawnsPerMinute;
+      }
+      if ((currentDraft.quotaCooldownScope ?? prevRisk.quotaCooldownScope) === prevRisk.quotaCooldownScope) {
+        next.quotaCooldownScope = nextRisk.quotaCooldownScope;
+      }
+      if ((currentDraft.excludeDefaultComponents ?? prevRisk.excludeDefaultComponents) === prevRisk.excludeDefaultComponents) {
+        next.excludeDefaultComponents = nextRisk.excludeDefaultComponents;
+      }
+      if ((currentDraft.accountFailover ?? prevRisk.accountFailover) === prevRisk.accountFailover) {
+        next.accountFailover = nextRisk.accountFailover;
+      }
+      if ((currentDraft.maxQuotaAccountSwitches ?? prevRisk.maxQuotaAccountSwitches) === prevRisk.maxQuotaAccountSwitches) {
+        next.maxQuotaAccountSwitches = nextRisk.maxQuotaAccountSwitches;
+      }
+      if ((currentDraft.policyBlockCooldownMs ?? prevRisk.policyBlockCooldownMs) === prevRisk.policyBlockCooldownMs) {
+        next.policyBlockCooldownMs = nextRisk.policyBlockCooldownMs;
+      }
+      if ((currentDraft.maxInternal429RetriesBeforeCancel ?? prevRisk.maxInternal429RetriesBeforeCancel) === prevRisk.maxInternal429RetriesBeforeCancel) {
+        next.maxInternal429RetriesBeforeCancel = nextRisk.maxInternal429RetriesBeforeCancel;
+      }
       return next;
     });
 
@@ -156,8 +243,10 @@ export function AcpSettingsView({
       sensitiveWords: _sensitiveWords,
       ...ordinarySettings
     } = draft;
+    const draftRisk = withRiskControlDefaults(draft);
     const settings = {
       ...ordinarySettings,
+      ...draftRisk,
       host: draft.host.trim(),
       agyPath: draft.agyPath.trim(),
       cooldownStepsMinutes: parsedCooldownSteps,
@@ -165,6 +254,7 @@ export function AcpSettingsView({
     const currentSettings = {
       ...config,
       cacheSettlingDelayMs: config.cacheSettlingDelayMs ?? 1000,
+      ...withRiskControlDefaults(config),
     };
     const changes = Object.fromEntries(
       (Object.keys(settings) as Array<keyof typeof settings>)
@@ -175,7 +265,11 @@ export function AcpSettingsView({
     if (clearDefaultProxy || defaultProxy.trim()) {
       changes.defaultProxy = clearDefaultProxy ? '' : defaultProxy.trim();
     }
-    return changes;
+    if (Object.keys(changes).length === 0) return {};
+    return {
+      ...changes,
+      ...draftRisk,
+    };
   }, [config, draft, parsedCooldownSteps, clearApiKey, clearDefaultProxy]);
   const isDirty = Object.keys(patch).length > 0;
 
@@ -211,6 +305,24 @@ export function AcpSettingsView({
     if (parsedCooldownSteps.length === 0) {
       setError('冷却阶梯至少需要一个大于 0 的分钟数');
       return;
+    }
+
+    const risk = withRiskControlDefaults(draft);
+    const rangeChecks: Array<[string, number, number, number]> = [
+      ['同出口 IP 并发上限', risk.maxConcurrencyPerExitIp, 0, 64],
+      ['同出口最小错峰间隔', risk.minExitIpRequestIntervalMs, 0, 10000],
+      ['单号最小请求间隔', risk.minAccountRequestIntervalMs, 0, 30000],
+      ['随机抖动上限', risk.requestJitterMs, 0, 10000],
+      ['单号每分钟最大 Worker 拉起次数', risk.maxWorkerSpawnsPerMinute, 0, 120],
+      ['配额/429 单次请求最大切号次数', risk.maxQuotaAccountSwitches, 0, 10],
+      ['403 策略封禁硬锁时长 (ms)', risk.policyBlockCooldownMs, 60_000, 604_800_000],
+      ['内部 429 重试熔断次数', risk.maxInternal429RetriesBeforeCancel, 1, 8],
+    ];
+    for (const [label, val, min, max] of rangeChecks) {
+      if (!Number.isInteger(val) || val < min || val > max) {
+        setError(`${label}必须为 ${min}–${max} 之间的整数`);
+        return;
+      }
     }
 
     setSaving(true);
@@ -639,7 +751,281 @@ export function AcpSettingsView({
             </div>
           </section>
 
-          {/* 5. 安全鉴权 */}
+          {/* 5. 风控与防漂移保护 */}
+          <section className="settings-section">
+            <div className="settings-section-heading">
+              <span className="settings-icon">
+                <ShieldAlert size={20} />
+              </span>
+              <div>
+                <h2>风控与防漂移保护</h2>
+                <p>代理强绑定、出口 IP 漂移熔断、同出口错峰限流与冷启动风暴防护</p>
+              </div>
+            </div>
+            <div className="settings-section-body">
+              <div className="form-grid" style={{ marginBottom: '12px' }}>
+                <Toggle
+                  checked={draft.strictProxyBinding ?? RISK_CONTROL_DEFAULTS.strictProxyBinding}
+                  onChange={(checked) => updateField('strictProxyBinding', checked)}
+                  label="强代理绑定（代理不可达时直接阻断，严禁回退直连）"
+                />
+                <Toggle
+                  checked={draft.blockOnExitIpDrift ?? RISK_CONTROL_DEFAULTS.blockOnExitIpDrift}
+                  onChange={(checked) => updateField('blockOnExitIpDrift', checked)}
+                  label="出口 IP 漂移自动熔断（检测到出口 IP 变化时自动标为受限并移出调度）"
+                />
+                <Toggle
+                  checked={draft.accountFailover ?? RISK_CONTROL_DEFAULTS.accountFailover}
+                  onChange={(checked) => updateField('accountFailover', checked)}
+                  label="防连坐自动切号（关闭时 401/402/403/429 停在当前号防连坐；开启时受下方 429 切号上限保护）"
+                />
+                <Toggle
+                  checked={draft.excludeDefaultComponents ?? RISK_CONTROL_DEFAULTS.excludeDefaultComponents}
+                  onChange={(checked) => updateField('excludeDefaultComponents', checked)}
+                  label="极简模式（开启时剥离 agy 官方默认系统提示词以省 Token；关闭为保真模式）"
+                />
+              </div>
+
+              <div className="form-grid">
+                <Field
+                  label="同出口 IP 并发上限"
+                  hint="范围 0–64，0 表示不限制（默认 4）"
+                >
+                  <span className="suffixed-input">
+                    <input
+                      type="number"
+                      min={0}
+                      max={64}
+                      step={1}
+                      value={draft.maxConcurrencyPerExitIp ?? RISK_CONTROL_DEFAULTS.maxConcurrencyPerExitIp}
+                      onChange={(e) =>
+                        updateField(
+                          'maxConcurrencyPerExitIp',
+                          toFiniteNumber(
+                            e.target.value,
+                            draft.maxConcurrencyPerExitIp ?? RISK_CONTROL_DEFAULTS.maxConcurrencyPerExitIp
+                          )
+                        )
+                      }
+                      required
+                    />
+                    <span>并发</span>
+                  </span>
+                </Field>
+                <Field
+                  label="同出口最小错峰间隔 (ms)"
+                  hint="范围 0–10000 ms，0 表示关闭（默认 250）"
+                >
+                  <span className="suffixed-input">
+                    <input
+                      type="number"
+                      min={0}
+                      max={10000}
+                      step={50}
+                      value={draft.minExitIpRequestIntervalMs ?? RISK_CONTROL_DEFAULTS.minExitIpRequestIntervalMs}
+                      onChange={(e) =>
+                        updateField(
+                          'minExitIpRequestIntervalMs',
+                          toFiniteNumber(
+                            e.target.value,
+                            draft.minExitIpRequestIntervalMs ?? RISK_CONTROL_DEFAULTS.minExitIpRequestIntervalMs
+                          )
+                        )
+                      }
+                      required
+                    />
+                    <span>ms</span>
+                  </span>
+                </Field>
+                <Field
+                  label="单号最小请求间隔 (ms)"
+                  hint="范围 0–30000 ms，0 表示关闭（默认 500）"
+                >
+                  <span className="suffixed-input">
+                    <input
+                      type="number"
+                      min={0}
+                      max={30000}
+                      step={50}
+                      value={draft.minAccountRequestIntervalMs ?? RISK_CONTROL_DEFAULTS.minAccountRequestIntervalMs}
+                      onChange={(e) =>
+                        updateField(
+                          'minAccountRequestIntervalMs',
+                          toFiniteNumber(
+                            e.target.value,
+                            draft.minAccountRequestIntervalMs ?? RISK_CONTROL_DEFAULTS.minAccountRequestIntervalMs
+                          )
+                        )
+                      }
+                      required
+                    />
+                    <span>ms</span>
+                  </span>
+                </Field>
+                <Field
+                  label="随机抖动上限 (ms)"
+                  hint="范围 0–10000 ms，0 表示关闭（默认 300）"
+                >
+                  <span className="suffixed-input">
+                    <input
+                      type="number"
+                      min={0}
+                      max={10000}
+                      step={50}
+                      value={draft.requestJitterMs ?? RISK_CONTROL_DEFAULTS.requestJitterMs}
+                      onChange={(e) =>
+                        updateField(
+                          'requestJitterMs',
+                          toFiniteNumber(
+                            e.target.value,
+                            draft.requestJitterMs ?? RISK_CONTROL_DEFAULTS.requestJitterMs
+                          )
+                        )
+                      }
+                      required
+                    />
+                    <span>ms</span>
+                  </span>
+                </Field>
+                <Field
+                  label="单号每分钟最大 Worker 拉起次数"
+                  hint="范围 0–120 次，0 表示关闭（默认 12）"
+                >
+                  <span className="suffixed-input">
+                    <input
+                      type="number"
+                      min={0}
+                      max={120}
+                      step={1}
+                      value={draft.maxWorkerSpawnsPerMinute ?? RISK_CONTROL_DEFAULTS.maxWorkerSpawnsPerMinute}
+                      onChange={(e) =>
+                        updateField(
+                          'maxWorkerSpawnsPerMinute',
+                          toFiniteNumber(
+                            e.target.value,
+                            draft.maxWorkerSpawnsPerMinute ?? RISK_CONTROL_DEFAULTS.maxWorkerSpawnsPerMinute
+                          )
+                        )
+                      }
+                      required
+                    />
+                    <span>次</span>
+                  </span>
+                </Field>
+                <Field
+                  label="429 配额冷却范围"
+                  hint="控制单号触发 429 时的避让粒度"
+                >
+                  <Select
+                    aria-label="429 配额冷却范围"
+                    value={draft.quotaCooldownScope ?? RISK_CONTROL_DEFAULTS.quotaCooldownScope}
+                    onChange={(e) =>
+                      updateField(
+                        'quotaCooldownScope',
+                        e.target.value as QuotaCooldownScope
+                      )
+                    }
+                  >
+                    <option value="family">
+                      family（仅冷却当前模型家族 · 默认）
+                    </option>
+                    <option value="account">
+                      account（附带账号级短避让，防跨模型连打）
+                    </option>
+                  </Select>
+                </Field>
+                <Field
+                  label="配额/429 单次请求最大切号次数"
+                  hint="范围 0–10 次，仅开启「防连坐自动切号」时生效（默认 1）"
+                >
+                  <span className="suffixed-input">
+                    <input
+                      type="number"
+                      min={0}
+                      max={10}
+                      step={1}
+                      value={draft.maxQuotaAccountSwitches ?? RISK_CONTROL_DEFAULTS.maxQuotaAccountSwitches}
+                      onChange={(e) =>
+                        updateField(
+                          'maxQuotaAccountSwitches',
+                          toFiniteNumber(
+                            e.target.value,
+                            draft.maxQuotaAccountSwitches ?? RISK_CONTROL_DEFAULTS.maxQuotaAccountSwitches
+                          )
+                        )
+                      }
+                      required
+                    />
+                    <span>次</span>
+                  </span>
+                </Field>
+                <Field
+                  label="内部 429 重试熔断次数"
+                  hint="范围 1–8 次，agy 内部 429 重试风暴触发 session/cancel 熔断（默认 2）"
+                >
+                  <span className="suffixed-input">
+                    <input
+                      type="number"
+                      min={1}
+                      max={8}
+                      step={1}
+                      value={
+                        draft.maxInternal429RetriesBeforeCancel ??
+                        RISK_CONTROL_DEFAULTS.maxInternal429RetriesBeforeCancel
+                      }
+                      onChange={(e) =>
+                        updateField(
+                          'maxInternal429RetriesBeforeCancel',
+                          toFiniteNumber(
+                            e.target.value,
+                            draft.maxInternal429RetriesBeforeCancel ??
+                              RISK_CONTROL_DEFAULTS.maxInternal429RetriesBeforeCancel
+                          )
+                        )
+                      }
+                      required
+                    />
+                    <span>次</span>
+                  </span>
+                </Field>
+                <Field
+                  label="403 策略封禁硬锁时长 (分钟)"
+                  hint={(() => {
+                    const ms =
+                      draft.policyBlockCooldownMs ??
+                      RISK_CONTROL_DEFAULTS.policyBlockCooldownMs;
+                    const hours = (ms / 3_600_000).toFixed(2).replace(/\.?0+$/, '');
+                    return `范围 1–10080 分钟（60000–604800000 ms，默认 360 分钟 / 6 小时），当前换算：${ms} ms（约 ${hours} 小时）`;
+                  })()}
+                >
+                  <span className="suffixed-input">
+                    <input
+                      type="number"
+                      min={1}
+                      max={10080}
+                      step={1}
+                      value={Math.round(
+                        (draft.policyBlockCooldownMs ??
+                          RISK_CONTROL_DEFAULTS.policyBlockCooldownMs) / 60_000
+                      )}
+                      onChange={(e) => {
+                        const currentMinutes = Math.round(
+                          (draft.policyBlockCooldownMs ??
+                            RISK_CONTROL_DEFAULTS.policyBlockCooldownMs) / 60_000
+                        );
+                        const nextMinutes = toFiniteNumber(e.target.value, currentMinutes);
+                        updateField('policyBlockCooldownMs', Math.round(nextMinutes * 60_000));
+                      }}
+                      required
+                    />
+                    <span>分钟</span>
+                  </span>
+                </Field>
+              </div>
+            </div>
+          </section>
+
+          {/* 6. 安全鉴权 */}
           <section className="settings-section">
             <div className="settings-section-heading">
               <span className="settings-icon">

@@ -13,6 +13,9 @@ export const STICKY_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
 export const MAX_STICKY_ENTRIES = 4096;
 const CACHE_SETTLING_TTL_MS = 60_000;
 const MAX_CACHE_SETTLING_ENTRIES = 4096;
+const WORKER_SPAWN_WINDOW_MS = 60_000;
+const ACCOUNT_QUOTA_BACKOFF_DEFAULT_MS = 30_000;
+const ACCOUNT_QUOTA_BACKOFF_MAX_MS = 60_000;
 
 function createAbortError(reason?: unknown): Error {
   if (reason instanceof Error) return reason;
@@ -130,6 +133,8 @@ export interface FailureRecordOptions {
 export interface AccountSchedulerOptions {
   dbStore?: GatewayStore;
   getActiveCount?: (accountId: string) => number;
+  now?: () => number;
+  random?: () => number;
 }
 
 export interface AccountLeaseResult {
@@ -143,13 +148,21 @@ export class AccountScheduler {
   private readonly heavyColdCompletedAt = new Map<string, number>();
   private readonly activeLeases = new Map<string, Map<symbol, "pending" | "acquired">>();
   private readonly waiters = new Set<() => void>();
+  private readonly lastAccountDispatchAt = new Map<string, number>();
+  private readonly lastExitIpDispatchAt = new Map<string, number>();
+  private readonly workerSpawnTimestamps = new Map<string, number[]>();
   private readonly dbStore: GatewayStore;
   private readonly getActiveCount?: (accountId: string) => number;
+  private readonly nowFn: () => number;
+  private readonly randomFn: () => number;
   private roundRobinCursor = 0;
 
   constructor(
     dbStoreOrOptions: GatewayStore | AccountSchedulerOptions = store,
-    options?: Omit<AccountSchedulerOptions, "dbStore">,
+    options?: Omit<AccountSchedulerOptions, "dbStore"> & {
+      now?: () => number;
+      random?: () => number;
+    },
   ) {
     if (
       dbStoreOrOptions &&
@@ -157,10 +170,14 @@ export class AccountScheduler {
     ) {
       this.dbStore = dbStoreOrOptions as GatewayStore;
       this.getActiveCount = options?.getActiveCount;
+      this.nowFn = options?.now ?? (() => Date.now());
+      this.randomFn = options?.random ?? (() => Math.random());
     } else {
       const opts = (dbStoreOrOptions ?? {}) as AccountSchedulerOptions;
       this.dbStore = opts.dbStore ?? store;
       this.getActiveCount = opts.getActiveCount ?? options?.getActiveCount;
+      this.nowFn = opts.now ?? options?.now ?? (() => Date.now());
+      this.randomFn = opts.random ?? options?.random ?? (() => Math.random());
     }
     this.loadStickyFromStore();
   }
@@ -296,6 +313,141 @@ export class AccountScheduler {
     console.info(
       `[scheduler] cache settling waited ${remainingMs}ms (account=${accountId}, session=${sessionHash.slice(0, 12)})`,
     );
+  }
+
+  /**
+   * 单号最小请求间隔 + 同出口 IP 错峰间隔 + 随机 Jitter：
+   * 仅当 accountId 或 exitIp 在窗口内刚派发过请求时才等待，首次冷请求 0 延迟。
+   */
+  async awaitDispatchPacing(
+    accountId: string,
+    exitIp?: string,
+    signal?: AbortSignal,
+  ): Promise<number> {
+    signal?.throwIfAborted();
+    const cfg = getConfig();
+    const minAccInterval = Math.max(0, cfg.minAccountRequestIntervalMs ?? 0);
+    const minIpInterval = Math.max(0, cfg.minExitIpRequestIntervalMs ?? 0);
+    const maxJitter = Math.max(0, cfg.requestJitterMs ?? 0);
+    const ip = exitIp?.trim() || undefined;
+
+    const now = this.nowFn();
+    const prevAcc = this.lastAccountDispatchAt.get(accountId);
+    const prevIp = ip ? this.lastExitIpDispatchAt.get(ip) : undefined;
+
+    const accWait =
+      minAccInterval > 0 && prevAcc !== undefined
+        ? Math.max(0, prevAcc + minAccInterval - now)
+        : 0;
+    const ipWait =
+      ip && minIpInterval > 0 && prevIp !== undefined
+        ? Math.max(0, prevIp + minIpInterval - now)
+        : 0;
+
+    const baseWait = Math.max(accWait, ipWait);
+    const isHotAccount =
+      minAccInterval > 0 && prevAcc !== undefined && prevAcc + minAccInterval > now;
+    const isHotIp = Boolean(
+      ip && minIpInterval > 0 && prevIp !== undefined && prevIp + minIpInterval > now,
+    );
+    const shouldJitter = maxJitter > 0 && (baseWait > 0 || isHotAccount || isHotIp);
+    const jitter = shouldJitter ? Math.floor(this.randomFn() * (maxJitter + 1)) : 0;
+    const totalWait = baseWait + jitter;
+    const plannedAt = now + totalWait;
+
+    this.lastAccountDispatchAt.set(accountId, plannedAt);
+    if (ip) {
+      this.lastExitIpDispatchAt.set(ip, plannedAt);
+    }
+
+    if (totalWait > 0) {
+      try {
+        await this.sleepWithAbort(totalWait, signal);
+      } catch (err) {
+        if (this.lastAccountDispatchAt.get(accountId) === plannedAt) {
+          if (prevAcc === undefined) this.lastAccountDispatchAt.delete(accountId);
+          else this.lastAccountDispatchAt.set(accountId, prevAcc);
+        }
+        if (ip && this.lastExitIpDispatchAt.get(ip) === plannedAt) {
+          if (prevIp === undefined) this.lastExitIpDispatchAt.delete(ip);
+          else this.lastExitIpDispatchAt.set(ip, prevIp);
+        }
+        throw err;
+      }
+      const actualAt = this.nowFn();
+      if (actualAt > plannedAt) {
+        this.lastAccountDispatchAt.set(accountId, actualAt);
+        if (ip) {
+          this.lastExitIpDispatchAt.set(ip, actualAt);
+        }
+      }
+    }
+
+    return totalWait;
+  }
+
+  private pruneWorkerSpawns(accountId: string, now: number): number[] {
+    const existing = this.workerSpawnTimestamps.get(accountId);
+    if (!existing || existing.length === 0) return [];
+    const cutoff = now - WORKER_SPAWN_WINDOW_MS;
+    const kept = existing.filter((ts) => ts > cutoff);
+    if (kept.length === 0) {
+      this.workerSpawnTimestamps.delete(accountId);
+    } else if (kept.length !== existing.length) {
+      this.workerSpawnTimestamps.set(accountId, kept);
+    }
+    return kept;
+  }
+
+  /** 记录单号 Worker 拉起时间戳（60s 滑动窗口）。 */
+  recordWorkerSpawn(accountId: string, now = this.nowFn()): void {
+    const kept = this.pruneWorkerSpawns(accountId, now);
+    kept.push(now);
+    this.workerSpawnTimestamps.set(accountId, kept);
+  }
+
+  /** 原子判限并记账：若未超出 60s 滑动窗口上限则写入时间戳并返回 true，否则直接拒绝返回 false。 */
+  tryConsumeWorkerSpawn(accountId: string, now = this.nowFn()): boolean {
+    const kept = this.pruneWorkerSpawns(accountId, now);
+    const limit = getConfig().maxWorkerSpawnsPerMinute ?? 0;
+    if (limit > 0 && kept.length >= limit) {
+      return false;
+    }
+    kept.push(now);
+    this.workerSpawnTimestamps.set(accountId, kept);
+    return true;
+  }
+
+  /** 判断单号是否触发 60s Worker 拉起频率护栏；maxWorkerSpawnsPerMinute === 0 时关闭。 */
+  isWorkerSpawnRateLimited(accountId: string, now = this.nowFn()): boolean {
+    const limit = getConfig().maxWorkerSpawnsPerMinute ?? 0;
+    if (limit <= 0) return false;
+    const kept = this.pruneWorkerSpawns(accountId, now);
+    return kept.length >= limit;
+  }
+
+  private buildExitIpConcurrencyMap(accounts: AccountRecord[]): Map<string, number> {
+    const map = new Map<string, number>();
+    for (const a of accounts) {
+      const ip = a.exitIp?.trim();
+      if (!ip) continue;
+      const active = this.getAccountActiveWorkers(a);
+      if (active > 0) {
+        map.set(ip, (map.get(ip) ?? 0) + active);
+      }
+    }
+    return map;
+  }
+
+  private hasExitIpSlot(
+    account: AccountRecord,
+    maxPerExitIp: number,
+    exitIpConcurrency: Map<string, number>,
+  ): boolean {
+    if (maxPerExitIp <= 0) return true;
+    const ip = account.exitIp?.trim();
+    if (!ip) return true;
+    return (exitIpConcurrency.get(ip) ?? 0) < maxPerExitIp;
   }
 
   /**
@@ -459,6 +611,9 @@ export class AccountScheduler {
     }
 
     if (opts.reasonCode === "RESTRICTED" || opts.upstreamStatus === 403) {
+      const cfg = getConfig();
+      const cooldownMs = cfg.policyBlockCooldownMs ?? 21_600_000;
+      const untilMs = now + cooldownMs;
       const acc = this.dbStore.getAccount(accountId);
       if (acc) {
         this.dbStore.upsertAccount({
@@ -469,7 +624,17 @@ export class AccountScheduler {
         });
         eventBus.emit("accounts", this.dbStore.listAccounts());
       }
-      return;
+      this.dbStore.upsertCooldown({
+        accountId,
+        family: "*",
+        scopeType: "global",
+        reason: opts.reasonCode || "RESTRICTED",
+        untilMs,
+        consecutiveFailures: 1,
+        lastError: opts.rawError || "Account restricted / verification required",
+      });
+      eventBus.emit("cooldowns", this.dbStore.listCooldowns(now));
+      return untilMs;
     }
 
     const cfg = getConfig();
@@ -515,6 +680,31 @@ export class AccountScheduler {
     };
 
     this.dbStore.upsertCooldown(record);
+    if (isQuotaError && cfg.quotaCooldownScope === "account") {
+      const accountBackoffMs = Math.min(
+        hasRetryHint ? retryAfterMs! : ACCOUNT_QUOTA_BACKOFF_DEFAULT_MS,
+        ACCOUNT_QUOTA_BACKOFF_MAX_MS,
+      );
+      if (accountBackoffMs > 0) {
+        const existingGlobal = existingList.find(
+          (c) => c.accountId === accountId && c.family === "*" && c.scopeType === "global",
+        );
+        const globalCandidateUntilMs = now + accountBackoffMs;
+        const globalFinalUntilMs =
+          existingGlobal && existingGlobal.untilMs > globalCandidateUntilMs
+            ? existingGlobal.untilMs
+            : globalCandidateUntilMs;
+        this.dbStore.upsertCooldown({
+          accountId,
+          family: "*",
+          scopeType: "global",
+          reason: record.reason,
+          untilMs: globalFinalUntilMs,
+          consecutiveFailures: 1,
+          lastError: record.lastError,
+        });
+      }
+    }
     eventBus.emit("cooldowns", this.dbStore.listCooldowns(now));
     return isQuotaError ? finalUntilMs : undefined;
   }
@@ -621,7 +811,8 @@ export class AccountScheduler {
     while (true) {
       signal?.throwIfAborted();
       const now = Date.now();
-      const account = this.dbStore.listAccounts().find((a) => a.id === accountId && a.status === "ready");
+      const allAccounts = this.dbStore.listAccounts();
+      const account = allAccounts.find((a) => a.id === accountId && a.status === "ready");
       if (!account) {
         throw new NoReadyAccountsError(`Fallback account '${accountId}' is not ready`);
       }
@@ -644,10 +835,26 @@ export class AccountScheduler {
         throw new AllAccountsCooldownError(family, retryAfterSeconds);
       }
 
-      if (this.getAccountActiveWorkers(account) < account.concurrencyLimit) {
+      const spawnNow = this.nowFn();
+      if (this.isWorkerSpawnRateLimited(account.id, spawnNow)) {
+        const timestamps = this.workerSpawnTimestamps.get(account.id) ?? [];
+        const oldest = timestamps[0] ?? spawnNow;
+        const retryAfterSeconds = Math.max(
+          1,
+          Math.ceil((oldest + WORKER_SPAWN_WINDOW_MS - spawnNow) / 1000),
+        );
+        throw new AllAccountsCooldownError(family, retryAfterSeconds);
+      }
+
+      const exitIpConcurrency = this.buildExitIpConcurrencyMap(allAccounts);
+      if (
+        this.getAccountActiveWorkers(account) < account.concurrencyLimit &&
+        this.hasExitIpSlot(account, cfg.maxConcurrencyPerExitIp ?? 0, exitIpConcurrency)
+      ) {
         const lease = this.createLease(account.id);
         try {
           await this.awaitCacheSettling(account.id, sessionKey, signal);
+          await this.awaitDispatchPacing(account.id, account.exitIp, signal);
         } catch (err) {
           lease.release();
           throw err;
@@ -680,13 +887,18 @@ export class AccountScheduler {
     while (true) {
       signal?.throwIfAborted();
       const now = Date.now();
-      const readyAccounts = this.dbStore
-        .listAccounts()
-        .filter((a) => a.status === "ready" && !excludeAccountIds.has(a.id));
+      const spawnNow = this.nowFn();
+      const allAccounts = this.dbStore.listAccounts();
+      const readyAccounts = allAccounts.filter(
+        (a) => a.status === "ready" && !excludeAccountIds.has(a.id),
+      );
 
       if (readyAccounts.length === 0) {
         throw new NoReadyAccountsError();
       }
+
+      const exitIpConcurrency = this.buildExitIpConcurrencyMap(allAccounts);
+      const maxPerExitIp = cfg.maxConcurrencyPerExitIp ?? 0;
 
       const activeCooldowns = this.dbStore.listCooldowns(now);
       const cooldownMap = new Map<string, CooldownRecord>();
@@ -710,26 +922,38 @@ export class AccountScheduler {
 
         if (boundAccount) {
           const boundCd = cooldownMap.get(boundAccount.id);
-          const boundHasSlot = this.getAccountActiveWorkers(boundAccount) < boundAccount.concurrencyLimit;
-          if (!boundCd && boundHasSlot) {
+          const boundHasSlot =
+            this.getAccountActiveWorkers(boundAccount) < boundAccount.concurrencyLimit &&
+            this.hasExitIpSlot(boundAccount, maxPerExitIp, exitIpConcurrency);
+          const boundRateLimited = this.isWorkerSpawnRateLimited(boundAccount.id, spawnNow);
+          if (!boundCd && boundHasSlot && !boundRateLimited) {
             this.touchSticky(sessionKey, boundAccount.id, now);
             const lease = shouldReserve
               ? this.createLease(boundAccount.id)
               : { release: () => {}, onWorkerAcquired: () => {} };
             try {
               await this.awaitCacheSettling(boundAccount.id, sessionKey, signal);
+              if (shouldReserve) {
+                await this.awaitDispatchPacing(boundAccount.id, boundAccount.exitIp, signal);
+              }
             } catch (err) {
               lease.release();
               throw err;
             }
             return { account: boundAccount, ...lease };
           }
-          const remainingCdMs = boundCd ? boundCd.untilMs - now : 0;
-          const canWaitCooldown = !boundCd || remainingCdMs <= cacheWaitCapMs;
-          if (canWaitCooldown && now < cacheWaitDeadline) {
-            const waitMs = Math.min(100, cacheWaitDeadline - now, boundCd ? remainingCdMs : Infinity);
-            await this.waitForChange(waitMs, signal);
-            continue;
+          if (!boundRateLimited) {
+            const remainingCdMs = boundCd ? boundCd.untilMs - now : 0;
+            const canWaitCooldown = !boundCd || remainingCdMs <= cacheWaitCapMs;
+            if (canWaitCooldown && now < cacheWaitDeadline) {
+              const waitMs = Math.min(
+                100,
+                cacheWaitDeadline - now,
+                boundCd ? remainingCdMs : Infinity,
+              );
+              await this.waitForChange(waitMs, signal);
+              continue;
+            }
           }
         }
       }
@@ -748,7 +972,10 @@ export class AccountScheduler {
       }
 
       const available = uncooled.filter(
-        (a) => this.getAccountActiveWorkers(a) < a.concurrencyLimit,
+        (a) =>
+          this.getAccountActiveWorkers(a) < a.concurrencyLimit &&
+          this.hasExitIpSlot(a, maxPerExitIp, exitIpConcurrency) &&
+          !this.isWorkerSpawnRateLimited(a.id, spawnNow),
       );
       if (available.length > 0) {
         // 优先调度非特价完整 Pro 账号（含 gemini_flagship 桶），其次其他 Pro 账号，
@@ -767,6 +994,9 @@ export class AccountScheduler {
           : { release: () => {}, onWorkerAcquired: () => {} };
         try {
           await this.awaitCacheSettling(chosen.id, sessionKey, signal);
+          if (shouldReserve) {
+            await this.awaitDispatchPacing(chosen.id, chosen.exitIp, signal);
+          }
         } catch (err) {
           lease.release();
           throw err;

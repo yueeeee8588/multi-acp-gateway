@@ -4,6 +4,7 @@ import {
   BadgeCheck,
   Clock,
   Copy,
+  ExternalLink,
   FolderInput,
   Gauge,
   Globe,
@@ -30,6 +31,7 @@ import {
   Select,
 } from "../components";
 import { useMinSpin } from "../useMinSpin";
+import { AcpAccountErrorModal } from "./AcpAccountErrorModal";
 import {
   AccountEditModal,
   BatchProxyModal,
@@ -38,11 +40,20 @@ import {
 } from "./AcpAccountModals";
 import { AcpExitsBar } from "./AcpExitsBar";
 import {
+  ATTENTION_CATEGORY_LABELS,
+  ATTENTION_CATEGORY_ORDER,
+  isAttentionAccount,
+  resolveAttentionInfo,
+  type AttentionCategory,
+  type AttentionInfo,
+} from "./accountAttention";
+import {
   clearAccountCooldown,
   deleteAccount,
   detectAccountTiers,
   importLocalAccounts,
   loginAccount,
+  openAccountUrlInChrome,
   refreshAccount,
   refreshAccountQuota,
   refreshAllAccountQuotas,
@@ -605,6 +616,9 @@ export function AcpAccountsView({
 
   const [searchQuery, setSearchQuery] = useState("");
   const [statusFilter, setStatusFilter] = useState<StatusFilter>("all");
+  const [attentionCategoryFilter, setAttentionCategoryFilter] = useState<
+    "all" | AttentionCategory
+  >("all");
   const [tierFilter, setTierFilter] = useState<TierFilter>("all");
   const [exitFilter, setExitFilter] = useState("");
   const [selectedIds, setSelectedIds] = useState<Set<string>>(() => new Set());
@@ -612,6 +626,7 @@ export function AcpAccountsView({
   const [actions, setActions] = useState<PendingActions>(() => ({ global: null, rows: new Map() }));
   const actionsRef = useRef(actions);
   const [batchActionKind, setBatchActionKind] = useState<"enable" | "disable" | "refresh" | null>(null);
+  const [refreshProgress, setRefreshProgress] = useState<{ done: number; total: number } | null>(null);
   const globalBusy = actions.global !== null;
   const batchBlocked = globalBusy || actions.rows.size > 0;
   const refreshingQuotas = actions.global === "quota";
@@ -632,6 +647,8 @@ export function AcpAccountsView({
   const [editingModal, setEditingModal] = useState<
     "new" | AccountRecord | null
   >(null);
+  const [errorModalAccount, setErrorModalAccount] =
+    useState<AccountRecord | null>(null);
   const [showTokenModal, setShowTokenModal] = useState(false);
   const [showChromeModal, setShowChromeModal] = useState(false);
   const [showProxyModal, setShowProxyModal] = useState(false);
@@ -684,12 +701,27 @@ export function AcpAccountsView({
     [accounts, cooldownsByAccount]
   );
   const attentionCount = useMemo(
-    () =>
-      accounts.filter(
-        (acc) => acc.status === "auth_required" || acc.status === "restricted"
-      ).length,
+    () => accounts.filter((acc) => isAttentionAccount(acc)).length,
     [accounts]
   );
+
+  const attentionCategoryCounts = useMemo(() => {
+    const counts = new Map<AttentionCategory, number>();
+    for (const acc of accounts) {
+      if (!isAttentionAccount(acc)) continue;
+      const cat = resolveAttentionInfo(acc).category;
+      counts.set(cat, (counts.get(cat) ?? 0) + 1);
+    }
+    return counts;
+  }, [accounts]);
+
+  const activeErrorModalAccount = useMemo(() => {
+    if (!errorModalAccount) return null;
+    return (
+      accounts.find((acc) => acc.id === errorModalAccount.id) ??
+      errorModalAccount
+    );
+  }, [accounts, errorModalAccount]);
 
   const exitOptions = useMemo(() => {
     const seen = new Set<string>();
@@ -708,24 +740,42 @@ export function AcpAccountsView({
     return list;
   }, [exits]);
 
+  useEffect(() => {
+    if (exitFilter !== "" && !exitOptions.some((opt) => opt.value === exitFilter)) {
+      setExitFilter("");
+    }
+  }, [exitFilter, exitOptions]);
+
+  useEffect(() => {
+    if (attentionCategoryFilter === "all") return;
+    if (
+      statusFilter !== "attention" ||
+      (attentionCategoryCounts.get(attentionCategoryFilter) ?? 0) === 0
+    ) {
+      setAttentionCategoryFilter("all");
+    }
+  }, [statusFilter, attentionCategoryFilter, attentionCategoryCounts]);
+
   const filteredAccounts = useMemo(() => {
     const q = searchQuery.trim().toLowerCase();
     return accounts.filter((acc) => {
       const tierBucket = getAccountTierBucket(acc);
       if (tierFilter !== "all" && tierBucket !== tierFilter) return false;
 
-      const accExit = acc.exitIp || "unknown";
+      const accExit = (acc.exitIp || "").trim() || "unknown";
       if (exitFilter && accExit !== exitFilter) return false;
 
       const cds = cooldownsByAccount.get(acc.id) ?? [];
       if (statusFilter === "ready" && acc.status !== "ready") return false;
       if (statusFilter === "cooldown" && cds.length === 0) return false;
-      if (
-        statusFilter === "attention" &&
-        acc.status !== "auth_required" &&
-        acc.status !== "restricted"
-      ) {
-        return false;
+      if (statusFilter === "attention") {
+        if (!isAttentionAccount(acc)) return false;
+        if (
+          attentionCategoryFilter !== "all" &&
+          resolveAttentionInfo(acc).category !== attentionCategoryFilter
+        ) {
+          return false;
+        }
       }
 
       if (!q) return true;
@@ -738,6 +788,7 @@ export function AcpAccountsView({
     });
   }, [
     accounts,
+    attentionCategoryFilter,
     cooldownsByAccount,
     exitFilter,
     searchQuery,
@@ -813,18 +864,35 @@ export function AcpAccountsView({
         notify("没有可刷新的启用账号");
         return;
       }
+      setRefreshProgress({ done: 0, total: enabledAccounts.length });
       let succeeded = 0;
       let failed = 0;
       let lastError = "";
-      for (const acc of enabledAccounts) {
-        try {
-          await refreshAccount(acc.id);
-          succeeded += 1;
-        } catch (err) {
-          failed += 1;
-          lastError = err instanceof Error ? err.message : "刷新失败";
+      let nextIndex = 0;
+      const concurrency = Math.min(4, enabledAccounts.length);
+
+      async function worker() {
+        while (true) {
+          const idx = nextIndex;
+          nextIndex += 1;
+          if (idx >= enabledAccounts.length) return;
+          const acc = enabledAccounts[idx];
+          try {
+            await refreshAccount(acc.id);
+            succeeded += 1;
+          } catch (err) {
+            failed += 1;
+            lastError = err instanceof Error ? err.message : "刷新失败";
+          } finally {
+            setRefreshProgress((prev) =>
+              prev ? { ...prev, done: prev.done + 1 } : prev
+            );
+          }
         }
       }
+
+      await Promise.all(Array.from({ length: concurrency }, () => worker()));
+
       if (failed === 0) {
         notify(`已完成全部账号刷新（共 ${succeeded} 个）`, "success");
       } else {
@@ -837,6 +905,7 @@ export function AcpAccountsView({
     } catch (err) {
       notify(err instanceof Error ? err.message : "刷新全部账号失败", "error");
     } finally {
+      setRefreshProgress(null);
       finishGlobalAction();
     }
   }
@@ -1099,8 +1168,64 @@ export function AcpAccountsView({
   const hasFilters =
     searchQuery.trim() !== "" ||
     statusFilter !== "all" ||
+    attentionCategoryFilter !== "all" ||
     tierFilter !== "all" ||
     exitFilter !== "";
+
+  async function handleOpenAccountUrl(
+    acc: AccountRecord,
+    url: string,
+    actionLabel?: string
+  ) {
+    try {
+      const res = await openAccountUrlInChrome(acc.id, url);
+      if (res.launched) {
+        notify(
+          `已在 Chrome「${res.profileName || res.profileDir}」中打开${actionLabel || "链接"}`,
+          "success"
+        );
+        return;
+      }
+      window.open(url, "_blank", "noopener,noreferrer");
+      notify(
+        `未在 Chrome 中找到 ${acc.email || "该账号"} 的登录配置，已在当前浏览器打开`
+      );
+    } catch {
+      window.open(url, "_blank", "noopener,noreferrer");
+      notify(
+        "网关暂未启用 Chrome 直达，已在当前浏览器打开（重启 8048 即可支持按账号直达 Chrome）"
+      );
+    }
+  }
+
+  function handleQuickAttentionAction(
+    acc: AccountRecord,
+    info: AttentionInfo
+  ) {
+    if (info.actionKind === "external_url" && info.actionUrl) {
+      const targetLabel =
+        info.category === "violation_blocked"
+          ? "申诉页面"
+          : info.category === "validation_required"
+            ? "验证页面"
+            : info.actionLabel;
+      void handleOpenAccountUrl(acc, info.actionUrl, targetLabel);
+      return;
+    }
+    if (info.actionKind === "relogin") {
+      void handleLogin(acc);
+      return;
+    }
+    if (info.actionKind === "enable") {
+      void handleToggleDisable(acc);
+      return;
+    }
+    if (info.actionKind === "refresh") {
+      void handleRefreshOne(acc);
+      return;
+    }
+    setErrorModalAccount(acc);
+  }
 
   return (
     <div>
@@ -1127,7 +1252,9 @@ export function AcpAccountsView({
             disabled={batchBlocked}
           >
             <RefreshCw size={15} className={refreshAllSpinning ? "spin" : undefined} />
-            刷新全部
+            {actions.global === "refresh" && refreshProgress
+              ? `刷新中 (${refreshProgress.done}/${refreshProgress.total})`
+              : "刷新全部"}
           </Button>
           <Button
             onClick={() => void handleRefreshAllQuotas()}
@@ -1202,9 +1329,13 @@ export function AcpAccountsView({
             <Select
               aria-label="按状态筛选"
               value={statusFilter}
-              onChange={(e) =>
-                setStatusFilter(e.target.value as StatusFilter)
-              }
+              onChange={(e) => {
+                const next = e.target.value as StatusFilter;
+                setStatusFilter(next);
+                if (next !== "attention") {
+                  setAttentionCategoryFilter("all");
+                }
+              }}
             >
               <option value="all">全部状态 ({accounts.length})</option>
               <option value="ready">就绪 ({readyCount})</option>
@@ -1225,7 +1356,7 @@ export function AcpAccountsView({
 
             <Select
               aria-label="按出口筛选"
-              value={exitFilter}
+              value={exitOptions.some((opt) => opt.value === exitFilter) ? exitFilter : ""}
               onChange={(e) => setExitFilter(e.target.value)}
             >
               <option value="">全部出口</option>
@@ -1308,6 +1439,76 @@ export function AcpAccountsView({
           </div>
         </div>
 
+        {statusFilter === "attention" && attentionCount > 0 && (
+          <div
+            style={{
+              display: "flex",
+              flexWrap: "wrap",
+              alignItems: "center",
+              gap: "6px",
+              padding: "8px 18px 10px",
+              borderTop: "1px dashed var(--line)",
+              background: "var(--cream)",
+            }}
+          >
+            <button
+              type="button"
+              onClick={() => setAttentionCategoryFilter("all")}
+              style={{
+                display: "inline-flex",
+                alignItems: "center",
+                gap: "4px",
+                padding: "4px 10px",
+                borderRadius: "var(--pill)",
+                border:
+                  attentionCategoryFilter === "all"
+                    ? "1px solid var(--pink-500)"
+                    : "1px solid var(--line)",
+                background:
+                  attentionCategoryFilter === "all"
+                    ? "var(--pink-500)"
+                    : "var(--surface)",
+                color:
+                  attentionCategoryFilter === "all" ? "#fff" : "var(--ink-soft)",
+                fontSize: "11.5px",
+                fontWeight: 600,
+                cursor: "pointer",
+              }}
+            >
+              全部需关注 ({attentionCount})
+            </button>
+            {ATTENTION_CATEGORY_ORDER.map((cat) => {
+              const count = attentionCategoryCounts.get(cat) ?? 0;
+              if (count === 0) return null;
+              const active = attentionCategoryFilter === cat;
+              return (
+                <button
+                  key={cat}
+                  type="button"
+                  onClick={() => setAttentionCategoryFilter(cat)}
+                  style={{
+                    display: "inline-flex",
+                    alignItems: "center",
+                    gap: "4px",
+                    padding: "4px 10px",
+                    borderRadius: "var(--pill)",
+                    border: active
+                      ? "1px solid var(--pink-500)"
+                      : "1px solid var(--line)",
+                    background: active ? "var(--pink-50)" : "var(--surface)",
+                    color: active ? "var(--pink-700)" : "var(--ink-soft)",
+                    fontSize: "11.5px",
+                    fontWeight: 600,
+                    cursor: "pointer",
+                  }}
+                >
+                  {ATTENTION_CATEGORY_LABELS[cat]} ({count})
+                </button>
+              );
+            })}
+          </div>
+        )}
+
         {selectedCount > 0 && (
           <div
             style={{
@@ -1381,6 +1582,7 @@ export function AcpAccountsView({
                   onClick={() => {
                     setSearchQuery("");
                     setStatusFilter("all");
+                    setAttentionCategoryFilter("all");
                     setTierFilter("all");
                     setExitFilter("");
                   }}
@@ -1414,6 +1616,9 @@ export function AcpAccountsView({
               const quotaBusy = rowAction === "quota" || (refreshingQuotas && acc.status !== "disabled");
               const cds = cooldownsByAccount.get(acc.id) ?? [];
               const statusMeta = statusBadgeMeta(acc.status);
+              const attentionInfo = isAttentionAccount(acc)
+                ? resolveAttentionInfo(acc)
+                : null;
               const isPro = acc.tier === "pro";
               const tierBucket = getAccountTierBucket(acc);
               const isSelected = selectedIds.has(acc.id);
@@ -1554,9 +1759,32 @@ export function AcpAccountsView({
                       {renderTierBadge(tierBucket)}
                     </button>
 
-                    <Badge variant={statusMeta.variant} dot={statusMeta.dot}>
-                      {statusMeta.label}
-                    </Badge>
+                    {attentionInfo ? (
+                      <>
+                        {attentionInfo.isDisabled && (
+                          <Badge variant="neutral">已停用</Badge>
+                        )}
+                        {(!attentionInfo.isDisabled ||
+                          attentionInfo.category !== "manual_disabled") && (
+                          <Badge
+                            variant={
+                              attentionInfo.tone === "danger"
+                                ? "red"
+                                : attentionInfo.tone === "warning"
+                                  ? "amber"
+                                  : "neutral"
+                            }
+                            dot
+                          >
+                            {attentionInfo.label}
+                          </Badge>
+                        )}
+                      </>
+                    ) : (
+                      <Badge variant={statusMeta.variant} dot={statusMeta.dot}>
+                        {statusMeta.label}
+                      </Badge>
+                    )}
 
                     <span
                       style={{
@@ -1628,21 +1856,105 @@ export function AcpAccountsView({
                     ))}
                   </div>
 
-                  {acc.statusReason && acc.status !== "ready" && (
-                    <div
-                      className="cell-secondary"
-                      style={{
-                        fontSize: "11px",
-                        color: "var(--rose-600)",
-                        overflow: "hidden",
-                        textOverflow: "ellipsis",
-                        whiteSpace: "nowrap",
-                      }}
-                      title={acc.statusReason}
-                    >
-                      {acc.statusReason}
-                    </div>
-                  )}
+                  {attentionInfo &&
+                    (acc.statusReason ||
+                      attentionInfo.category !== "manual_disabled") && (
+                      <div
+                        role="button"
+                        tabIndex={0}
+                        onClick={() => setErrorModalAccount(acc)}
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter" || e.key === " ") {
+                            e.preventDefault();
+                            setErrorModalAccount(acc);
+                          }
+                        }}
+                        title={
+                          attentionInfo.parsedMessage ||
+                          acc.statusReason ||
+                          attentionInfo.summary
+                        }
+                        style={{
+                          display: "flex",
+                          alignItems: "center",
+                          justifyContent: "space-between",
+                          gap: "8px",
+                          padding: "5px 8px",
+                          borderRadius: "6px",
+                          background:
+                            attentionInfo.tone === "danger"
+                              ? "var(--rose-bg)"
+                              : attentionInfo.tone === "warning"
+                                ? "var(--amber-bg)"
+                                : "var(--pnl-soft)",
+                          border:
+                            attentionInfo.tone === "danger"
+                              ? "1px solid rgba(180, 95, 80, 0.22)"
+                              : attentionInfo.tone === "warning"
+                                ? "1px solid var(--honey-200)"
+                                : "1px solid var(--line)",
+                          cursor: "pointer",
+                        }}
+                      >
+                        <div
+                          style={{
+                            display: "flex",
+                            alignItems: "center",
+                            gap: "5px",
+                            minWidth: 0,
+                            flex: "1 1 0%",
+                            fontSize: "11px",
+                            fontWeight: 600,
+                            color:
+                              attentionInfo.tone === "danger"
+                                ? "var(--rose)"
+                                : attentionInfo.tone === "warning"
+                                  ? "var(--amber)"
+                                  : "var(--ink-soft)",
+                          }}
+                        >
+                          <AlertTriangle size={12} style={{ flexShrink: 0 }} />
+                          <span
+                            style={{
+                              overflow: "hidden",
+                              textOverflow: "ellipsis",
+                              whiteSpace: "nowrap",
+                            }}
+                          >
+                            {attentionInfo.parsedMessage ||
+                              attentionInfo.summary}
+                          </span>
+                        </div>
+                        <button
+                          type="button"
+                          disabled={rowBusy}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            handleQuickAttentionAction(acc, attentionInfo);
+                          }}
+                          style={{
+                            display: "inline-flex",
+                            alignItems: "center",
+                            gap: "3px",
+                            flexShrink: 0,
+                            padding: "2px 7px",
+                            borderRadius: "4px",
+                            border: "1px solid rgba(26, 26, 26, 0.12)",
+                            background: "rgba(255, 255, 255, 0.88)",
+                            color: "var(--ink)",
+                            fontSize: "10.5px",
+                            fontWeight: 600,
+                            cursor: rowBusy ? "not-allowed" : "pointer",
+                            whiteSpace: "nowrap",
+                          }}
+                        >
+                          {attentionInfo.actionKind === "external_url" && (
+                            <ExternalLink size={10} />
+                          )}
+                          {attentionInfo.actionLabel}
+                        </button>
+                      </div>
+                    )}
 
                   {/* 3. 三号池配额区 */}
                   <div style={{ width: "100%" }}>
@@ -1865,6 +2177,9 @@ export function AcpAccountsView({
                   const quotaBusy = rowAction === "quota" || (refreshingQuotas && acc.status !== "disabled");
                   const cds = cooldownsByAccount.get(acc.id) ?? [];
                   const statusMeta = statusBadgeMeta(acc.status);
+                  const attentionInfo = isAttentionAccount(acc)
+                    ? resolveAttentionInfo(acc)
+                    : null;
                   const isPro = acc.tier === "pro";
                   const tierBucket = getAccountTierBucket(acc);
 
@@ -1957,12 +2272,36 @@ export function AcpAccountsView({
                               gap: "5px",
                             }}
                           >
-                            <Badge
-                              variant={statusMeta.variant}
-                              dot={statusMeta.dot}
-                            >
-                              {statusMeta.label}
-                            </Badge>
+                            {attentionInfo ? (
+                              <>
+                                {attentionInfo.isDisabled && (
+                                  <Badge variant="neutral">已停用</Badge>
+                                )}
+                                {(!attentionInfo.isDisabled ||
+                                  attentionInfo.category !==
+                                    "manual_disabled") && (
+                                  <Badge
+                                    variant={
+                                      attentionInfo.tone === "danger"
+                                        ? "red"
+                                        : attentionInfo.tone === "warning"
+                                          ? "amber"
+                                          : "neutral"
+                                    }
+                                    dot
+                                  >
+                                    {attentionInfo.label}
+                                  </Badge>
+                                )}
+                              </>
+                            ) : (
+                              <Badge
+                                variant={statusMeta.variant}
+                                dot={statusMeta.dot}
+                              >
+                                {statusMeta.label}
+                              </Badge>
+                            )}
                             {cds.map((cd) => (
                               <button
                                 key={`${cd.accountId}-${cd.family}-${cd.scopeType}`}
@@ -1991,20 +2330,75 @@ export function AcpAccountsView({
                               </button>
                             ))}
                           </div>
-                          {acc.statusReason && acc.status !== "ready" && (
-                            <span
-                              className="cell-secondary"
-                              style={{
-                                maxWidth: "240px",
-                                overflow: "hidden",
-                                textOverflow: "ellipsis",
-                                whiteSpace: "nowrap",
-                              }}
-                              title={acc.statusReason}
-                            >
-                              {acc.statusReason}
-                            </span>
-                          )}
+                          {attentionInfo &&
+                            (acc.statusReason ||
+                              attentionInfo.category !== "manual_disabled") && (
+                              <div
+                                style={{
+                                  display: "flex",
+                                  alignItems: "center",
+                                  gap: "6px",
+                                  maxWidth: "280px",
+                                }}
+                              >
+                                <button
+                                  type="button"
+                                  onClick={() => setErrorModalAccount(acc)}
+                                  title={
+                                    attentionInfo.parsedMessage ||
+                                    acc.statusReason ||
+                                    attentionInfo.summary
+                                  }
+                                  style={{
+                                    padding: 0,
+                                    border: 0,
+                                    background: "transparent",
+                                    color:
+                                      attentionInfo.tone === "danger"
+                                        ? "var(--rose)"
+                                        : attentionInfo.tone === "warning"
+                                          ? "var(--amber)"
+                                          : "var(--ink-soft)",
+                                    fontSize: "11px",
+                                    fontWeight: 600,
+                                    textAlign: "left",
+                                    overflow: "hidden",
+                                    textOverflow: "ellipsis",
+                                    whiteSpace: "nowrap",
+                                    cursor: "pointer",
+                                    textDecoration: "underline",
+                                  }}
+                                >
+                                  {attentionInfo.parsedMessage ||
+                                    attentionInfo.summary}
+                                </button>
+                                <button
+                                  type="button"
+                                  disabled={rowBusy}
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    handleQuickAttentionAction(
+                                      acc,
+                                      attentionInfo
+                                    );
+                                  }}
+                                  style={{
+                                    flexShrink: 0,
+                                    padding: "1px 6px",
+                                    borderRadius: "4px",
+                                    border: "1px solid var(--line)",
+                                    background: "var(--surface)",
+                                    color: "var(--ink)",
+                                    fontSize: "10.5px",
+                                    fontWeight: 600,
+                                    cursor: rowBusy ? "not-allowed" : "pointer",
+                                    whiteSpace: "nowrap",
+                                  }}
+                                >
+                                  {attentionInfo.actionLabel}
+                                </button>
+                              </div>
+                            )}
                         </div>
                       </td>
 
@@ -2115,6 +2509,21 @@ export function AcpAccountsView({
           </span>
         </div>
       </section>
+
+      {activeErrorModalAccount && (
+        <AcpAccountErrorModal
+          account={activeErrorModalAccount}
+          busy={
+            globalBusy || actions.rows.has(activeErrorModalAccount.id)
+          }
+          onClose={() => setErrorModalAccount(null)}
+          onRelogin={handleLogin}
+          onToggleDisable={handleToggleDisable}
+          onRefresh={handleRefreshOne}
+          onOpenUrl={handleOpenAccountUrl}
+          notify={notify}
+        />
+      )}
 
       {editingModal !== null && (
         <AccountEditModal

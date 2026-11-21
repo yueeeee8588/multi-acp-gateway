@@ -4,12 +4,14 @@ import { extname, join, resolve } from 'node:path';
 import { AccountManager } from './accounts/manager';
 import {
   authorizeChromeProfiles,
+  openUrlInAccountChrome,
   scanChromeProfiles,
   type ChromeOAuthProfileRequest,
 } from './accounts/chrome-scan';
 import {
   AccountQueueTimeoutError,
   AccountScheduler,
+  accountScheduler as globalAccountScheduler,
   AllAccountsCooldownError,
   NoReadyAccountsError,
   isFullProAccount,
@@ -21,6 +23,7 @@ import {
   getConfig,
   getPublicConfig,
   updateConfig,
+  validateRiskControlPatch,
   validateSensitiveFilterPatch,
 } from './config/settings';
 import { store } from './db/store';
@@ -209,14 +212,17 @@ export function createApp(options: AppOptions = {}) {
   const inFlightControllers = options.geminiDeps?.inFlightControllers ?? new Map<string, AbortController>();
   const accountManager = options.accountManager ?? new AccountManager();
   const mcpServer = options.geminiDeps?.workerPool ? null : new LoopbackMcpServer();
+  let accountScheduler: AccountScheduler | null = null;
   const acpPool = options.geminiDeps?.workerPool
     ? null
     : new AcpWorkerPool({
         mcpServer: mcpServer!,
         agyPath: config.agyPath || undefined,
         softErrorCutoffMs: config.softErrorCutoffMs,
+        tryAcquireWorkerSpawn: (accountId) =>
+          (accountScheduler ?? globalAccountScheduler).tryConsumeWorkerSpawn(accountId),
       });
-  const accountScheduler = options.geminiDeps?.scheduler
+  accountScheduler = options.geminiDeps?.scheduler
     ? null
     : new AccountScheduler({
         getActiveCount: acpPool ? (id) => acpPool.getActiveCount(id) : undefined,
@@ -490,14 +496,31 @@ export function createApp(options: AppOptions = {}) {
           const existing = accountManager.getAccount(accountId);
           if (!existing) return Response.json({ error: 'Account not found' }, { status: 404 });
           const patch = (await req.json().catch(() => ({}))) as Partial<AccountRecord>;
+          const nextStatusReason =
+            patch.statusReason !== undefined
+              ? patch.statusReason
+              : patch.status === 'ready'
+                ? ''
+                : existing.statusReason;
           const updated: AccountRecord = {
             ...existing,
             ...patch,
             id: existing.id,
+            statusReason: nextStatusReason,
             tier: patch.tier === 'pro' ? 'pro' : patch.tier === 'standard' ? 'standard' : existing.tier,
             updatedAt: Date.now(),
           };
           store.upsertAccount(updated);
+          if (updated.status === 'ready') {
+            if (accountScheduler) {
+              accountScheduler.clearCooldown(accountId, '*', 'global');
+            } else {
+              const deleted = store.deleteCooldown(accountId, '*', 'global');
+              if (deleted) {
+                eventBus.emit('cooldowns', store.listCooldowns(Date.now()));
+              }
+            }
+          }
           eventBus.emit('accounts', accountManager.listAccounts());
           return Response.json(enrichAccount(updated));
         }
@@ -528,6 +551,30 @@ export function createApp(options: AppOptions = {}) {
           const updated = await accountManager.refreshAccountQuota(accountId);
           if (!updated) return Response.json({ error: 'Account not found' }, { status: 404 });
           return Response.json(enrichAccount(updated));
+        }
+
+        if (req.method === 'POST' && subPath === 'open-url') {
+          const body = (await req.json().catch(() => ({}))) as { url?: unknown };
+          const rawUrl = typeof body.url === 'string' ? body.url.trim() : '';
+          if (!rawUrl || /[\r\n\0]/.test(rawUrl) || !/^https?:\/\//i.test(rawUrl)) {
+            return Response.json(
+              { error: 'Valid http:// or https:// url is required' },
+              { status: 400 }
+            );
+          }
+          const existing = store.getAccount(accountId);
+          if (!existing) {
+            return Response.json({ error: 'Account not found' }, { status: 404 });
+          }
+          try {
+            const result = openUrlInAccountChrome(existing.email || '', rawUrl);
+            return Response.json(result);
+          } catch (err) {
+            return Response.json(
+              { error: err instanceof Error ? err.message : String(err) },
+              { status: 400 }
+            );
+          }
         }
 
         const cdMatch = subPath.match(/^cooldowns\/(.+)$/);
@@ -679,6 +726,7 @@ export function createApp(options: AppOptions = {}) {
         }
         try {
           validateSensitiveFilterPatch(body as Record<string, unknown>);
+          validateRiskControlPatch(body as Record<string, unknown>);
         } catch (err) {
           return Response.json(
             { error: err instanceof Error ? err.message : String(err) },

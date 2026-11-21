@@ -9,6 +9,7 @@ type ClassifiedError = NonNullable<ReturnType<typeof classifyUpstreamError>>;
 type UpdateBoundary = {
   handleUpdate(params: Record<string, unknown>): void;
   scheduleSoftErrorCutoff(text: string, classified: ClassifiedError): void;
+  abortTurnImmediately(text: string, classified: ClassifiedError): void;
   activeTurnParts: GeminiPart[];
   activeTurnCallbacks: { onPart: (part: GeminiPart) => void };
 };
@@ -150,6 +151,179 @@ describe("explicit upstream errors", () => {
         code: "SOFT_ERROR", upstreamStatus: 502,
       });
     } finally {
+      cutoff.mockRestore();
+    }
+  });
+
+  test("classifyUpstreamError classifies ToS suspension message as RESTRICTED (403)", () => {
+    const tosMsg =
+      "⚠ This service has been disabled in this account for violation of terms of service. Please submit an appeal.";
+    expect(classifyUpstreamError(tosMsg)).toEqual({
+      code: "RESTRICTED",
+      upstreamStatus: 403,
+    });
+  });
+
+  test("first agent_message_chunk with warning ToS error triggers fast abort", () => {
+    const { boundary, streamed, cutoff, send } = createUpdateHarness();
+    const abortSpy = spyOn(boundary, "abortTurnImmediately").mockImplementation(() => {});
+    const tosChunk =
+      "⚠ This service has been disabled in this account for violation of terms of service.";
+    try {
+      send("agent_message_chunk", tosChunk);
+      expect(abortSpy).toHaveBeenCalledTimes(1);
+      expect(abortSpy).toHaveBeenCalledWith(tosChunk, {
+        code: "RESTRICTED",
+        upstreamStatus: 403,
+      });
+      expect(boundary.activeTurnParts).toEqual([]);
+      expect(streamed).toEqual([]);
+    } finally {
+      abortSpy.mockRestore();
+      cutoff.mockRestore();
+    }
+  });
+
+  test("first agent_message_chunk with ordinary warning text passes through", () => {
+    const { boundary, streamed, cutoff, send } = createUpdateHarness();
+    const abortSpy = spyOn(boundary, "abortTurnImmediately").mockImplementation(() => {});
+    const normalWarning = "⚠ 注意：该量表满分 226 分";
+    try {
+      send("agent_message_chunk", normalWarning);
+      expect(abortSpy).not.toHaveBeenCalled();
+      expect(boundary.activeTurnParts).toEqual([{ text: normalWarning }]);
+      expect(streamed).toEqual([{ text: normalWarning }]);
+    } finally {
+      abortSpy.mockRestore();
+      cutoff.mockRestore();
+    }
+  });
+});
+
+describe("transport error / EOF jitter guard", () => {
+  test("classifyUpstreamError classifies EOF, connection reset by peer, and no such host as TRANSPORT_ERROR (502)", () => {
+    for (const msg of [
+      'request failed: Post "https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse": EOF',
+      "read tcp 10.0.0.1:443: connection reset by peer",
+      "dial tcp: lookup daily-cloudcode-pa.googleapis.com: no such host",
+    ]) {
+      expect(classifyUpstreamError(msg)).toEqual({
+        code: "TRANSPORT_ERROR",
+        upstreamStatus: 502,
+      });
+    }
+    expect(classifyUpstreamError("thereof")).toBeNull();
+  });
+
+  test("first agent_message_chunk with CLI API error EOF triggers fast abort and leaves activeTurnParts empty", () => {
+    const { boundary, streamed, cutoff, send } = createUpdateHarness();
+    const abortSpy = spyOn(boundary, "abortTurnImmediately").mockImplementation(() => {});
+    const eofChunk =
+      '⚠ API error (attempt 1): request failed: Post "https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse": EOF';
+    try {
+      send("agent_message_chunk", eofChunk);
+      expect(abortSpy).toHaveBeenCalledTimes(1);
+      expect(abortSpy).toHaveBeenCalledWith(eofChunk, {
+        code: "TRANSPORT_ERROR",
+        upstreamStatus: 502,
+      });
+      expect(boundary.activeTurnParts).toEqual([]);
+      expect(streamed).toEqual([]);
+      expect(cutoff).not.toHaveBeenCalled();
+    } finally {
+      abortSpy.mockRestore();
+      cutoff.mockRestore();
+    }
+  });
+
+  test("agent_thought_chunk followed by CLI API error EOF still triggers fast abort", () => {
+    const { boundary, streamed, cutoff, send } = createUpdateHarness();
+    const abortSpy = spyOn(boundary, "abortTurnImmediately").mockImplementation(() => {});
+    const eofChunk = "⚠ API error (attempt 1): stream error: EOF";
+    try {
+      send("agent_thought_chunk", "Let me think through this...");
+      send("agent_message_chunk", eofChunk);
+      expect(abortSpy).toHaveBeenCalledTimes(1);
+      expect(abortSpy).toHaveBeenCalledWith(eofChunk, {
+        code: "TRANSPORT_ERROR",
+        upstreamStatus: 502,
+      });
+      expect(boundary.activeTurnParts).toEqual([
+        { text: "Let me think through this...", thought: true },
+      ]);
+      expect(streamed).toEqual([
+        { text: "Let me think through this...", thought: true },
+      ]);
+      expect(cutoff).not.toHaveBeenCalled();
+    } finally {
+      abortSpy.mockRestore();
+      cutoff.mockRestore();
+    }
+  });
+
+  test("CLI API error EOF after effective agent_message_chunk is silently filtered without polluting output", () => {
+    const { boundary, streamed, cutoff, send } = createUpdateHarness();
+    const abortSpy = spyOn(boundary, "abortTurnImmediately").mockImplementation(() => {});
+    const eofChunk = "⚠ API error (attempt 1): connection reset by peer: EOF";
+    try {
+      send("agent_message_chunk", "这是前半段正常正文。");
+      send("agent_message_chunk", eofChunk);
+      send("agent_message_chunk", "这是后半段续吐正文。");
+      expect(abortSpy).not.toHaveBeenCalled();
+      expect(cutoff).not.toHaveBeenCalled();
+      expect(boundary.activeTurnParts).toEqual([
+        { text: "这是前半段正常正文。" },
+        { text: "这是后半段续吐正文。" },
+      ]);
+      expect(streamed).toEqual([
+        { text: "这是前半段正常正文。" },
+        { text: "这是后半段续吐正文。" },
+      ]);
+    } finally {
+      abortSpy.mockRestore();
+      cutoff.mockRestore();
+    }
+  });
+
+  test("error frame containing EOF triggers fast abort without waiting for softErrorCutoff", () => {
+    const { boundary, streamed, cutoff } = createUpdateHarness();
+    const abortSpy = spyOn(boundary, "abortTurnImmediately").mockImplementation(() => {});
+    const errMsg = "stream terminated unexpectedly: EOF";
+    try {
+      boundary.handleUpdate({ update: { sessionUpdate: "error", message: errMsg } });
+      expect(abortSpy).toHaveBeenCalledTimes(1);
+      expect(abortSpy).toHaveBeenCalledWith(errMsg, {
+        code: "TRANSPORT_ERROR",
+        upstreamStatus: 502,
+      });
+      expect(cutoff).not.toHaveBeenCalled();
+      expect(boundary.activeTurnParts).toEqual([]);
+      expect(streamed).toEqual([]);
+    } finally {
+      abortSpy.mockRestore();
+      cutoff.mockRestore();
+    }
+  });
+
+  test("ordinary warning chunk still passes through even after thought chunk", () => {
+    const { boundary, streamed, cutoff, send } = createUpdateHarness();
+    const abortSpy = spyOn(boundary, "abortTurnImmediately").mockImplementation(() => {});
+    const normalWarning = "⚠ 注意：该量表满分 226 分";
+    try {
+      send("agent_thought_chunk", "先核对量表总分。");
+      send("agent_message_chunk", normalWarning);
+      expect(abortSpy).not.toHaveBeenCalled();
+      expect(cutoff).not.toHaveBeenCalled();
+      expect(boundary.activeTurnParts).toEqual([
+        { text: "先核对量表总分。", thought: true },
+        { text: normalWarning },
+      ]);
+      expect(streamed).toEqual([
+        { text: "先核对量表总分。", thought: true },
+        { text: normalWarning },
+      ]);
+    } finally {
+      abortSpy.mockRestore();
       cutoff.mockRestore();
     }
   });

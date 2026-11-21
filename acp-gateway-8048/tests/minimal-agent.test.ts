@@ -14,10 +14,12 @@ import {
   type AcpTransport,
   type AcpTransportFactory,
 } from "../src/acp/worker";
+import { getConfig, updateConfig } from "../src/config/settings";
 import type { AccountRecord, GeminiGenerateRequest } from "../src/types";
 
 const tempDirs: string[] = [];
 const prevMinimalEnv = process.env.AGY_8048_MINIMAL_AGENT;
+const prevExcludeDefaultComponents = getConfig().excludeDefaultComponents;
 
 function makeTempDir(prefix: string): string {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
@@ -54,6 +56,8 @@ afterEach(() => {
     process.env.AGY_8048_MINIMAL_AGENT = prevMinimalEnv;
   }
 
+  updateConfig({ excludeDefaultComponents: prevExcludeDefaultComponents });
+
   while (tempDirs.length > 0) {
     const dir = tempDirs.pop()!;
     fs.rmSync(dir, { recursive: true, force: true });
@@ -61,7 +65,10 @@ afterEach(() => {
 });
 
 describe("minimal-agent", () => {
-  it("writes agent.md with excludeDefaultComponents: true by default and skips unchanged rewrites", () => {
+  it("writes agent.md without excludeDefaultComponents: true by default and skips unchanged rewrites", () => {
+    delete process.env.AGY_8048_MINIMAL_AGENT;
+    updateConfig({ excludeDefaultComponents: false });
+
     const workspace = makeTempDir("agy-ws-");
     const agentPath = ensureMinimalAgentDefinition(workspace);
     expect(agentPath).toBe(
@@ -70,7 +77,7 @@ describe("minimal-agent", () => {
 
     const content = fs.readFileSync(agentPath, "utf8");
     expect(content).toContain(`name: ${AGY_BRIDGE_AGENT_NAME}`);
-    expect(content).toContain("excludeDefaultComponents: true");
+    expect(content).not.toContain("excludeDefaultComponents: true");
     expect(content).toContain("Use only the provided tools.");
 
     const pastTime = new Date(Date.now() - 60_000);
@@ -82,14 +89,47 @@ describe("minimal-agent", () => {
     expect(afterMtime).toBe(beforeMtime);
   });
 
-  it("omits excludeDefaultComponents when AGY_8048_MINIMAL_AGENT=0 or options.minimal=false", () => {
-    const ws1 = makeTempDir("agy-ws-opt-");
-    const path1 = ensureMinimalAgentDefinition(ws1, { minimal: false });
-    expect(fs.readFileSync(path1, "utf8")).not.toContain("excludeDefaultComponents: true");
+  it("refreshes agent.md immediately when excludeDefaultComponents config or env overrides change", () => {
+    delete process.env.AGY_8048_MINIMAL_AGENT;
+    updateConfig({ excludeDefaultComponents: false });
 
+    const workspace = makeTempDir("agy-ws-toggle-");
+    const agentPath = ensureMinimalAgentDefinition(workspace);
+    expect(fs.readFileSync(agentPath, "utf8")).not.toContain("excludeDefaultComponents: true");
+
+    // Switching config to true immediately overwrites agent.md on next call
+    updateConfig({ excludeDefaultComponents: true });
+    ensureMinimalAgentDefinition(workspace);
+    expect(fs.readFileSync(agentPath, "utf8")).toContain("excludeDefaultComponents: true");
+
+    // Switching config back to false immediately removes it on next call
+    updateConfig({ excludeDefaultComponents: false });
+    ensureMinimalAgentDefinition(workspace);
+    expect(fs.readFileSync(agentPath, "utf8")).not.toContain("excludeDefaultComponents: true");
+
+    // AGY_8048_MINIMAL_AGENT=1 has highest priority over config and options
+    process.env.AGY_8048_MINIMAL_AGENT = "1";
+    ensureMinimalAgentDefinition(workspace, { minimal: false });
+    expect(fs.readFileSync(agentPath, "utf8")).toContain("excludeDefaultComponents: true");
+
+    // AGY_8048_MINIMAL_AGENT=0 has highest priority over config and options
+    updateConfig({ excludeDefaultComponents: true });
     process.env.AGY_8048_MINIMAL_AGENT = "0";
-    const ws2 = makeTempDir("agy-ws-env-");
-    const path2 = ensureMinimalAgentDefinition(ws2);
+    ensureMinimalAgentDefinition(workspace, { minimal: true });
+    expect(fs.readFileSync(agentPath, "utf8")).not.toContain("excludeDefaultComponents: true");
+  });
+
+  it("supports explicit options.minimal when AGY_8048_MINIMAL_AGENT is unset", () => {
+    delete process.env.AGY_8048_MINIMAL_AGENT;
+    updateConfig({ excludeDefaultComponents: false });
+
+    const ws1 = makeTempDir("agy-ws-opt-true-");
+    const path1 = ensureMinimalAgentDefinition(ws1, { minimal: true });
+    expect(fs.readFileSync(path1, "utf8")).toContain("excludeDefaultComponents: true");
+
+    updateConfig({ excludeDefaultComponents: true });
+    const ws2 = makeTempDir("agy-ws-opt-false-");
+    const path2 = ensureMinimalAgentDefinition(ws2, { minimal: false });
     expect(fs.readFileSync(path2, "utf8")).not.toContain("excludeDefaultComponents: true");
   });
 

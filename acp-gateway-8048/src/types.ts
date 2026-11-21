@@ -166,6 +166,8 @@ export interface CooldownRecord {
 
 export type RoutingStrategy = 'sticky-round-robin' | 'fill-first' | 'cache-first' | 'performance-first';
 
+export type QuotaCooldownScope = 'family' | 'account';
+
 export type SensitiveWordScope = 'all' | 'system' | 'messages' | 'tools';
 
 export interface SensitiveWordRule {
@@ -201,6 +203,24 @@ export interface GatewayConfig {
    * 下一次请求出站前的 KV 缓存就绪平滑等待窗口（毫秒，0..5000，0 表示关闭，默认 1000）。
    */
   cacheSettlingDelayMs: number;
+  strictProxyBinding: boolean;
+  blockOnExitIpDrift: boolean;
+  maxConcurrencyPerExitIp: number;
+  minExitIpRequestIntervalMs: number;
+  minAccountRequestIntervalMs: number;
+  requestJitterMs: number;
+  maxWorkerSpawnsPerMinute: number;
+  quotaCooldownScope: QuotaCooldownScope;
+  /** 是否剥离 agy 原生默认系统提示词组件（false = 保真模式，true = 极简剥离模式）。 */
+  excludeDefaultComponents: boolean;
+  /** 防"连坐打爆全池"总开关；关闭时遇到 401/402/403/429 不跨号自动轮换。 */
+  accountFailover: boolean;
+  /** 开启 accountFailover 时，单次请求针对 429/配额类错误的最大跨号切换保险丝上限（0..10）。 */
+  maxQuotaAccountSwitches: number;
+  /** 403/RESTRICTED 策略封禁硬锁 TTL（毫秒，60_000..604_800_000，默认 6 小时）。 */
+  policyBlockCooldownMs: number;
+  /** agy 内部 429 重试风暴触发 session/cancel 的通知次数阈值（1..8）。 */
+  maxInternal429RetriesBeforeCancel: number;
   sensitiveFilterEnabled: boolean;
   sensitiveWords: SensitiveWordRule[];
 }

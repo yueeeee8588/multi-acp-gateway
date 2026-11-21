@@ -410,4 +410,127 @@ describe("AgySessionWorker warm-reuse dedup & promptToFirstEventMs / idle watchd
       await mcpServer.stop();
     }
   });
+
+  test("5a. cancels via session/cancel within 100ms on 2 consecutive internal 429 retries with no effective output", async () => {
+    const mcpServer = new LoopbackMcpServer();
+    await mcpServer.start();
+
+    const cancelCalls: string[] = [];
+    const worker = new AgySessionWorker({
+      account: makeAccount("429-storm-cancel"),
+      model: "gemini-4-hydrogen-medium",
+      workspaceDir: "unused",
+      mcpServer,
+      transportFactory: ({ onUpdate }): AcpTransport => ({
+        initialize: async () => ({ ok: true }),
+        newSession: async () => ({ sessionId: "sess-429-storm" }),
+        setModel: async () => ({}),
+        prompt: async () => {
+          onUpdate({
+            sessionId: "sess-429-storm",
+            update: {
+              sessionUpdate: "agent_message_chunk",
+              content: { type: "text", text: "⚠ API error (attempt 1): 429 RESOURCE_EXHAUSTED retrying in 5s" },
+            },
+          });
+          await new Promise((r) => setTimeout(r, 10));
+          onUpdate({
+            sessionId: "sess-429-storm",
+            update: {
+              sessionUpdate: "agent_message_chunk",
+              content: { type: "text", text: "⚠ API error (attempt 2): 429 RESOURCE_EXHAUSTED retrying in 12s" },
+            },
+          });
+          // Simulate agy hanging on 8-minute backoff if not cancelled
+          await new Promise((r) => setTimeout(r, 5000));
+          return { stopReason: "end_turn" };
+        },
+        cancel: async (sessionId) => {
+          cancelCalls.push(sessionId);
+        },
+        close: async () => {},
+        isAlive: () => true,
+      }),
+    });
+
+    try {
+      const started = performance.now();
+      let caught: unknown;
+      try {
+        await worker.executePrompt({
+          contents: [{ role: "user", parts: [{ text: "hello" }] }],
+        });
+      } catch (err) {
+        caught = err;
+      }
+      const elapsedMs = performance.now() - started;
+
+      expect(caught).toBeInstanceOf(WorkerError);
+      expect((caught as WorkerError).code).toBe("QUOTA_EXHAUSTED");
+      expect((caught as WorkerError).upstreamStatus).toBe(429);
+      expect(cancelCalls).toEqual(["sess-429-storm"]);
+      expect(elapsedMs).toBeLessThan(100);
+    } finally {
+      await worker.resetAndClose();
+      await mcpServer.stop();
+    }
+  });
+
+  test("5b. does NOT false-cancel on 429 retry notices once effective output has been produced", async () => {
+    const mcpServer = new LoopbackMcpServer();
+    await mcpServer.start();
+
+    const cancelCalls: string[] = [];
+    const worker = new AgySessionWorker({
+      account: makeAccount("429-no-false-kill"),
+      model: "gemini-4-hydrogen-medium",
+      workspaceDir: "unused",
+      mcpServer,
+      transportFactory: ({ onUpdate }): AcpTransport => ({
+        initialize: async () => ({ ok: true }),
+        newSession: async () => ({ sessionId: "sess-429-safe" }),
+        setModel: async () => ({}),
+        prompt: async () => {
+          onUpdate({
+            sessionId: "sess-429-safe",
+            update: {
+              sessionUpdate: "agent_message_chunk",
+              content: { type: "text", text: "⚠ API error (attempt 1): 429 RESOURCE_EXHAUSTED retrying in 5s" },
+            },
+          });
+          onUpdate({
+            sessionId: "sess-429-safe",
+            update: {
+              sessionUpdate: "agent_message_chunk",
+              content: { type: "text", text: "Recovered answer" },
+            },
+          });
+          onUpdate({
+            sessionId: "sess-429-safe",
+            update: {
+              sessionUpdate: "agent_message_chunk",
+              content: { type: "text", text: "⚠ API error (attempt 2): 429 RESOURCE_EXHAUSTED" },
+            },
+          });
+          return { stopReason: "end_turn" };
+        },
+        cancel: async (sessionId) => {
+          cancelCalls.push(sessionId);
+        },
+        close: async () => {},
+        isAlive: () => true,
+      }),
+    });
+
+    try {
+      const res = await worker.executePrompt({
+        contents: [{ role: "user", parts: [{ text: "hello" }] }],
+      });
+      expect(res.parts).toEqual([{ text: "Recovered answer" }]);
+      expect(cancelCalls).toEqual([]);
+    } finally {
+      await worker.resetAndClose();
+      await mcpServer.stop();
+    }
+  });
 });

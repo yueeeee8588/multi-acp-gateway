@@ -3,7 +3,12 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'nod
 import { tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
 import { AccountManager, GOOGLE_TOKEN_URL } from '../src/accounts/manager';
-import { classifyModelPool, computeAccountQuotaSnapshot } from '../src/accounts/quota';
+import {
+  __setQuotaFetcherForTest,
+  classifyModelPool,
+  computeAccountQuotaSnapshot,
+  fetchAccountQuota,
+} from '../src/accounts/quota';
 import { store } from '../src/db/store';
 import { createApp } from '../src/server';
 import type { AccountRecord } from '../src/types';
@@ -535,5 +540,49 @@ describe('account quota refresh', () => {
     expect(accounts.find((account) => account.id === broken.id)?.quota).toBeNull();
     expect(accounts.find((account) => account.id === wrongShape.id)?.quota).toBeNull();
     expect(accounts.some((account) => account.id === good.id)).toBe(true);
+  });
+
+  it('sends official antigravity/cli User-Agent on loadCodeAssist and retrieveUserQuotaSummary', async () => {
+    const capturedUserAgents: Array<{ url: string; userAgent: string | null }> = [];
+    const uaRegex =
+      /^antigravity\/cli\/\S+ \(aidev_client; os_type=(windows|darwin|linux); arch=(amd64|arm64); cl=\d+; auth_method=\S+\)$/;
+
+    __setQuotaFetcherForTest((async (input, init) => {
+      const url = String(input);
+      const headers = new Headers(init?.headers);
+      capturedUserAgents.push({ url, userAgent: headers.get('User-Agent') });
+
+      if (url.endsWith(':loadCodeAssist')) {
+        return Response.json({
+          cloudaicompanionProject: 'ua-test-project',
+          paidTier: { id: 'g1-pro-tier' },
+        });
+      }
+      if (url.endsWith(':fetchAvailableModels')) {
+        return Response.json({
+          models: {
+            'gemini-4-argon-high': modelQuota(0.9),
+          },
+        });
+      }
+      if (url.endsWith(':retrieveUserQuotaSummary')) {
+        return Response.json(flagshipSummary(0.9, 0.8));
+      }
+      return Response.json({}, { status: 404 });
+    }) as typeof fetch);
+
+    try {
+      const result = await fetchAccountQuota({ accessToken: 'test-access-token' });
+      expect(result.snapshot.pools.gemini_flagship?.percentage).toBe(80);
+    } finally {
+      __setQuotaFetcherForTest(undefined);
+    }
+
+    const loadCall = capturedUserAgents.find((c) => c.url.endsWith(':loadCodeAssist'));
+    const summaryCall = capturedUserAgents.find((c) => c.url.endsWith(':retrieveUserQuotaSummary'));
+    expect(loadCall).toBeDefined();
+    expect(summaryCall).toBeDefined();
+    expect(loadCall!.userAgent).toMatch(uaRegex);
+    expect(summaryCall!.userAgent).toMatch(uaRegex);
   });
 });

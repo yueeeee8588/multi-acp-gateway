@@ -407,7 +407,7 @@ describe('503 capacity classification, fast abort, and real 503 passthrough', ()
     }
   });
 
-  it('4. guardrails: normal text mentioning 503 or CLI error text AFTER normal output passes through untouched', async () => {
+  it('4. guardrails: normal text mentioning 503 passes through while CLI error noise AFTER normal output is silently filtered without aborting', async () => {
     const mcpServer = new LoopbackMcpServer();
     const emittedParts: GeminiPart[] = [];
     const closedAccounts: string[] = [];
@@ -449,7 +449,6 @@ describe('503 capacity classification, fast abort, and real 503 passthrough', ()
       );
       expect(result.parts).toEqual([
         { text: 'HTTP 503 Service Unavailable means the server is overloaded.' },
-        { text: REAL_503_CLI_CHUNK },
       ]);
       expect(emittedParts).toEqual(result.parts);
       expect(closedAccounts).toEqual([]);

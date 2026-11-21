@@ -1,7 +1,13 @@
+import { Database } from 'bun:sqlite';
 import { afterEach, describe, expect, it } from 'bun:test';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { LoopbackMcpServer } from '../src/acp/loopback-mcp';
 import { AcpWorkerPool } from '../src/acp/pool';
+import { computeSensitiveFilterFingerprint } from '../src/acp/sensitive-filter';
 import type { AcpTransport, AcpTransportFactory } from '../src/acp/worker';
+import { getConfig, updateConfig } from '../src/config/settings';
 import { DEFAULT_ACP_SESSION_TTL_MS, GatewayStore, store } from '../src/db/store';
 import type { AccountRecord, GeminiGenerateRequest } from '../src/types';
 
@@ -615,6 +621,291 @@ describe('cross-restart session/resume persistence', () => {
     } finally {
       await pool.shutdownAll();
       await mcpServer.stop();
+    }
+  });
+
+  it('stores zero plaintext in any acp_sessions column', async () => {
+    const account = makeAccount('acc-zero-plaintext');
+    const model = 'gemini-4-hydrogen';
+    const sessionKey = 'sess-zero-pt-1';
+    const stickyKey = `${account.id}:${model}:${sessionKey}`;
+    cleanupKeys.push(stickyKey);
+
+    const secretSystem = 'SECRET_SYSTEM_PROMPT_9981';
+    const secretTool = 'secret_tool_lookup_9981';
+    const secretUser = 'SECRET_USER_MESSAGE_9981';
+
+    const calls: RecordedCalls = {
+      newSessionParams: [],
+      resumeSessionParams: [],
+      setModelParams: [],
+      promptParams: [],
+    };
+    const mcpServer = new LoopbackMcpServer();
+    await mcpServer.start();
+    const pool = new AcpWorkerPool({
+      mcpServer,
+      cleanupIntervalMs: 60_000,
+      transportFactory: createMockTransportFactory({
+        sessionId: 'sid-zero-pt-1',
+        resumeSupported: true,
+        calls,
+      }),
+    });
+
+    const req: GeminiGenerateRequest = {
+      systemInstruction: { parts: [{ text: secretSystem }] },
+      tools: [
+        {
+          functionDeclarations: [
+            {
+              name: secretTool,
+              description: 'Confidential tool description 9981',
+              parameters: { type: 'OBJECT', properties: {} },
+            },
+          ],
+        },
+      ],
+      contents: [{ role: 'user', parts: [{ text: secretUser }] }],
+    };
+
+    try {
+      const { worker, release } = pool.acquireWorker(account, model, req, sessionKey);
+      await worker.executePrompt(req);
+      release();
+    } finally {
+      await pool.shutdownAll();
+      await mcpServer.stop();
+    }
+
+    const rawDb = (
+      store as unknown as {
+        db: { query: (sql: string) => { get: (...args: unknown[]) => Record<string, unknown> | null } };
+      }
+    ).db;
+    const rawRow = rawDb
+      .query('SELECT * FROM acp_sessions WHERE sticky_key = ?')
+      .get(stickyKey);
+    expect(rawRow).not.toBeNull();
+
+    const serializedRow = JSON.stringify(rawRow);
+    expect(serializedRow).not.toContain(secretSystem);
+    expect(serializedRow).not.toContain(secretTool);
+    expect(serializedRow).not.toContain('Confidential tool description 9981');
+    expect(serializedRow).not.toContain(secretUser);
+    expect(String(rawRow?.system_hash)).toMatch(/^[a-f0-9]{64}$/);
+    expect(String(rawRow?.tools_hash)).toMatch(/^[a-f0-9]{64}$/);
+    const hashes = JSON.parse(String(rawRow?.committed_hashes_json)) as string[];
+    expect(hashes).toHaveLength(1);
+    for (const h of hashes) {
+      expect(h).toMatch(/^[a-f0-9]{64}$/);
+    }
+  });
+
+  it('persists sensitiveFilterFingerprint across restart, sets timings.sessionResumed=true, and sends only delta', async () => {
+    const prevConfig = getConfig();
+    const rules = [
+      {
+        pattern: 'forbidden-token',
+        replace: '[REDACTED]',
+        enabled: true,
+        case_insensitive: false,
+        scope: 'all' as const,
+      },
+    ];
+    updateConfig({
+      sensitiveFilterEnabled: true,
+      sensitiveWords: rules,
+    });
+    const expectedFingerprint = computeSensitiveFilterFingerprint({
+      sensitiveFilterEnabled: true,
+      sensitiveWords: rules,
+    });
+    expect(expectedFingerprint).toMatch(/^[a-f0-9]{64}$/);
+
+    const account = makeAccount('acc-sensitive-resume');
+    const model = 'gemini-4-hydrogen';
+    const sessionKey = 'sess-sensitive-resume-1';
+    const stickyKey = `${account.id}:${model}:${sessionKey}`;
+    cleanupKeys.push(stickyKey);
+
+    try {
+      const calls1: RecordedCalls = {
+        newSessionParams: [],
+        resumeSessionParams: [],
+        setModelParams: [],
+        promptParams: [],
+      };
+      const mcpServer1 = new LoopbackMcpServer();
+      await mcpServer1.start();
+      const pool1 = new AcpWorkerPool({
+        mcpServer: mcpServer1,
+        cleanupIntervalMs: 60_000,
+        transportFactory: createMockTransportFactory({
+          sessionId: 'sensitive-sid-100',
+          resumeSupported: true,
+          calls: calls1,
+        }),
+      });
+
+      const reqTurn1: GeminiGenerateRequest = {
+        systemInstruction: { parts: [{ text: 'System with forbidden-token' }] },
+        contents: [{ role: 'user', parts: [{ text: 'Turn 1 forbidden-token' }] }],
+      };
+
+      try {
+        const { worker, release } = pool1.acquireWorker(account, model, reqTurn1, sessionKey);
+        const res1 = await worker.executePrompt(reqTurn1);
+        release();
+        expect(res1.timings?.sessionResumed).toBe(false);
+      } finally {
+        await pool1.shutdownAll();
+        await mcpServer1.stop();
+      }
+
+      const saved = store.getAcpSession(stickyKey);
+      expect(saved).not.toBeNull();
+      expect(saved?.sensitiveFilterFingerprint).toBe(expectedFingerprint);
+
+      // Restart with same sensitive filter config -> must resume with timings.sessionResumed === true
+      const calls2: RecordedCalls = {
+        newSessionParams: [],
+        resumeSessionParams: [],
+        setModelParams: [],
+        promptParams: [],
+      };
+      const mcpServer2 = new LoopbackMcpServer();
+      await mcpServer2.start();
+      const pool2 = new AcpWorkerPool({
+        mcpServer: mcpServer2,
+        cleanupIntervalMs: 60_000,
+        transportFactory: createMockTransportFactory({
+          resumeSupported: true,
+          calls: calls2,
+        }),
+      });
+
+      const reqTurn2: GeminiGenerateRequest = {
+        systemInstruction: { parts: [{ text: 'System with forbidden-token' }] },
+        contents: [
+          { role: 'user', parts: [{ text: 'Turn 1 forbidden-token' }] },
+          { role: 'model', parts: [{ text: 'ok' }] },
+          { role: 'user', parts: [{ text: 'Turn 2 forbidden-token delta' }] },
+        ],
+      };
+
+      try {
+        const { worker, release } = pool2.acquireWorker(account, model, reqTurn2, sessionKey);
+        const res2 = await worker.executePrompt(reqTurn2);
+        release();
+
+        expect(res2.timings?.sessionResumed).toBe(true);
+        expect(calls2.resumeSessionParams).toHaveLength(1);
+        expect(calls2.newSessionParams).toHaveLength(0);
+        expect(calls2.resumeSessionParams[0]?.sessionId).toBe('sensitive-sid-100');
+
+        const sentBlocks = calls2.promptParams[0]?.prompt as Array<{ text?: string }>;
+        const joined = sentBlocks.map((b) => b.text ?? '').join('\n');
+        expect(joined).toContain('Turn 2 [REDACTED] delta');
+        expect(joined).not.toContain('Turn 1');
+        expect(joined).not.toContain('forbidden-token');
+      } finally {
+        await pool2.shutdownAll();
+        await mcpServer2.stop();
+      }
+    } finally {
+      updateConfig({
+        sensitiveFilterEnabled: prevConfig.sensitiveFilterEnabled,
+        sensitiveWords: prevConfig.sensitiveWords,
+      });
+    }
+  });
+
+  it('prunes expired acp_sessions on AcpWorkerPool init and migrates legacy schema idempotently', async () => {
+    const expiredKey = 'acc-pool-init-prune:gemini-4-hydrogen:sess-expired';
+    const freshKey = 'acc-pool-init-prune:gemini-4-hydrogen:sess-fresh';
+    cleanupKeys.push(expiredKey, freshKey);
+
+    const now = Date.now();
+    store.upsertAcpSession({
+      stickyKey: expiredKey,
+      sessionId: 'expired-sid',
+      accountId: 'acc-pool-init-prune',
+      model: 'gemini-4-hydrogen',
+      systemHash: 'sys',
+      toolsHash: 'tools',
+      sensitiveFilterFingerprint: 'fp-1',
+      committedHashes: ['h1'],
+      updatedAt: now - DEFAULT_ACP_SESSION_TTL_MS - 10_000,
+    });
+    store.upsertAcpSession({
+      stickyKey: freshKey,
+      sessionId: 'fresh-sid',
+      accountId: 'acc-pool-init-prune',
+      model: 'gemini-4-hydrogen',
+      systemHash: 'sys',
+      toolsHash: 'tools',
+      sensitiveFilterFingerprint: 'fp-1',
+      committedHashes: ['h1'],
+      updatedAt: now,
+    });
+
+    const mcpServer = new LoopbackMcpServer();
+    await mcpServer.start();
+    const pool = new AcpWorkerPool({
+      mcpServer,
+      cleanupIntervalMs: 60_000,
+    });
+
+    try {
+      expect(store.getAcpSession(expiredKey, now)).toBeNull();
+      const fresh = store.getAcpSession(freshKey, now);
+      expect(fresh?.sessionId).toBe('fresh-sid');
+      expect(fresh?.sensitiveFilterFingerprint).toBe('fp-1');
+    } finally {
+      await pool.shutdownAll();
+      await mcpServer.stop();
+    }
+
+    // Verify idempotent ALTER TABLE migration on a legacy DB missing sensitive_filter_fingerprint
+    const tempDir = mkdtempSync(join(tmpdir(), 'acp-legacy-db-'));
+    const dbPath = join(tempDir, 'legacy.db');
+    try {
+      const legacyDb = new Database(dbPath, { create: true });
+      legacyDb.exec(`
+        CREATE TABLE acp_sessions (
+          sticky_key TEXT PRIMARY KEY,
+          session_id TEXT NOT NULL,
+          account_id TEXT NOT NULL,
+          model TEXT NOT NULL,
+          system_hash TEXT NOT NULL,
+          tools_hash TEXT NOT NULL,
+          committed_hashes_json TEXT NOT NULL,
+          updated_at INTEGER NOT NULL
+        );
+      `);
+      legacyDb
+        .query(
+          `INSERT INTO acp_sessions (
+            sticky_key, session_id, account_id, model, system_hash, tools_hash, committed_hashes_json, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+        )
+        .run('legacy-key', 'legacy-sid', 'acc-1', 'gemini-4-hydrogen', 'sys', 'tools', '["h1"]', now);
+      legacyDb.close();
+
+      const migratedStore = new GatewayStore(dbPath);
+      const migrated = migratedStore.getAcpSession('legacy-key', now);
+      expect(migrated).not.toBeNull();
+      expect(migrated?.sessionId).toBe('legacy-sid');
+      expect(migrated?.sensitiveFilterFingerprint).toBe('');
+      migratedStore.close();
+
+      // Re-opening must remain idempotent
+      const reopenedStore = new GatewayStore(dbPath);
+      expect(reopenedStore.getAcpSession('legacy-key', now)?.sensitiveFilterFingerprint).toBe('');
+      reopenedStore.close();
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true });
     }
   });
 });

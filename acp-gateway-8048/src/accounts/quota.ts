@@ -1,3 +1,5 @@
+import { execFileSync } from 'node:child_process';
+import { resolveOfficialAgyBinary } from '../acp/env';
 import { getConfig } from '../config/settings';
 import type {
   AccountQuotaSnapshot,
@@ -13,8 +15,57 @@ const QUOTA_ENDPOINTS = [
   'https://cloudcode-pa.googleapis.com',
 ] as const;
 
-const CODE_ASSIST_USER_AGENT = 'antigravity/hub/2.23.1 (aidev_client; os_type=windows; arch=amd64; cl=998881661)';
+const CODE_ASSIST_CL = '1021519450';
+const FALLBACK_AGY_VERSION = '1.5.9';
 const QUOTA_FETCH_TIMEOUT_MS = 8000;
+
+let cachedAgyVersion: string | null = null;
+
+function resolveOsType(platform: NodeJS.Platform = process.platform): 'windows' | 'darwin' | 'linux' {
+  if (platform === 'win32') return 'windows';
+  if (platform === 'darwin') return 'darwin';
+  return 'linux';
+}
+
+function resolveArch(arch: string = process.arch): 'amd64' | 'arm64' {
+  return arch === 'arm64' ? 'arm64' : 'amd64';
+}
+
+function detectAgyVersion(): string {
+  if (cachedAgyVersion) {
+    return cachedAgyVersion;
+  }
+  let bin = 'agy';
+  try {
+    const cfgPath = getConfig().agyPath?.trim();
+    bin = resolveOfficialAgyBinary(cfgPath || undefined);
+  } catch {
+    bin = getConfig().agyPath?.trim() || 'agy';
+  }
+  try {
+    const out = execFileSync(bin, ['--version'], {
+      encoding: 'utf8',
+      timeout: 3000,
+      windowsHide: true,
+    });
+    const match = out.trim().match(/\d+\.\d+\.\d+(?:[-+.\w]*)?/);
+    if (match?.[0]) {
+      cachedAgyVersion = match[0];
+      return cachedAgyVersion;
+    }
+  } catch {
+    // 回退到默认已知版本号，避免阻塞配额刷新
+  }
+  cachedAgyVersion = FALLBACK_AGY_VERSION;
+  return cachedAgyVersion;
+}
+
+export function buildCodeAssistUserAgent(authMethod = 'oauth'): string {
+  const version = detectAgyVersion();
+  const osType = resolveOsType();
+  const arch = resolveArch();
+  return `antigravity/cli/${version} (aidev_client; os_type=${osType}; arch=${arch}; cl=${CODE_ASSIST_CL}; auth_method=${authMethod})`;
+}
 
 const POOL_LABELS: Record<QuotaPoolKey, string> = {
   gemini_flagship: 'G4 Argon',
@@ -572,7 +623,7 @@ async function postCodeAssistJson(
     headers: {
       Authorization: `Bearer ${accessToken}`,
       'Content-Type': 'application/json',
-      'User-Agent': CODE_ASSIST_USER_AGENT,
+      'User-Agent': buildCodeAssistUserAgent(),
     },
     body: JSON.stringify(body),
     signal: AbortSignal.timeout(QUOTA_FETCH_TIMEOUT_MS),
