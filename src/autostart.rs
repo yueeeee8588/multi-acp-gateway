@@ -1,7 +1,17 @@
+use serde::Serialize;
 use std::path::{Path, PathBuf};
 
 pub const GATEWAY_8046_SCRIPT: &str = "Gateway-8046-Autostart.vbs";
 pub const ACP_8048_SCRIPT: &str = "AGY-8048-Autostart.vbs";
+pub const AISTUDIO_2048_SCRIPT: &str = "AiStudio-2048-Autostart.vbs";
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct AiStudioAutostartStatus {
+    pub supported: bool,
+    pub available: bool,
+    pub enabled: bool,
+    pub script_path: Option<String>,
+}
 
 pub fn is_supported() -> bool {
     cfg!(windows)
@@ -72,6 +82,33 @@ fn resolve_acp_8048_dir(work_dir: &Path) -> Option<PathBuf> {
             return Some(candidate);
         }
     }
+    None
+}
+
+fn resolve_aistudio_dir(
+    work_dir: &Path,
+    aistudio_gateway_dir_env: Option<&str>,
+) -> Option<PathBuf> {
+    if let Some(env_dir) = aistudio_gateway_dir_env
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        let candidate = PathBuf::from(env_dir);
+        let resolved = if candidate.is_absolute() {
+            candidate
+        } else {
+            work_dir.join(candidate)
+        };
+        if resolved.is_dir() {
+            return Some(resolved);
+        }
+    }
+
+    let candidate = work_dir.join("magpie-aistudio-2048");
+    if candidate.is_dir() {
+        return Some(candidate);
+    }
+
     None
 }
 
@@ -207,6 +244,136 @@ pub fn apply(enabled: bool) -> Result<(), String> {
     apply_in_dir(enabled, &dir)
 }
 
+fn render_2048_vbs(aistudio_dir: &Path) -> String {
+    let aistudio_dir_str = clean_windows_path(aistudio_dir);
+    let silent_vbs = aistudio_dir.join("launch_2048_silent.vbs");
+    let cmd = if silent_vbs.is_file() {
+        let silent_vbs_str = clean_windows_path(&silent_vbs);
+        format!("wscript.exe \"{silent_vbs_str}\"")
+    } else {
+        let manage_ps1 = aistudio_dir.join("manage_aistudio.ps1");
+        let manage_ps1_str = clean_windows_path(&manage_ps1);
+        format!(
+            "powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File \"{manage_ps1_str}\" start"
+        )
+    };
+
+    format!(
+        "Set shell = CreateObject(\"WScript.Shell\")\r\n\
+         shell.CurrentDirectory = {}\r\n\
+         shell.Run {}, 0, False\r\n",
+        vbs_string_expr(&aistudio_dir_str),
+        vbs_string_expr(&cmd),
+    )
+}
+
+fn aistudio_has_launcher(aistudio_dir: &Path) -> bool {
+    aistudio_dir.join("launch_2048_silent.vbs").is_file()
+        || aistudio_dir.join("manage_aistudio.ps1").is_file()
+}
+
+pub fn aistudio_status_in_dir(
+    startup_dir: &Path,
+    work_dir: &Path,
+    aistudio_gateway_dir_env: Option<&str>,
+) -> AiStudioAutostartStatus {
+    let target = startup_dir.join(AISTUDIO_2048_SCRIPT);
+    let available = resolve_aistudio_dir(work_dir, aistudio_gateway_dir_env)
+        .is_some_and(|dir| aistudio_has_launcher(&dir));
+    let enabled = target.is_file();
+    AiStudioAutostartStatus {
+        supported: is_supported(),
+        available,
+        enabled,
+        script_path: Some(clean_windows_path(&target)),
+    }
+}
+
+pub fn apply_aistudio_in_dir(
+    enabled: bool,
+    startup_dir: &Path,
+    work_dir: &Path,
+    aistudio_gateway_dir_env: Option<&str>,
+) -> Result<AiStudioAutostartStatus, String> {
+    let target = startup_dir.join(AISTUDIO_2048_SCRIPT);
+    if !enabled {
+        match std::fs::remove_file(&target) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "Failed to remove autostart script {}: {error}",
+                    target.display()
+                ));
+            }
+        }
+        return Ok(aistudio_status_in_dir(
+            startup_dir,
+            work_dir,
+            aistudio_gateway_dir_env,
+        ));
+    }
+
+    let aistudio_dir = resolve_aistudio_dir(work_dir, aistudio_gateway_dir_env)
+        .filter(|dir| aistudio_has_launcher(dir))
+        .ok_or_else(|| {
+            "AI Studio 2048 directory or launcher script (magpie-aistudio-2048) not found"
+                .to_string()
+        })?;
+
+    std::fs::create_dir_all(startup_dir).map_err(|error| {
+        format!(
+            "Failed to create startup directory {}: {error}",
+            startup_dir.display()
+        )
+    })?;
+
+    let script = render_2048_vbs(&aistudio_dir);
+    std::fs::write(&target, script).map_err(|error| {
+        format!(
+            "Failed to write autostart script {}: {error}",
+            target.display()
+        )
+    })?;
+
+    Ok(aistudio_status_in_dir(
+        startup_dir,
+        work_dir,
+        aistudio_gateway_dir_env,
+    ))
+}
+
+pub fn aistudio_status() -> Result<AiStudioAutostartStatus, String> {
+    if !is_supported() {
+        return Ok(AiStudioAutostartStatus {
+            supported: false,
+            available: false,
+            enabled: false,
+            script_path: None,
+        });
+    }
+    let startup_dir = default_startup_dir()?;
+    let work_dir = std::env::current_dir()
+        .map_err(|error| format!("Failed to resolve current working directory: {error}"))?;
+    let aistudio_env = env_non_empty("AISTUDIO_GATEWAY_DIR");
+    Ok(aistudio_status_in_dir(
+        &startup_dir,
+        &work_dir,
+        aistudio_env.as_deref(),
+    ))
+}
+
+pub fn apply_aistudio(enabled: bool) -> Result<AiStudioAutostartStatus, String> {
+    if !is_supported() {
+        return Err("AI Studio 2048 autostart is only supported on Windows".to_string());
+    }
+    let startup_dir = default_startup_dir()?;
+    let work_dir = std::env::current_dir()
+        .map_err(|error| format!("Failed to resolve current working directory: {error}"))?;
+    let aistudio_env = env_non_empty("AISTUDIO_GATEWAY_DIR");
+    apply_aistudio_in_dir(enabled, &startup_dir, &work_dir, aistudio_env.as_deref())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -285,5 +452,44 @@ mod tests {
 
         // Disabling again when already absent must succeed (ignore NotFound).
         apply_in_dir(false, &startup_dir).unwrap();
+    }
+
+    #[test]
+    fn aistudio_autostart_is_isolated_from_main_autostart() {
+        let dir = tempfile::tempdir().unwrap();
+        let startup_dir = dir.path().join("startup");
+        let work_dir = dir.path().join("work");
+        let aistudio_dir = work_dir.join("magpie-aistudio-2048");
+        std::fs::create_dir_all(&aistudio_dir).unwrap();
+        std::fs::write(aistudio_dir.join("launch_2048_silent.vbs"), "' silent 2048").unwrap();
+
+        // Initial status: available=true, enabled=false
+        let st0 = aistudio_status_in_dir(&startup_dir, &work_dir, None);
+        assert!(st0.available);
+        assert!(!st0.enabled);
+
+        // Enable 2048 autostart
+        let st1 = apply_aistudio_in_dir(true, &startup_dir, &work_dir, None).unwrap();
+        assert!(st1.enabled);
+        let aistudio_vbs = std::fs::read_to_string(startup_dir.join(AISTUDIO_2048_SCRIPT)).unwrap();
+        assert!(aistudio_vbs.contains("launch_2048_silent.vbs"));
+        assert!(aistudio_vbs.contains("0, False"));
+        assert!(!startup_dir.join(GATEWAY_8046_SCRIPT).exists());
+
+        // Main 8046/8048 enable/disable must NOT touch AiStudio-2048-Autostart.vbs
+        apply_in_dir(true, &startup_dir).unwrap();
+        assert!(startup_dir.join(GATEWAY_8046_SCRIPT).exists());
+        assert!(startup_dir.join(AISTUDIO_2048_SCRIPT).exists());
+
+        apply_in_dir(false, &startup_dir).unwrap();
+        assert!(!startup_dir.join(GATEWAY_8046_SCRIPT).exists());
+        assert!(startup_dir.join(AISTUDIO_2048_SCRIPT).exists());
+
+        // Disable 2048 autostart removes only AiStudio-2048-Autostart.vbs
+        apply_in_dir(true, &startup_dir).unwrap();
+        let st2 = apply_aistudio_in_dir(false, &startup_dir, &work_dir, None).unwrap();
+        assert!(!st2.enabled);
+        assert!(!startup_dir.join(AISTUDIO_2048_SCRIPT).exists());
+        assert!(startup_dir.join(GATEWAY_8046_SCRIPT).exists());
     }
 }

@@ -30,7 +30,7 @@ HEALTHCHECK --interval=10s --timeout=3s --start-period=10s --retries=6 \
 ENTRYPOINT ["/app/gateway-sync"]
 
 FROM debian:bookworm-slim AS runtime
-LABEL org.opencontainers.image.version="0.15.0"
+LABEL org.opencontainers.image.version="0.15.1"
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl \
     && rm -rf /var/lib/apt/lists/* \

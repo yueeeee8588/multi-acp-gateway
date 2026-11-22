@@ -358,6 +358,19 @@ export const day = (date: Date) =>
 export const errorMessage = (error: unknown) =>
   error instanceof Error ? error.message : "操作失败，请重试";
 
+export type AiStudioAutostartStatus = {
+  supported: boolean;
+  available: boolean;
+  enabled: boolean;
+  script_path: string | null;
+};
+
+export const fetchAiStudioAutostart = () =>
+  api<AiStudioAutostartStatus>("/aistudio/autostart");
+
+export const setAiStudioAutostart = (enabled: boolean) =>
+  api<AiStudioAutostartStatus>("/aistudio/autostart", "POST", { enabled });
+
 export async function copy(value: string) {
   try {
     await navigator.clipboard.writeText(value);

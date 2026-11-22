@@ -214,6 +214,10 @@ pub fn app(state: Shared) -> Router {
         )
         .route("/api/providers/{id}/groups", get(provider_keys::groups))
         .route("/api/settings", get(api::settings).put(api::save_settings))
+        .route(
+            "/api/aistudio/autostart",
+            get(api::aistudio_autostart).post(api::set_aistudio_autostart),
+        )
         .route("/api/prompt-rules", get(api::prompt_rules).put(api::save_prompt_rules))
         .route("/api/settings/turnstile-test", post(api::test_turnstile))
         .route("/api/password", post(api::password))

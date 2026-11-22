@@ -1183,6 +1183,32 @@ pub async fn save_settings(
         !secret_key.is_empty(),
     )))
 }
+
+#[derive(Deserialize)]
+pub struct AiStudioAutostartInput {
+    pub enabled: bool,
+}
+
+pub async fn aistudio_autostart(State(s): State<Shared>, h: HeaderMap) -> ApiResult<Value> {
+    auth(&s, &h)?;
+    let status = crate::autostart::aistudio_status()
+        .map_err(|error| ApiError(StatusCode::INTERNAL_SERVER_ERROR, error))?;
+    Ok(Json(json!(status)))
+}
+
+pub async fn set_aistudio_autostart(
+    State(s): State<Shared>,
+    h: HeaderMap,
+    Json(input): Json<AiStudioAutostartInput>,
+) -> ApiResult<Value> {
+    auth(&s, &h)?;
+    if !crate::autostart::is_supported() {
+        return Err(bad("AI Studio 2048 autostart is only supported on Windows"));
+    }
+    let status = crate::autostart::apply_aistudio(input.enabled)
+        .map_err(|error| ApiError(StatusCode::INTERNAL_SERVER_ERROR, error))?;
+    Ok(Json(json!(status)))
+}
 #[derive(Deserialize)]
 pub struct PasswordInput {
     current_password: String,

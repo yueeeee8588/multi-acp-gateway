@@ -1,6 +1,12 @@
 import { useCallback, useEffect, useState } from "react";
 import type { FormEvent } from "react";
-import { LogOut, Play, RefreshCw, Square } from "lucide-react";
+import { LogOut, Play, Power, RefreshCw, Square } from "lucide-react";
+import {
+  errorMessage,
+  fetchAiStudioAutostart,
+  setAiStudioAutostart,
+} from "../api";
+import type { AiStudioAutostartStatus } from "../api";
 import { Badge, Button, ErrorBox, Field } from "../components";
 import type { Notice } from "../components";
 import { useMinSpin } from "../useMinSpin";
@@ -34,6 +40,10 @@ export function AiStudioConsolePage({
   const [tab, setTab] = useState<AiStudioTab>("accounts");
   const [manualRefreshing, setManualRefreshing] = useState(false);
   const [controlBusy, setControlBusy] = useState(false);
+  const [autostartStatus, setAutostartStatus] =
+    useState<AiStudioAutostartStatus | null>(null);
+  const [autostartLoading, setAutostartLoading] = useState(true);
+  const [autostartBusy, setAutostartBusy] = useState(false);
   const [username, setUsername] = useState("magpie");
   const [password, setPassword] = useState("");
   const [loginBusy, setLoginBusy] = useState(false);
@@ -54,6 +64,24 @@ export function AiStudioConsolePage({
     aistudio.error,
     onLoadingChange,
   ]);
+
+  useEffect(() => {
+    let cancelled = false;
+    setAutostartLoading(true);
+    void fetchAiStudioAutostart()
+      .then((res) => {
+        if (!cancelled) setAutostartStatus(res);
+      })
+      .catch(() => {
+        if (!cancelled) setAutostartStatus(null);
+      })
+      .finally(() => {
+        if (!cancelled) setAutostartLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const handleRefresh = useCallback(() => {
     setManualRefreshing(true);
@@ -78,6 +106,33 @@ export function AiStudioConsolePage({
       notify(err instanceof Error ? err.message : String(err), true);
     } finally {
       setControlBusy(false);
+    }
+  }
+
+  async function handleToggleAutostart() {
+    if (autostartBusy || !autostartStatus) return;
+    if (!autostartStatus.supported) {
+      notify("仅 Windows 环境支持 2048 开机自启", true);
+      return;
+    }
+    const nextEnabled = !autostartStatus.enabled;
+    if (nextEnabled && !autostartStatus.available) {
+      notify("未检测到 magpie-aistudio-2048 启动脚本，无法开启开机自启", true);
+      return;
+    }
+    setAutostartBusy(true);
+    try {
+      const updated = await setAiStudioAutostart(nextEnabled);
+      setAutostartStatus(updated);
+      notify(
+        updated.enabled
+          ? "已开启 AI Studio 2048 开机自启"
+          : "已关闭 AI Studio 2048 开机自启",
+      );
+    } catch (err) {
+      notify(errorMessage(err), true);
+    } finally {
+      setAutostartBusy(false);
     }
   }
 
@@ -164,6 +219,36 @@ export function AiStudioConsolePage({
                 {st.running ? "停止服务" : "启动服务"}
               </Button>
             )}
+            <Button
+              type="button"
+              className={autostartStatus?.enabled ? "primary" : ""}
+              busy={autostartBusy}
+              disabled={
+                autostartLoading ||
+                !autostartStatus ||
+                !autostartStatus.supported ||
+                (!autostartStatus.enabled && !autostartStatus.available)
+              }
+              title={
+                !autostartStatus
+                  ? "正在加载开机自启状态"
+                  : !autostartStatus.supported
+                    ? "仅 Windows 环境支持开机自启"
+                    : !autostartStatus.available && !autostartStatus.enabled
+                      ? "未检测到 magpie-aistudio-2048 启动脚本"
+                      : autostartStatus.enabled
+                        ? "点击关闭 AI Studio 2048 开机自启"
+                        : "点击开启 AI Studio 2048 开机自启"
+              }
+              onClick={() => void handleToggleAutostart()}
+            >
+              {!autostartBusy && <Power size={14} />}
+              {autostartLoading
+                ? "开机自启..."
+                : autostartStatus?.enabled
+                  ? "开机自启：已开启"
+                  : "开机自启：已关闭"}
+            </Button>
             <Button
               type="button"
               onClick={handleRefresh}
