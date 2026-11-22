@@ -1,0 +1,1491 @@
+import http from "node:http";
+import fs from "node:fs";
+import crypto from "node:crypto";
+import net from "node:net";
+import { TextDecoder } from "node:util";
+import * as protocol from "../native-provider.mjs";
+import { Security } from "./security.mjs";
+import { openDirectTurn } from "./native-transport.mjs";
+import { Accounts } from "./accounts.mjs";
+import { scanChromeProfiles, runChromeOAuthBatch } from "./chrome-oauth.mjs";
+import { AccountPool } from "./pool.mjs";
+import { QUOTA_DOWNGRADE_REASONS, quotaDowngradeCode, isExplicitQuotaFailure } from "./quota-failover.mjs";
+import { fault } from "./state.mjs";
+import { resolveSessionIdentity, describeRequest } from "./request-identity.mjs";
+import { safeNativeEvidence, isClientAbortError } from "./native-evidence.mjs";
+import { RequestResumption } from './request-resumption.mjs';
+import { QuotaRefreshJobs } from './quota-refresh-jobs.mjs';
+import { NativeDiagnostic, observeNative } from './native-diagnostic.mjs';
+import { createResponseDelivery } from './response-delivery.mjs';
+import { measurePromptImagePayload } from '../openai-usage.mjs';
+import { normalizeGoogleRequest, countGoogleTokens } from '../Google-contract.mjs';
+import { listGeminiModels, describeGeminiModel, normalizeGeminiRequest, countGeminiTokens } from '../gemini-contract.mjs';
+import { RequestLogHub } from './request-log-hub.mjs';
+
+function extractUsage(usage) {
+  if (!usage || typeof usage !== "object") {
+    return { inputTokens: null, outputTokens: null, cachedTokens: null, cacheHit: false };
+  }
+  const num = (v) => (typeof v === "number" && Number.isFinite(v) && v >= 0 ? v : null);
+  const inputTokens = num(
+    usage.input_tokens ?? usage.prompt_tokens ?? usage.promptTokenCount ?? usage.inputTokens,
+  );
+  const outputTokens = num(
+    usage.output_tokens ?? usage.completion_tokens ?? usage.candidatesTokenCount ?? usage.outputTokens,
+  );
+  const cachedTokens = num(
+    usage.cached_tokens ??
+      usage.cache_read_input_tokens ??
+      usage.cachedContentTokenCount ??
+      usage.prompt_tokens_details?.cached_tokens ??
+      usage.input_tokens_details?.cached_tokens ??
+      usage.cachedTokens,
+  );
+  return {
+    inputTokens,
+    outputTokens,
+    cachedTokens,
+    cacheHit: Boolean(cachedTokens && cachedTokens > 0),
+  };
+}
+const uiRoot = new URL("../admin-v2/", import.meta.url);
+const assets = new Map([
+  ["/admin", "index.html"],
+  ["/admin/", "index.html"],
+  ["/admin/index.html", "index.html"],
+  ["/admin/app.js", "app.js"],
+  ["/admin/styles.css", "styles.css"],
+]);
+const sensitiveMethods = new Set(["POST", "PATCH", "DELETE", "PUT"]);
+function hasDuplicateHostHeader(rawHeaders) {
+  if (!Array.isArray(rawHeaders)) return false;
+  let count = 0;
+  for (let i = 0; i < rawHeaders.length; i += 2) {
+    if (typeof rawHeaders[i] === "string" && rawHeaders[i].toLowerCase() === "host") {
+      count++;
+      if (count > 1) return true;
+    }
+  }
+  return false;
+}
+/** Parse and canonicalize an HTTP Host header while keeping explicit default ports intact. */
+function parseHostHeader(raw) {
+  if (typeof raw !== "string" || raw.length === 0 || raw.length > 255)
+    return null;
+  if (raw.startsWith("[")) {
+    const match = raw.match(/^\[([0-9a-fA-F:.]+)\](?::([1-9][0-9]{0,4}))?$/);
+    if (!match || net.isIP(match[1]) !== 6) return null;
+    const port = match[2] ?? "";
+    if (port && (Number(port) < 1 || Number(port) > 65535)) return null;
+    let parsed;
+    try {
+      parsed = new URL(`http://[${match[1]}]`);
+    } catch {
+      return null;
+    }
+    const hostname = parsed.hostname.toLowerCase();
+    return { hostname, bareHost: hostname.slice(1, -1), port, family: 6 };
+  }
+  const match = raw.match(/^([A-Za-z0-9._-]+)(?::([1-9][0-9]{0,4}))?$/);
+  if (!match) return null;
+  const hostPart = match[1];
+  const port = match[2] ?? "";
+  if (port && (Number(port) < 1 || Number(port) > 65535)) return null;
+  let parsed;
+  try {
+    parsed = new URL(`http://${hostPart}`);
+  } catch {
+    return null;
+  }
+  if (
+    parsed.username ||
+    parsed.password ||
+    parsed.pathname !== "/" ||
+    parsed.search ||
+    parsed.hash ||
+    parsed.port
+  )
+    return null;
+  const hostname = parsed.hostname.toLowerCase();
+  // Reject non-canonical IPv4 shorthand forms such as 127.1 or 2130706433.
+  if (hostPart.toLowerCase() !== hostname) return null;
+  return { hostname, bareHost: hostname, port, family: net.isIP(hostname) };
+}
+function isPrivateIPv4Bytes(a, b) {
+  return (
+    a === 127 ||
+    a === 10 ||
+    (a === 172 && b >= 16 && b <= 31) ||
+    (a === 192 && b === 168) ||
+    (a === 169 && b === 254) ||
+    (a === 100 && b >= 64 && b <= 127)
+  );
+}
+function parseIPv6Words(bareHost) {
+  const halves = bareHost.split("::");
+  if (halves.length > 2) return null;
+  const left = halves[0] ? halves[0].split(":") : [];
+  const right = halves[1] ? halves[1].split(":") : [];
+  const missing = halves.length === 2 ? 8 - left.length - right.length : 0;
+  if (missing < 0 || (halves.length === 1 && left.length !== 8)) return null;
+  const groups = [
+    ...left,
+    ...Array.from({ length: missing }, () => "0"),
+    ...right,
+  ];
+  return groups.length === 8 ? groups.map((g) => parseInt(g, 16)) : null;
+}
+/** Parse optional GATEWAY_ALLOWED_PROBE_HOSTS (comma-separated string or array of host[:port]). */
+export function parseProbeHosts(value) {
+  if (value === undefined || value === null || value === "")
+    return Object.freeze([]);
+  let items;
+  if (Array.isArray(value)) {
+    if (value.length === 0) return Object.freeze([]);
+    items = value;
+  } else if (typeof value === "string") {
+    if (Buffer.byteLength(value) > 8192) throw fault("INVALID_PROBE_HOSTS", 400);
+    items = value.split(",").map((s) => s.trim());
+  } else {
+    throw fault("INVALID_PROBE_HOSTS", 400);
+  }
+  if (items.length > 64) throw fault("INVALID_PROBE_HOSTS", 400);
+  const rules = [];
+  for (const entry of items) {
+    let raw;
+    if (typeof entry === "string") {
+      raw = entry.trim();
+    } else if (
+      entry &&
+      typeof entry === "object" &&
+      !Array.isArray(entry) &&
+      typeof entry.hostname === "string" &&
+      typeof entry.port === "string"
+    ) {
+      raw = entry.port ? `${entry.hostname}:${entry.port}` : entry.hostname;
+    } else {
+      throw fault("INVALID_PROBE_HOSTS", 400);
+    }
+    const parsed = parseHostHeader(raw);
+    if (!parsed) throw fault("INVALID_PROBE_HOSTS", 400);
+    rules.push(Object.freeze({ hostname: parsed.hostname, port: parsed.port }));
+  }
+  return Object.freeze(rules);
+}
+/** Return true for built-in container/internal probe hosts or explicitly configured probe hosts. */
+function isInternalProbeHost(parsedHost, customProbeHosts = []) {
+  if (
+    customProbeHosts.some(
+      (rule) =>
+        rule.hostname === parsedHost.hostname &&
+        (rule.port === "" || (parsedHost.port || "80") === rule.port),
+    )
+  )
+    return true;
+  if (parsedHost.family === 4) {
+    const [a, b] = parsedHost.bareHost.split(".").map(Number);
+    return isPrivateIPv4Bytes(a, b);
+  }
+  if (parsedHost.family === 6) {
+    const words = parseIPv6Words(parsedHost.bareHost);
+    if (!words) return false;
+    if (words.slice(0, 7).every((w) => w === 0) && words[7] === 1) return true;
+    if (words.slice(0, 5).every((w) => w === 0) && words[5] === 0xffff)
+      return isPrivateIPv4Bytes(words[6] >> 8, words[6] & 0xff);
+    return (words[0] & 0xfe00) === 0xfc00 || (words[0] & 0xffc0) === 0xfe80;
+  }
+  return (
+    parsedHost.hostname === "localhost" ||
+    /^[a-z0-9](?:[a-z0-9_-]{0,61}[a-z0-9])?$/.test(parsedHost.hostname) ||
+    /\.(?:internal|local|localhost|home\.arpa|svc|svc\.cluster\.local)$/.test(
+      parsedHost.hostname,
+    )
+  );
+}
+// Terminal operation failure after bounded provider recovery, never an input limit.
+const NO_OUTPUT_FAILURES = new Set(['NATIVE_STREAM_CLOSED_EARLY', 'NATIVE_TURN_TIMEOUT',
+  'NATIVE_STREAM_RESET', 'NATIVE_CONNECTION_FAILED', 'NATIVE_STREAM_FAILED',
+  'INCOMPLETE_NATIVE_RESPONSE', 'EMPTY_NATIVE_RESPONSE']);
+export function errorPayload(error) {
+  const code =
+    typeof error?.code === "string" && /^[A-Z0-9_]{1,80}$/.test(error.code)
+      ? error.code
+      : "INTERNAL_ERROR";
+  const reason = error?.nativeEvidence?.downgradeReason;
+  const quotaReason = isExplicitQuotaFailure(error) && quotaDowngradeCode(reason) === code
+    ? QUOTA_DOWNGRADE_REASONS[reason] : null;
+  const previousCode = typeof error?.previousErrorCode === "string" && /^[A-Z0-9_]{1,80}$/.test(error.previousErrorCode) ? error.previousErrorCode : null;
+  const previousRequestId = typeof error?.previousRequestId === "string" && /^req_[A-Za-z0-9_-]{1,80}$/.test(error.previousRequestId) ? error.previousRequestId : null;
+  const toolReason = error?.nativeEvidence?.toolProtocolReason ?? error?.toolProtocolReason;
+  const toolProtocolReason = (code === 'MALFORMED_TOOL_CALL' || previousCode === 'MALFORMED_TOOL_CALL') &&
+    ['opening_fence', 'closing_fence'].includes(toolReason) ? toolReason : null;
+  const terminal = code === 'GENERATION_FAILED' && error?.terminalNoOutput === true;
+  const param =
+    typeof error?.param === "string" &&
+    /^[A-Za-z0-9_.\[\]-]{1,160}$/.test(error.param)
+      ? error.param
+      : null;
+  return {
+    error: {
+      message: terminal ? 'Generation ended without output. Gateway recovery is exhausted; this turn has failed.'
+        : code === 'MALFORMED_TOOL_CALL' && toolProtocolReason ? `${code}: invalid ${toolProtocolReason} layout. No tool call was released.`
+        : code === 'UNSUPPORTED_PARAMETER' && param ? `UNSUPPORTED_PARAMETER: ${param}`
+        : code === 'UNSUPPORTED_MODEL' ? 'UNSUPPORTED_MODEL: supported models are gemini-neon, gemini-hydrogen, gemini-flash-lite (alias: gemini-argon -> gemini-neon)'
+        : code === 'NATIVE_UPSTREAM_UNAVAILABLE' ? 'NATIVE_UPSTREAM_UNAVAILABLE: upstream Google service temporarily unavailable (HTTP 503 / gRPC UNAVAILABLE)'
+        : code === 'SERVER_SHUTDOWN' ? 'SERVER_SHUTDOWN: gateway is restarting; retry the request'
+        : code,
+      type:
+        terminal ? "server_error" : error?.status === 401
+          ? "authentication_error"
+          : error?.status === 429 ? "rate_limit_error"
+          : error?.status < 500
+            ? "invalid_request_error"
+            : "server_error",
+      param,
+      code,
+      ...(terminal ? { terminal: true, retryable: false, client_action: 'stop_turn',
+        upstream_code: error.upstreamCode, upstream_status: error.upstreamStatus } : {}),
+      ...(previousCode ? { previous_code: previousCode } : {}),
+      ...(previousRequestId ? { previous_request_id: previousRequestId } : {}),
+      ...(quotaReason ? { quota_fallback: true, quota_reason: quotaReason } : {}),
+      ...(toolProtocolReason ? { tool_protocol_reason: toolProtocolReason } : {}),
+    },
+  };
+}
+function json(res, value, status = 200) {
+  res.writeHead(status, { "Content-Type": "application/json; charset=utf-8" });
+  res.end(JSON.stringify(value));
+}
+async function readJson(req, limit) {
+  if (!/^application\/json(?:;|$)/i.test(req.headers["content-type"] ?? ""))
+    throw fault("JSON_CONTENT_TYPE_REQUIRED", 415);
+  const chunks = [];
+  let length = 0;
+  for await (const chunk of req) {
+    length += chunk.length;
+    if (length > limit) {
+      req.resume();
+      throw fault("REQUEST_TOO_LARGE", 413);
+    }
+    chunks.push(chunk);
+  }
+  try {
+    const text = new TextDecoder("utf-8", { fatal: true }).decode(
+        Buffer.concat(chunks),
+      ),
+      value = JSON.parse(text);
+    if (!value || typeof value !== "object" || Array.isArray(value))
+      throw Error();
+    // Two different measurements. The usage estimator works in characters; an
+    // operator-facing byte limit must compare UTF-8 bytes, otherwise non-ASCII input
+    // is undercounted by up to 3x. `length` is the raw received body byte count.
+    Object.defineProperty(value, "__promptChars", { value: text.length, enumerable: false });
+    Object.defineProperty(value, "__promptBytes", { value: length, enumerable: false });
+    return value;
+  } catch {
+    throw fault("INVALID_JSON");
+  }
+}
+async function readJsonAny(req, limit) {
+  if (!/^application\/json(?:;|$)/i.test(req.headers["content-type"] ?? ""))
+    throw fault("JSON_CONTENT_TYPE_REQUIRED", 415);
+  const chunks = [];
+  let length = 0;
+  for await (const chunk of req) {
+    length += chunk.length;
+    if (length > limit) {
+      req.resume();
+      throw fault("REQUEST_TOO_LARGE", 413);
+    }
+    chunks.push(chunk);
+  }
+  try {
+    const text = new TextDecoder("utf-8", { fatal: true }).decode(
+        Buffer.concat(chunks),
+      ),
+      value = JSON.parse(text);
+    if (!value || typeof value !== "object") throw Error();
+    return value;
+  } catch {
+    throw fault("INVALID_JSON");
+  }
+}
+function only(obj, keys) {
+  const unexpected = Object.keys(obj).find((k) => !keys.includes(k));
+  if (unexpected !== undefined) {
+    const error = fault("UNSUPPORTED_PARAMETER");
+    if (/^[A-Za-z0-9_.-]{1,64}$/.test(unexpected)) error.param = unexpected;
+    throw error;
+  }
+}
+export function createGateway({
+  store,
+  accounts,
+  provider,
+  openTurn = openDirectTurn,
+  uploadImages,
+  downloadImages,
+  allowFailover = true,
+  allowQuotaFailover = false,
+  allowEmptyResponseFailover = false,
+  allowAutomaticRecovery = false,
+  routingAccountIds = null,
+  probeHosts = null,
+  secureCookies = false,
+  publicOrigin = null,
+  callbackPort = 18765,
+  callbackHost = "127.0.0.1",
+  chromeOAuthOpts = {},
+} = {}) {
+  if (!store) throw new TypeError("store required");
+  const normalizedProbeHosts = parseProbeHosts(probeHosts);
+  const startedAt = Date.now(),
+    requestHub = new RequestLogHub({ maxCompleted: 200, pingIntervalMs: 20000 }),
+    audit = [];
+  let active = 0,
+    totalRequests = 0,
+    totalErrors = 0,
+    closing = false,
+    draining = false,
+    // A settings write during in-flight work defers cache invalidation to the
+    // first idle moment instead of disturbing accepted requests.
+    settingsInvalidationPending = false,
+    origin = publicOrigin;
+  const controllers = new Set(),
+    inFlightTasks = new Set();
+  const auditEvent = (action, target = null) => {
+    audit.unshift({ id: crypto.randomUUID(), at: Date.now(), action, target });
+    audit.length = Math.min(audit.length, 200);
+  };
+  accounts ??= new Accounts(store, {
+    callbackPort,
+    callbackHost,
+    onChange: auditEvent,
+  });
+  provider ??= new protocol.NativeDirectProvider(accounts, {
+    openTurn,
+    uploadImages,
+    downloadImages,
+    timeoutMs: store.settings().timeoutMs,
+    continuation: store.settings().continuation,
+    maxSessions: store.settings().maxSessions,
+    sessionTtlMs: store.settings().sessionTtlMs,
+  });
+  const pool = new AccountPool(accounts, {
+    settings: () => store.settings(),
+    allowFailover,
+    allowQuotaFailover,
+    allowEmptyResponseFailover,
+    allowAutomaticRecovery,
+    routingAccountIds,
+    onFailover: () => auditEvent("request.failover"),
+  });
+  const quotaRefreshJobs = new QuotaRefreshJobs(accounts, {
+    onComplete: job => auditEvent('quota.batch.' + job.status, job.id),
+  });
+  const security = new Security(store, { secureCookies });
+  const resumption = new RequestResumption({ maxEntries: Math.min(64, store.settings().maxSessions) });
+  const nativeDiagnostic = new NativeDiagnostic(store.directory);
+  const effectiveSettings = () => ({
+    ...store.settings(),
+    ...(server.listening
+      ? { port: server.address().port, host: server.address().address }
+      : {}),
+  });
+  const ready = () =>
+    !closing && !draining && !!store.data.profile && pool.available().length > 0;
+  const availability = () => {
+    const eligible = pool.available("gemini-neon");
+    const verified = eligible.filter(
+      (a) => a.modelStates?.["gemini-neon"]?.state === "verified",
+    ).length;
+    return {
+      defaultModel: "gemini-neon",
+      eligibleAccounts: eligible.length,
+      verifiedAccounts: verified,
+      upstreamVerified: verified > 0,
+      automaticModelProbes: false,
+      routingPolicy: pool.routingPolicy(),
+    };
+  };
+  const resolveAccountLabel = (accId) => {
+    if (!accId) return null;
+    const raw =
+      store.data.accounts?.find((a) => a.id === accId) ??
+      accounts.list?.()?.find((a) => a.id === accId);
+    if (!raw) return null;
+    return raw.email || raw.label || raw.displayName || raw.name || null;
+  };
+  const overview = () => {
+    const completedRequests = requestHub.listCompleted();
+    const times = completedRequests.map((r) => r.durationMs).sort((a, b) => a - b),
+      quantile = (p) =>
+        times.length
+          ? times[Math.min(times.length - 1, Math.floor(times.length * p))]
+          : 0;
+    return {
+      version: "1.5.3",
+      uptimeSeconds: Math.floor((Date.now() - startedAt) / 1000),
+      mode: "native-direct",
+      toolProtocol: "prompt",
+      generalFailoverDisabled: !allowFailover,
+      quotaFailoverEnabled: pool.allowQuotaFailover,
+      emptyResponseFailoverEnabled: pool.allowEmptyResponseFailover,
+      automaticRecoveryEnabled: pool.allowAutomaticRecovery,
+      requestResumption: { enabled: allowAutomaticRecovery, ...resumption.snapshot() },
+      quotaRefresh: quotaRefreshJobs.summary(),
+      ready: ready(),
+      availability: availability(),
+      metrics: {
+        requests: totalRequests,
+        errors: totalErrors,
+        active,
+        successRate: totalRequests
+          ? Math.round((100 * (totalRequests - totalErrors)) / totalRequests)
+          : 100,
+        p50Ms: quantile(0.5),
+        p95Ms: quantile(0.95),
+      },
+      accounts: pool.snapshotAccounts(),
+      sessions: pool.listSessions(),
+      failovers: [...pool.failovers],
+      requests: completedRequests,
+      audit: [...audit],
+      models: protocol.NATIVE_MODELS,
+      modelTelemetry: pool.modelTelemetry(),
+      settings: effectiveSettings(),
+      keyCount: store.listKeys().filter((k) => !k.revokedAt).length,
+    };
+  };
+  async function execute(
+    req,
+    res,
+    body,
+    { owner, route, playground = false, accountTestId = null, geminiModel = null, geminiStream = false, geminiSse = true } = {},
+  ) {
+    if (req.aborted || res.destroyed) return;
+    const outputStreaming = !playground && (route === "gemini" ? geminiStream : body.stream === true);
+    const canonical =
+      route === "responses"
+        ? protocol.normalizeResponsesRequest(body).body
+        : route === "google"
+          ? normalizeGoogleRequest(body)
+          : route === "gemini"
+            ? normalizeGeminiRequest(geminiModel, body, { stream: outputStreaming })
+            : protocol.normalizeChatRequest(body);
+    const settings = store.settings();
+    if (settings.allowRemoteImages !== true && canonical.messages.some(message =>
+      Array.isArray(message.content) && message.content.some(part =>
+        part.type === "image_url" && /^https?:/i.test(part.image_url.url))))
+      throw fault("REMOTE_IMAGES_DISABLED", 403);
+    // A conversation can grow past the point where the upstream finishes the turn at all.
+    // Rejecting it up front turns a 70-200 s dead wait into an immediate, explicit answer.
+    // Disabled by default (0).
+    const promptLimit = settings.maxPromptBytes;
+    if (Number.isSafeInteger(promptLimit) && promptLimit > 0 &&
+      Number.isInteger(body.__promptBytes) && body.__promptBytes > promptLimit)
+      throw fault("PROMPT_SIZE_LIMIT", 413);
+    if (active >= settings.maxConcurrent) throw fault("GATEWAY_BUSY", 429);
+    let hardDestroyTimer = null;
+    const controller = new AbortController(),
+      timer = setTimeout(() => {
+        controller.abort(fault('REQUEST_DEADLINE', 504));
+        if (res.headersSent && !res.destroyed && !res.writableEnded) {
+          // Give delivery.interrupt() a short window to flush a clean SSE termination
+          // frame (e.g. finish_reason: "tool_calls" + [DONE]); destroy immediately only
+          // if the client socket is already backpressured, or after a 2s fallback.
+          if (res.writableNeedDrain) {
+            res.destroy?.();
+          } else {
+            hardDestroyTimer = setTimeout(() => {
+              if (!res.destroyed && !res.writableEnded) res.destroy?.();
+            }, 2000);
+            hardDestroyTimer.unref?.();
+          }
+        }
+      }, settings.timeoutMs + 1000);
+    timer.unref();
+    controllers.add(controller);
+    const { imageCount, imageUrlChars } = measurePromptImagePayload(body);
+    const delivery = createResponseDelivery(res, { route, stream: outputStreaming, geminiSse, model: canonical.model,
+      thinkingLevel: canonical.thinking_level, reasoningEffort: canonical.reasoning_effort ?? canonical.reasoning?.effort,
+      includeUsage: body.stream_options?.include_usage === true, parallelToolCalls: canonical.parallel_tool_calls ?? true,
+      promptChars: Math.max(0, (body.__promptChars ?? 0) - imageUrlChars), imageCount,
+      deferEmptyStart: !playground && !accountTestId && !canonical.native_search,
+      signal: controller.signal, writeTimeoutMs: Math.min(settings.timeoutMs, 30000) });
+    let resolveInFlight;
+    const inFlightPromise = new Promise((r) => { resolveInFlight = r; });
+    inFlightTasks.add(inFlightPromise);
+    active++;
+    totalRequests++;
+    const id = "req_" + crypto.randomUUID(),
+      at = Date.now(),
+      reqPath = accountTestId ? "/admin/api/accounts/test" : playground
+        ? "/admin/api/playground"
+        : route === "responses"
+          ? "/v1/responses"
+          : route === "google"
+            ? "/v1/messages"
+            : route === "gemini"
+              ? "/v1beta/models"
+              : "/v1/chat/completions",
+      protocolName = accountTestId || playground ? "admin" : route;
+    let accountId = null,
+      accountLabel = null,
+      status = 200,
+      errorCode = null,
+      errorMessage = null,
+      toolCalls = 0,
+      continued = false,
+      nativeEvidence = null,
+      nativeResponseRevisions = null,
+      previousRequestId = null,
+      identity = { sessionId: undefined, source: "generated" },
+      description = null,
+      providerAttempts = 0,
+      firstEventMs = null,
+      usage = { inputTokens: null, outputTokens: null, cachedTokens: null, cacheHit: false };
+    let outputIncomplete = false;
+    const providerFailures = [];
+    const attempts = [];
+    let diagnostic = null;
+    const inFlightRecord = {
+      id,
+      at,
+      timestamp: at,
+      startedAt: at,
+      path: reqPath,
+      model: canonical.model ?? "gemini-neon",
+      accountId: null,
+      accountLabel: null,
+      status: 200,
+      state: "running",
+      stream: Boolean(outputStreaming),
+      protocol: protocolName,
+      durationMs: 0,
+      errorCode: null,
+      error: null,
+      switchCount: 0,
+      firstEventMs: null,
+      inputTokens: null,
+      outputTokens: null,
+      cachedTokens: null,
+      cacheHit: false,
+      toolCalls: 0,
+      continued: false,
+      sessionSource: identity.source,
+      providerAttempts: 0,
+      providerFailures,
+      attempts,
+    };
+    requestHub.start(id, inFlightRecord, controller);
+    res.setHeader("X-Request-ID", id);
+    res.setHeader("X-Gemini-Provider-Attempts", "0");
+    res.setHeader("X-Gemini-Failover-Count", "0");
+    const disconnect = () => {
+      if (!res.writableEnded) controller.abort(fault('CLIENT_DISCONNECTED', 499));
+    };
+    req.once("aborted", disconnect);
+    res.once("close", disconnect);
+    if (req.aborted || res.destroyed) disconnect();
+    try {
+      const publicRequest = !accountTestId && !playground;
+      identity = publicRequest ? resolveSessionIdentity(req.headers, canonical) : { sessionId: undefined, source: "admin" };
+      inFlightRecord.sessionSource = identity.source;
+      const sid = identity.sessionId;
+      description = describeRequest(canonical);
+      if (description) {
+        inFlightRecord.promptBytes = description.promptBytes;
+        inFlightRecord.inputMessages = description.messageCount;
+        inFlightRecord.declaredTools = description.toolCount;
+      }
+      if (publicRequest && canonical.model === 'gemini-neon' && !canonical.native_search)
+        diagnostic = nativeDiagnostic.claim(id);
+      const turn = async (acc, context) => {
+        // A fresh attempt inherits nothing from a discarded short fragment.
+        if (providerAttempts > 0) delivery.discard();
+        accountId = acc;
+        accountLabel = resolveAccountLabel(acc);
+        providerAttempts++;
+        const attemptStartedAt = Date.now();
+        const attempt = {
+          index: attempts.length,
+          accountId: acc,
+          accountLabel,
+          startedAt: attemptStartedAt,
+          durationMs: null,
+          firstEventMs: null,
+          status: "running",
+          httpStatus: null,
+          reasonCode: null,
+          reasonText: null,
+          rawError: null,
+          requestedModel: canonical.model ?? "gemini-neon",
+          actualModel: null,
+          failoverReason: context?.failoverReason ?? null,
+        };
+        attempts.push(attempt);
+        inFlightRecord.accountId = accountId;
+        inFlightRecord.accountLabel = accountLabel;
+        inFlightRecord.providerAttempts = providerAttempts;
+        inFlightRecord.switchCount = Math.max(0, providerAttempts - 1);
+        requestHub.updateAttempt(id, {
+          attempt: { ...attempt },
+          switchCount: inFlightRecord.switchCount,
+          accountId: acc,
+          accountLabel,
+        });
+        let attemptDiagnostic = null;
+        try { attemptDiagnostic = diagnostic?.attempt(); } catch {}
+        if (!res.headersSent) {
+          res.setHeader("X-Gemini-Provider-Attempts", String(providerAttempts));
+          res.setHeader("X-Gemini-Failover-Count", String(providerAttempts - 1));
+          if (context.responseSessionId) res.setHeader('X-Session-ID', context.responseSessionId);
+          if (context.failoverReason) res.setHeader("X-Gemini-Failover-Reason", context.failoverReason);
+        }
+        const wrappedAccept = (event) => {
+          if (
+            event &&
+            !event.start &&
+            !event.reset &&
+            (
+              (typeof event.content === "string" && event.content.length > 0) ||
+              Boolean(event.call) ||
+              (typeof event.thinking === "string" && event.thinking.length > 0) ||
+              Boolean(event.reasoning)
+            )
+          ) {
+            const now = Date.now();
+            if (firstEventMs === null) {
+              firstEventMs = now - at;
+              inFlightRecord.firstEventMs = firstEventMs;
+            }
+            if (attempt.firstEventMs === null) {
+              attempt.firstEventMs = now - attemptStartedAt;
+            }
+          }
+          return delivery.accept(event);
+        };
+        try {
+          const turnResult = await provider.runTurn(acc, canonical, wrappedAccept, { ...context, timeoutMs: settings.timeoutMs,
+            incrementalOutput: true, outputMode: outputStreaming ? 'stream' : 'buffered',
+            getOutputCommitState: delivery.outputCommitState,
+            ...(attemptDiagnostic ? { nativeDiagnostic: attemptDiagnostic } : {}) });
+          attempt.durationMs = Date.now() - attemptStartedAt;
+          attempt.status = "success";
+          attempt.httpStatus = 200;
+          attempt.actualModel = typeof turnResult?.model === "string" && turnResult.model ? turnResult.model : null;
+          requestHub.updateAttempt(id, {
+            attempt: { ...attempt },
+            switchCount: Math.max(0, providerAttempts - 1),
+            accountId: acc,
+            accountLabel,
+          });
+          return turnResult;
+        }
+        catch (error) {
+          attempt.durationMs = Date.now() - attemptStartedAt;
+          const isCancelled = controller.signal.aborted && (
+            error?.code === "REQUEST_CANCELLED" ||
+            error?.code === "CLIENT_DISCONNECTED" ||
+            error?.name === "AbortError" ||
+            controller.signal.reason?.code === "REQUEST_CANCELLED" ||
+            controller.signal.reason?.code === "CLIENT_DISCONNECTED"
+          );
+          const errCode = errorPayload(error).error.code;
+          attempt.status = isCancelled ? "cancelled" : "failed";
+          attempt.httpStatus = Number.isInteger(error?.status) && error.status >= 400 && error.status <= 599
+            ? error.status
+            : (isCancelled ? 499 : 502);
+          attempt.reasonCode = errCode ?? error?.code ?? null;
+          attempt.reasonText = typeof error?.message === "string" && error.message
+            ? error.message.slice(0, 500)
+            : (attempt.reasonCode ?? null);
+          attempt.rawError = typeof error?.stack === "string"
+            ? error.stack.slice(0, 4000)
+            : (typeof error?.message === "string" ? error.message.slice(0, 4000) : null);
+          requestHub.updateAttempt(id, {
+            attempt: { ...attempt },
+            switchCount: Math.max(0, providerAttempts - 1),
+            accountId: acc,
+            accountLabel,
+          });
+          // Only content the caller actually received commits this turn. A held
+          // tiny prefix is still replaceable by one retry.
+          error.responseStarted = res.headersSent === true || delivery.publishedBytes > 0 || delivery.callCount > 0 || res.destroyed === true;
+          if (!error.responseStarted && !error.unverifiedOutput && !error.postOutputIdleStall && delivery.retryableShortfall) error.shortOutput = true;
+          const evidence = safeNativeEvidence(error.nativeEvidence);
+          const failure = { accountId: acc, status: Number.isInteger(error.status) && error.status >= 400 && error.status <= 599 ? error.status : 502,
+            code: errCode, ...(evidence ? { nativeEvidence: evidence } : {}) };
+          providerFailures.push(failure);
+          if (!res.headersSent) res.setHeader('X-Gemini-Recovery-Errors', [...new Set(providerFailures.map(f => f.code))].join(','));
+          if (evidence && !isClientAbortError({ status: failure.status, code: failure.code })) try {
+            accounts.recordUpstreamError(acc, { at: Date.now(), status: failure.status, code: failure.code,
+              model: canonical.model, nativeEvidence: evidence });
+          } catch { /* Diagnostic persistence must not replace the provider error. */ }
+          throw error;
+        }
+      };
+      const output = accountTestId
+        ? await pool.runTest(accountTestId, { model: canonical.model, signal: controller.signal }, turn)
+        : await pool.run({ owner, sessionId: sid, signal: controller.signal, model: canonical.model }, turn);
+      if (controller.signal.aborted) throw fault("REQUEST_CANCELLED", 499);
+      const result = output.result;
+      usage = extractUsage(result?.usage);
+      nativeEvidence = safeNativeEvidence(result.nativeEvidence);
+      try {
+        accounts.recordProviderSuccess(accountId, canonical.model, result);
+      } catch {
+        /* A diagnostic-state write must not fabricate an inference failure. */
+      }
+      toolCalls = result.calls?.length ?? 0;
+      if (Number.isSafeInteger(result.revisionCount) && result.revisionCount >= 0 && result.revisionCount <= 4096) {
+        nativeResponseRevisions = result.revisionCount;
+        if (!res.headersSent) res.setHeader('X-Gemini-Response-Revisions', String(nativeResponseRevisions));
+      }
+      continued = !!result.continued;
+      if (!res.headersSent) {
+        res.setHeader("X-Request-ID", id);
+        res.setHeader("X-Session-ID", output.sessionId);
+        if (Number.isSafeInteger(result.resolvedModeCategory)) res.setHeader("X-Native-Mode", String(result.resolvedModeCategory));
+        if (result.thinkingLevel !== null && result.thinkingLevel !== undefined) res.setHeader("X-Thinking-Level", String(result.thinkingLevel));
+      }
+      await delivery.complete(result);
+    } catch (error) {
+      if (controller.signal.reason?.code === 'REQUEST_DEADLINE') {
+        error = Object.assign(fault('NATIVE_TURN_TIMEOUT', 504), { nativeEvidence: error.nativeEvidence });
+      } else if (controller.signal.reason?.code === 'SERVER_SHUTDOWN') {
+        error = Object.assign(fault('SERVER_SHUTDOWN', 503), { nativeEvidence: error.nativeEvidence });
+        if (!res.headersSent) res.setHeader('Retry-After', '2');
+      }
+      status =
+        Number.isInteger(error.status) &&
+        error.status >= 400 &&
+        error.status <= 599
+          ? error.status
+          : 502;
+      errorCode = errorPayload(error).error.code;
+      errorMessage = typeof error?.message === "string" && error.message ? error.message.slice(0, 500) : errorCode;
+      previousRequestId = errorPayload(error).error.previous_request_id ?? null;
+      // Report the actual failure. Retrying never requires a local allowance.
+      nativeEvidence = safeNativeEvidence(error.nativeEvidence);
+      toolCalls = delivery.callCount;
+      totalErrors++;
+      // Internal attempts have finished. Do not turn an empty failed operation into
+      // a retryable 5xx, empty success, fabricated token limit, or model-written reply.
+      if (!playground && !accountTestId && !canonical.native_search && providerAttempts > 0 &&
+          NO_OUTPUT_FAILURES.has(error.code) && !delivery.hasContent &&
+          !error.partialResult?.content?.length && !error.partialResult?.calls?.length &&
+          !res.headersSent && !res.destroyed && !res.writableEnded &&
+          controller.signal.reason?.code !== 'CLIENT_DISCONNECTED') {
+        // Codex treats HTTP422 as a reconnectable Responses stream failure;
+        // its terminal HTTP400 path is required. Keep server_error + upstream cause.
+        const terminalStatus = route === 'responses' ? 400 : 422;
+        const terminal = Object.assign(fault('GENERATION_FAILED', terminalStatus), {
+          terminalNoOutput: true, upstreamCode: errorCode, upstreamStatus: status, nativeEvidence,
+        });
+        status = terminalStatus; errorCode = terminal.code; outputIncomplete = true; res.incomplete = true;
+        res.setHeader('X-Should-Retry', 'false');
+        throw terminal;
+      }
+      let interrupted = false;
+      try {
+        interrupted = await delivery.interrupt(error);
+      } catch (interruptError) {
+        error = interruptError;
+        status = Number.isInteger(error.status) && error.status >= 400 && error.status <= 599 ? error.status : 502;
+        errorCode = errorPayload(error).error.code;
+      }
+      if (interrupted) { status = res.statusCode || 200; outputIncomplete = true; return; }
+      if (res.headersSent) status = res.statusCode;
+      throw error;
+    } finally {
+      observeNative(diagnostic, 'finish', { status, errorCode, providerAttempts });
+      active--;
+      // Defer session-cache invalidation until all accepted work has finished.
+      if (!active && settingsInvalidationPending) {
+        settingsInvalidationPending = false;
+        provider.sessions?.clear();
+      }
+      controllers.delete(controller);
+      clearTimeout(timer);
+      if (hardDestroyTimer !== null) clearTimeout(hardDestroyTimer);
+      req.off("aborted", disconnect);
+      res.off("close", disconnect);
+      requests_cleanup: {
+        const cancellationSource = controller.signal.aborted
+          ? (controller.signal.reason?.code === 'REQUEST_DEADLINE'
+              ? 'request_deadline'
+              : controller.signal.reason?.code === 'SERVER_SHUTDOWN'
+                ? 'server_shutdown'
+                : controller.signal.reason?.code === 'REQUEST_CANCELLED'
+                  ? 'admin_cancel'
+                  : 'client_disconnect')
+          : null;
+        const finalState =
+          cancellationSource === 'admin_cancel' ||
+          cancellationSource === 'client_disconnect' ||
+          errorCode === 'REQUEST_CANCELLED' ||
+          errorCode === 'CLIENT_DISCONNECTED'
+            ? 'cancelled'
+            : (errorCode !== null || status >= 400 ? 'failed' : 'completed');
+        const finalRecord = {
+          id,
+          at,
+          timestamp: at,
+          startedAt: at,
+          path: reqPath,
+          model: canonical.model ?? "gemini-neon",
+          accountId,
+          accountLabel,
+          status,
+          state: finalState,
+          stream: Boolean(outputStreaming),
+          protocol: protocolName,
+          durationMs: Date.now() - at,
+          errorCode,
+          error: finalState === 'completed' ? null : (errorMessage ?? errorCode ?? null),
+          switchCount: Math.max(0, providerAttempts - 1),
+          firstEventMs,
+          inputTokens: usage.inputTokens,
+          outputTokens: usage.outputTokens,
+          cachedTokens: usage.cachedTokens,
+          cacheHit: usage.cacheHit,
+          ...(cancellationSource ? { cancellationSource } : {}),
+          ...(previousRequestId ? { previousRequestId } : {}),
+          toolCalls,
+          continued,
+          sessionSource: identity.source,
+          providerAttempts,
+          providerFailures,
+          attempts,
+          ...(outputIncomplete ? { outputIncomplete: true } : {}),
+          ...(nativeResponseRevisions !== null ? { nativeResponseRevisions } : {}),
+          ...(description ? { promptBytes: description.promptBytes, inputMessages: description.messageCount,
+            declaredTools: description.toolCount } : {}),
+          ...(nativeEvidence ? { nativeEvidence } : {}),
+        };
+        requestHub.finish(id, finalRecord);
+        break requests_cleanup;
+      }
+      inFlightTasks.delete(inFlightPromise);
+      resolveInFlight();
+    }
+  }
+  const server = http.createServer(async (req, res) => {
+    res.setHeader("Cache-Control", "no-store");
+    res.setHeader("X-Content-Type-Options", "nosniff");
+    res.setHeader("Referrer-Policy", "no-referrer");
+    res.setHeader("X-Frame-Options", "DENY");
+    res.setHeader(
+      "Content-Security-Policy",
+      "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
+    );
+    try {
+      if (!origin) throw fault("STARTING", 503);
+      if (hasDuplicateHostHeader(req.rawHeaders))
+        throw fault("HOST_REJECTED", 403);
+      const parsedHost = parseHostHeader(req.headers.host);
+      if (!parsedHost) throw fault("HOST_REJECTED", 403);
+      if (
+        typeof req.url !== "string" ||
+        !req.url.startsWith("/") ||
+        req.url.startsWith("//") ||
+        req.url.includes("\\") ||
+        req.url.includes("#") ||
+        /%(?![0-9A-Fa-f]{2})|%00|[\u0000-\u001f\u007f]/.test(req.url)
+      )
+        throw fault("ENDPOINT_NOT_FOUND", 404);
+      const expected = new URL(origin);
+      let url;
+      try {
+        url = new URL(req.url, expected.origin);
+      } catch {
+        throw fault("ENDPOINT_NOT_FOUND", 404);
+      }
+      if (url.origin !== expected.origin)
+        throw fault("ENDPOINT_NOT_FOUND", 404);
+      const defaultPort = expected.protocol === "https:" ? "443" : "80";
+      const expectedPort = expected.port || defaultPort;
+      const loopbackHosts = ["127.0.0.1", "localhost", "[::1]"];
+      const expectedHostname = expected.hostname.toLowerCase();
+      const expectedIsLoopbackHttp =
+        expected.protocol === "http:" &&
+        loopbackHosts.includes(expectedHostname);
+      const remote = req.socket?.remoteAddress;
+      const isLoopbackRemote = Security.isLoopbackAddress(remote);
+      const trustedProxy = security.isTrustedProxy(req);
+      const adminAllowedHostnames = new Set(
+        expectedIsLoopbackHttp ? loopbackHosts : [expectedHostname],
+      );
+      const isAdminHost =
+        adminAllowedHostnames.has(parsedHost.hostname) &&
+        ((parsedHost.port || defaultPort) === expectedPort ||
+          (trustedProxy && (parsedHost.port || defaultPort) === "8046"));
+      const originPortSuffix =
+        expectedPort === defaultPort ? "" : `:${expectedPort}`;
+      const adminAllowedOrigins = new Set(
+        expectedIsLoopbackHttp
+          ? [
+              ...loopbackHosts.map((h) => `http://${h}${originPortSuffix}`),
+              ...(trustedProxy ? loopbackHosts.map((h) => `http://${h}:8046`) : []),
+            ]
+          : [expected.origin],
+      );
+      const p = url.pathname;
+      const isApiRoute = p.startsWith("/v1/") || p.startsWith("/v1beta/");
+      const isProbeRoute =
+        req.method === "GET" && (p === "/health" || p === "/ready" || p === "/api/status");
+      if (isProbeRoute) {
+        if (
+          !isAdminHost &&
+          !isInternalProbeHost(parsedHost, normalizedProbeHosts)
+        )
+          throw fault("HOST_REJECTED", 403);
+      } else if (!isApiRoute) {
+        if (!isAdminHost) throw fault("HOST_REJECTED", 403);
+      }
+      if (req.method === "GET" && p === "/health")
+        return json(res, {
+          status: "ok",
+          version: "1.5.3",
+          mode: "native-direct",
+          toolProtocol: "prompt",
+          liveValidation: !allowFailover && !pool.allowQuotaFailover && !pool.allowEmptyResponseFailover && !pool.allowAutomaticRecovery,
+          generalFailoverDisabled: !allowFailover,
+          quotaFailoverEnabled: pool.allowQuotaFailover,
+          emptyResponseFailoverEnabled: pool.allowEmptyResponseFailover,
+          automaticRecoveryEnabled: pool.allowAutomaticRecovery,
+        });
+      if (req.method === "GET" && p === "/ready")
+        return json(
+          res,
+          {
+            ready: ready(),
+            ...availability(),
+            reason: ready()
+              ? null
+              : closing
+                ? "SHUTTING_DOWN"
+                : !store.data.profile || accounts.list().length === 0
+                  ? "ACCOUNT_OR_PROFILE_REQUIRED"
+                  : "NO_ELIGIBLE_ACCOUNTS",
+          },
+          ready() ? 200 : 503,
+        );
+      if (req.method === "GET" && p === "/api/status") {
+        const snapshot = pool.snapshotAccounts();
+        return json(res, {
+          ok: true,
+          service: "gemini-app2api-8049",
+          port: effectiveSettings().port,
+          uptimeSeconds: Math.floor((Date.now() - startedAt) / 1000),
+          ready: ready(),
+          accountsCount: snapshot.length,
+          enabledAccountsCount: snapshot.filter((a) => a.enabled !== false).length,
+          keyCount: store.listKeys().filter((k) => !k.revokedAt).length,
+        });
+      }
+      if (req.method === "POST" && p === "/api/drain") {
+        if (!isLoopbackRemote) throw fault("LOOPBACK_REQUIRED", 403);
+        draining = true;
+        auditEvent("gateway.drain");
+        return json(res, { ok: true, draining: true });
+      }
+      if (req.method === "GET" && (p === "/" || p === "/admin")) {
+        res.writeHead(302, { Location: "/admin/" + url.search });
+        res.end();
+        return;
+      }
+      if (req.method === "GET" && assets.has(p)) {
+        const filename = assets.get(p);
+        let bytes;
+        try {
+          bytes = fs.readFileSync(new URL(filename, uiRoot));
+        } catch {
+          throw fault("ADMIN_ASSET_UNAVAILABLE", 503);
+        }
+        res.writeHead(200, {
+          "Content-Type": filename.endsWith(".html")
+            ? "text/html; charset=utf-8"
+            : filename.endsWith(".js")
+              ? "text/javascript; charset=utf-8"
+              : "text/css; charset=utf-8",
+        });
+        res.end(bytes);
+        return;
+      }
+      if (p.startsWith("/admin/api/")) {
+        if (req.method === "POST" && p === "/admin/api/login") {
+          security.checkOrigin(req, adminAllowedOrigins);
+          const body = await readJson(req, 4096);
+          if (req.aborted || res.destroyed) return;
+          only(body, ["password"]);
+          const login = security.login(body.password, req.socket.remoteAddress);
+          res.setHeader("Set-Cookie", security.cookie(login.token));
+          auditEvent("admin.login");
+          return json(res, { csrf: login.csrf, authRequired: security.adminAuthRequired });
+        }
+        if (p === "/admin/api/session" && req.method === "GET") {
+          if (trustedProxy) {
+            let session = security.session(req);
+            if (!session) {
+              const bootstrap = security.issueSession(remote);
+              res.setHeader("Set-Cookie", security.cookie(bootstrap.token));
+              session = { csrf: bootstrap.csrf };
+            }
+            return json(res, { authenticated: true, csrf: session.csrf, authRequired: false });
+          }
+          let session = security.session(req);
+          if (!session && !security.adminAuthRequired) {
+            const site = req.headers["sec-fetch-site"];
+            if (
+              !isLoopbackRemote ||
+              (req.headers.origin &&
+                !adminAllowedOrigins.has(req.headers.origin)) ||
+              (site && site === "cross-site")
+            )
+              throw fault("ORIGIN_REJECTED", 403);
+            if (site && !["same-origin", "none"].includes(site)) throw fault("ORIGIN_REJECTED", 403);
+            if (!isAdminHost) throw fault("HOST_REJECTED", 403);
+            const bootstrap = security.issueSession(remote);
+            res.setHeader("Set-Cookie", security.cookie(bootstrap.token));
+            session = { csrf: bootstrap.csrf };
+          }
+          if (!session) throw fault("ADMIN_LOGIN_REQUIRED", 401);
+          return json(res, { authenticated: true, csrf: session.csrf, authRequired: security.adminAuthRequired });
+        }
+        const session = trustedProxy
+          ? security.session(req)
+          : sensitiveMethods.has(req.method)
+            ? security.requireMutation(req, adminAllowedOrigins)
+            : security.requireAdmin(req);
+        if (p === "/admin/api/logout" && req.method === "POST") {
+          if (session) security.logout(session);
+          res.setHeader("Set-Cookie", security.cookie("", { clear: true }));
+          auditEvent("admin.logout");
+          return json(res, { ok: true });
+        }
+        if (req.method === "GET" && p === "/admin/api/overview")
+          return json(res, overview());
+        if (req.method === "GET" && p === "/admin/api/requests")
+          return json(res, requestHub.listAll());
+        if (req.method === "GET" && p === "/admin/api/events")
+          return requestHub.subscribe(req, res);
+        const cancelRequestMatch = p.match(/^\/admin\/api\/requests\/([a-zA-Z0-9_-]+)\/cancel$/);
+        if (cancelRequestMatch && req.method === "POST") {
+          const cancelled = requestHub.cancel(cancelRequestMatch[1]);
+          if (!cancelled) return json(res, { ok: false, error: "REQUEST_NOT_FOUND" }, 404);
+          auditEvent("request.cancelled", cancelRequestMatch[1]);
+          return json(res, { ok: true, id: cancelRequestMatch[1] });
+        }
+        if (req.method === "DELETE" && p === "/admin/api/requests") {
+          const cleared = requestHub.clearCompleted();
+          auditEvent("requests.cleared");
+          return json(res, { ok: true, cleared });
+        }
+        if (req.method === "GET" && p === "/admin/api/accounts")
+          return json(res, { accounts: pool.snapshotAccounts() });
+        if (req.method === "GET" && p === "/admin/api/accounts/chrome-profiles")
+          return json(res, scanChromeProfiles(accounts, chromeOAuthOpts));
+        if (req.method === "POST" && p === "/admin/api/accounts/chrome-oauth") {
+          const b = await readJson(req, 65536);
+          if (req.aborted || res.destroyed) return;
+          only(b, ["profiles", "acceptTerms"]);
+          req.setTimeout(0);
+          res.setTimeout(0);
+          const result = await runChromeOAuthBatch(
+            accounts,
+            { profiles: b.profiles, acceptTerms: b.acceptTerms },
+            chromeOAuthOpts,
+          );
+          auditEvent("account.chrome_oauth");
+          return json(res, result);
+        }
+        if (req.method === "POST" && p === "/admin/api/accounts/import-tokens") {
+          const b = await readJsonAny(req, 262144);
+          if (req.aborted || res.destroyed) return;
+          let rawTokens;
+          let acceptTerms = true;
+          if (Array.isArray(b)) {
+            rawTokens = b;
+          } else {
+            only(b, ["tokens", "acceptTerms"]);
+            rawTokens = b.tokens;
+            acceptTerms = b.acceptTerms !== false;
+          }
+          const result = await accounts.importRefreshTokens(rawTokens, { acceptTerms });
+          auditEvent("account.tokens.imported");
+          return json(res, result);
+        }
+        if (req.method === "GET" && p === "/admin/api/accounts/export") {
+          return json(res, {
+            exportedAt: new Date().toISOString(),
+            format: "gemini-app2api-accounts-v1",
+            accounts: accounts.exportAccounts(),
+          });
+        }
+        if (req.method === 'POST' && p === '/admin/api/accounts/quota-refresh') {
+          const input = await readJson(req, 4096);
+          if (req.aborted || res.destroyed) return;
+          only(input, ['trigger']);
+          const result = quotaRefreshJobs.start(input);
+          if (!result.reused) auditEvent('quota.batch.started', result.job.id);
+          return json(res, result, 202);
+        }
+        const quotaJob = p.match(/^\/admin\/api\/accounts\/quota-refresh\/(quota_refresh_[a-f0-9-]{36})$/);
+        if (quotaJob && req.method === 'GET') return json(res, { job: quotaRefreshJobs.get(quotaJob[1]) });
+        if (req.method === "POST" && p === "/admin/api/accounts/login") {
+          const b = await readJson(req, 4096);
+          if (req.aborted || res.destroyed) return;
+          only(b, ["label", "acceptTerms", "loginHint"]);
+          const result = await accounts.beginLogin(b.label, {
+            acceptTerms: b.acceptTerms === undefined ? false : b.acceptTerms,
+            ...(b.loginHint !== undefined ? { loginHint: b.loginHint } : {}),
+          });
+          auditEvent("account.login.started");
+          return json(res, result, 201);
+        }
+        const flowCallback = p.match(
+          /^\/admin\/api\/accounts\/login\/([a-zA-Z0-9-]+)\/callback$/,
+        );
+        if (flowCallback && req.method === "POST") {
+          const b = await readJson(req, 8192);
+          if (req.aborted || res.destroyed) return;
+          only(b, ["callbackUrl", "url"]);
+          const rawUrl = b.callbackUrl ?? b.url;
+          if (typeof rawUrl !== "string" || !rawUrl.trim()) {
+            throw fault("INVALID_CALLBACK_URL");
+          }
+          const flow = await accounts.completeLoginCallback(flowCallback[1], rawUrl);
+          auditEvent("account.login.callback");
+          return json(res, { ok: true, flow });
+        }
+        const flow = p.match(
+          /^\/admin\/api\/accounts\/login\/([a-zA-Z0-9-]+)$/,
+        );
+        if (flow && req.method === "GET")
+          return json(res, accounts.flow(flow[1]));
+        if (flow && req.method === "DELETE") {
+          accounts.cancelFlow(flow[1]);
+          auditEvent("account.login.cancelled");
+          return json(res, { ok: true });
+        }
+        const acceptTerms = p.match(/^\/admin\/api\/accounts\/([a-zA-Z0-9_-]+)\/terms\/accept$/);
+        if (acceptTerms && req.method === 'POST') {
+          const input = await readJson(req, 4096);
+          if (req.aborted || res.destroyed) return;
+          only(input, ['confirmed']);
+          if (input.confirmed !== true) throw fault('CONFIRMATION_REQUIRED');
+          const controller = new AbortController();
+          const cancel = () => { if (!res.writableEnded) controller.abort(); };
+          req.once('aborted', cancel); res.once('close', cancel); controllers.add(controller);
+          if (req.aborted || res.destroyed) cancel();
+          try {
+            const terms = await accounts.acceptTerms(acceptTerms[1], { confirmed: true, signal: controller.signal });
+            auditEvent('account.terms.accepted', acceptTerms[1]);
+            return json(res, { terms, generationRequests: 0 });
+          } finally {
+            req.off('aborted', cancel); res.off('close', cancel); controllers.delete(controller);
+          }
+        }
+        const identity = p.match(
+          /^\/admin\/api\/accounts\/([a-zA-Z0-9_-]+)\/identity$/,
+        );
+        if (identity && req.method === "POST") {
+          const body = await readJson(req, 4096);
+          if (req.aborted || res.destroyed) return;
+          only(body, []);
+          const controller = new AbortController();
+          const cancel = () => { if (!res.writableEnded) controller.abort(); };
+          req.once("aborted", cancel); res.once("close", cancel); controllers.add(controller);
+          if (req.aborted || res.destroyed) cancel();
+          try {
+            return json(res, await accounts.updateIdentity(identity[1], { signal: controller.signal }));
+          } finally {
+            req.off("aborted", cancel); res.off("close", cancel); controllers.delete(controller);
+          }
+        }
+        const accountTest = p.match(/^\/admin\/api\/accounts\/([a-zA-Z0-9_-]+)\/test$/);
+        if (accountTest && req.method === "POST") {
+          const input = await readJson(req, 4096);
+          if (req.aborted || res.destroyed) return;
+          only(input, ["model"]);
+          const model = protocol.canonicalModel(input.model);
+          if (!protocol.NATIVE_MODELS.includes(model)) throw fault("UNSUPPORTED_MODEL");
+          return await execute(req, res, { model, messages: [{ role: "user", content: "Reply with OK." }], thinking_level: 2 }, { owner: "admin-account-test", route: "chat", accountTestId: accountTest[1] });
+        }
+        const subscriptionRefresh = p.match(/^\/admin\/api\/accounts\/([a-zA-Z0-9_-]+)\/subscription$/);
+        if (subscriptionRefresh && req.method === "POST") {
+          const body = await readJson(req, 4096);
+          if (req.aborted || res.destroyed) return;
+          only(body, []);
+          const controller = new AbortController();
+          const cancel = () => { if (!res.writableEnded) controller.abort(); };
+          req.once("aborted", cancel); res.once("close", cancel); controllers.add(controller);
+          if (req.aborted || res.destroyed) cancel();
+          try {
+            const subscription = await accounts.refreshSubscription(subscriptionRefresh[1], { signal: controller.signal });
+            auditEvent("subscription.refresh", subscriptionRefresh[1]);
+            return json(res, { subscription });
+          } finally {
+            req.off("aborted", cancel); res.off("close", cancel); controllers.delete(controller);
+          }
+        }
+        const quotaRefresh = p.match(new RegExp("^/admin/api/accounts/([a-zA-Z0-9_-]+)/quota$"));
+        if (quotaRefresh && req.method === "POST") {
+          const body = await readJson(req, 4096);
+          if (req.aborted || res.destroyed) return;
+          only(body, []);
+          const controller = new AbortController();
+          const cancel = () => { if (!res.writableEnded) controller.abort(); };
+          req.once("aborted", cancel); res.once("close", cancel); controllers.add(controller);
+          if (req.aborted || res.destroyed) cancel();
+          try {
+            const quota = await accounts.refreshQuota(quotaRefresh[1], { signal: controller.signal });
+            auditEvent("quota.refresh", quotaRefresh[1]);
+            return json(res, { quota });
+          } finally {
+            req.off("aborted", cancel); res.off("close", cancel); controllers.delete(controller);
+          }
+        }
+        const acc = p.match(/^\/admin\/api\/accounts\/([a-zA-Z0-9_-]+)$/);
+        if (acc && req.method === "PATCH") {
+          const body = await readJson(req, 4096);
+          if (req.aborted || res.destroyed) return;
+          accounts.update(acc[1], body);
+          if (active) settingsInvalidationPending = true;
+          else provider.sessions?.clear();
+          auditEvent("account.updated", acc[1]);
+          return json(res, { ok: true });
+        }
+        if (acc && req.method === "DELETE") {
+          accounts.remove(acc[1]);
+          pool.forgetAccount(acc[1]);
+          if (active) settingsInvalidationPending = true;
+          else provider.sessions?.clear();
+          auditEvent("account.removed", acc[1]);
+          return json(res, { ok: true });
+        }
+        if (p === "/admin/api/keys" && req.method === "GET")
+          return json(res, { keys: store.listKeys() });
+        if (p === "/admin/api/keys" && req.method === "POST") {
+          const b = await readJson(req, 4096);
+          if (req.aborted || res.destroyed) return;
+          only(b, ["label"]);
+          const key = store.createKey(b.label);
+          auditEvent("key.created", key.id);
+          return json(res, key, 201);
+        }
+        const keyReveal = p.match(/^\/admin\/api\/keys\/([a-zA-Z0-9_-]+)\/reveal$/);
+        if (keyReveal && req.method === "POST") {
+          const b = await readJson(req, 4096);
+          if (req.aborted || res.destroyed) return;
+          only(b, []);
+          const revealed = store.revealKey(keyReveal[1]);
+          auditEvent("key.revealed", revealed.id);
+          return json(res, revealed);
+        }
+        const key = p.match(/^\/admin\/api\/keys\/([a-zA-Z0-9_-]+)$/);
+        if (key && req.method === "DELETE") {
+          store.revokeKey(key[1]);
+          provider.sessions?.clear();
+          auditEvent("key.revoked", key[1]);
+          return json(res, { ok: true });
+        }
+        if (p === "/admin/api/settings" && req.method === "GET")
+          return json(res, effectiveSettings());
+        if (p === "/admin/api/settings" && req.method === "PATCH") {
+          const body = await readJson(req, 4096);
+          if (req.aborted || res.destroyed) return;
+          const value = store.updateSettings(body);
+          // Accepted work keeps its settings snapshot; saving never aborts it.
+          if (active) settingsInvalidationPending = true;
+          else {
+            provider.sessions?.clear();
+          }
+          auditEvent("settings.updated");
+          return json(res, { ...value, port: effectiveSettings().port });
+        }
+        if (p === "/admin/api/diagnostics" && req.method === "GET") {
+          const o = overview();
+          return json(res, {
+            version: o.version,
+            mode: o.mode,
+            toolProtocol: o.toolProtocol,
+            ready: o.ready,
+            uptimeSeconds: o.uptimeSeconds,
+            metrics: o.metrics,
+            modelTelemetry: o.modelTelemetry,
+            counts: {
+              accounts: o.accounts.length,
+              sessions: o.sessions.length,
+              keys: o.keyCount,
+              failovers: o.failovers.length,
+            },
+            settings: o.settings,
+            liveVerification: "not_implied_by_health",
+          });
+        }
+        if (p === "/admin/api/playground" && req.method === "POST") {
+          const b = await readJson(req, store.settings().maxBodyBytes);
+          if (req.aborted || res.destroyed) return;
+          return await execute(req, res, b, {
+            owner: "admin-playground",
+            route: "chat",
+            playground: true,
+          });
+        }
+        throw fault("ENDPOINT_NOT_FOUND", 404);
+      }
+      if (p.startsWith("/v1/")) {
+        const owner = security.apiOwner(req, url);
+        if (url.search) throw fault("UNSUPPORTED_QUERY_PARAMETER");
+        if (p === "/v1/models" && req.method === "GET") {
+          const contextWindows = {
+            "gemini-neon": 512000,
+            "gemini-hydrogen": 512000,
+          };
+          return json(res, {
+            object: "list",
+            data: protocol.NATIVE_MODELS.map((id) => ({
+              id,
+              object: "model",
+              created: 0,
+              owned_by: "google",
+              // Advisory gateway budget, not a measured upstream token limit.
+              ...(Object.hasOwn(contextWindows, id)
+                ? { context_window: contextWindows[id] }
+                : {}),
+            })),
+          });
+        }
+        if (p === "/v1/messages/count_tokens" && req.method === "POST") {
+          const body = await readJson(req, store.settings().maxBodyBytes);
+          if (req.aborted || res.destroyed) return;
+          return json(res, countGoogleTokens(body));
+        }
+        if (
+          req.method === "POST" &&
+          ["/v1/chat/completions", "/v1/responses", "/v1/messages"].includes(p)
+        ) {
+          const body = await readJson(req, store.settings().maxBodyBytes);
+          if (req.aborted || res.destroyed) return;
+          const route = p === "/v1/messages" ? "google" : p.endsWith("responses") ? "responses" : "chat";
+          if (allowAutomaticRecovery && route !== "google") {
+            const canonical = route === 'responses' ? protocol.normalizeResponsesRequest(body).body : protocol.normalizeChatRequest(body);
+            const { sessionId } = resolveSessionIdentity(req.headers, canonical);
+            if (sessionId !== undefined) return await resumption.run({ req, res, owner, sessionId, route, body }, async (input, output) => {
+              try { await execute(input, output, body, { owner, route }); }
+              catch (error) { if (output.headersSent) { output.incomplete = true; output.end(); } else { output.discard(); json(output, errorPayload(error), Number.isInteger(error.status) ? error.status : 500); } }
+            });
+          }
+          return await execute(req, res, body, { owner, route });
+        }
+        throw fault("UNSUPPORTED_ENDPOINT", 404);
+      }
+      if (p.startsWith("/v1beta/")) {
+        const owner = security.apiOwner(req, url);
+        for (const keyName of url.searchParams.keys()) {
+          if (keyName !== "alt" && keyName !== "key" && keyName !== "pageSize" && keyName !== "pageToken") {
+            throw fault("UNSUPPORTED_QUERY_PARAMETER");
+          }
+        }
+        if (p === "/v1beta/models" && req.method === "GET") {
+          return json(res, listGeminiModels());
+        }
+        const modelGetMatch = p.match(/^\/v1beta\/models\/([A-Za-z0-9._-]+)$/);
+        if (modelGetMatch && req.method === "GET") {
+          const desc = describeGeminiModel(modelGetMatch[1]);
+          if (!desc) throw fault("UNSUPPORTED_MODEL", 404);
+          return json(res, desc);
+        }
+        const actionMatch = p.match(/^\/v1beta\/models\/([A-Za-z0-9._-]+):(generateContent|streamGenerateContent|countTokens)$/);
+        if (actionMatch && req.method === "POST") {
+          const [, modelName, action] = actionMatch;
+          const body = await readJson(req, store.settings().maxBodyBytes);
+          if (req.aborted || res.destroyed) return;
+          if (action === "countTokens") {
+            return json(res, countGeminiTokens(modelName, body));
+          }
+          const isStream = action === "streamGenerateContent";
+          const alt = url.searchParams.get("alt");
+          const geminiSse = isStream && alt === "sse";
+          return await execute(req, res, body, {
+            owner,
+            route: "gemini",
+            geminiModel: modelName,
+            geminiStream: isStream,
+            geminiSse,
+          });
+        }
+        throw fault("UNSUPPORTED_ENDPOINT", 404);
+      }
+      throw fault("ENDPOINT_NOT_FOUND", 404);
+    } catch (error) {
+      if (res.destroyed || res.writableEnded) return;
+      const status =
+        Number.isInteger(error.status) &&
+        error.status >= 400 &&
+        error.status <= 599
+          ? error.status
+          : 500;
+      if (!res.headersSent) json(res, errorPayload(error), status);
+      else res.end();
+    }
+  });
+  server.requestTimeout = 30000;
+  server.headersTimeout = 15000;
+  server.keepAliveTimeout = 5000;
+  server.maxHeadersCount = 64;
+  server.maxConnections = 128;
+  return {
+    server,
+    store,
+    accounts,
+    quotaRefreshJobs,
+    provider,
+    pool,
+    security,
+    overview,
+    async listen({
+      host = store.settings().host,
+      port = store.settings().port,
+    } = {}) {
+      if (!security.adminAuthRequired) {
+        const loopbacks = ["127.0.0.1", "::1", "localhost"];
+        let originUrl = null;
+        try { originUrl = publicOrigin ? new URL(publicOrigin) : null; } catch { throw fault("ADMIN_PASSWORD_REQUIRED_FOR_REMOTE", 503); }
+        if (!loopbacks.includes(host) || (originUrl && (!["http:", "https:"].includes(originUrl.protocol) || ![...loopbacks, "[::1]"].includes(originUrl.hostname))))
+          throw fault("ADMIN_PASSWORD_REQUIRED_FOR_REMOTE", 503);
+      }
+      await new Promise((resolve, reject) => {
+        server.once("error", reject);
+        server.listen(port, host, () => {
+          server.off("error", reject);
+          resolve();
+        });
+      });
+      if (!origin) {
+        const addr = server.address();
+        origin = `http://${host.includes(":") ? "[" + host + "]" : host === "0.0.0.0" ? "127.0.0.1" : host}:${addr.port}`;
+      }
+      return origin;
+    },
+    async close() {
+      closing = true;
+      for (const c of controllers) c.abort(fault('SERVER_SHUTDOWN', 503));
+      requestHub.close();
+      resumption.close();
+      await quotaRefreshJobs.close();
+      const accountsDrain = Promise.resolve(accounts.close());
+      server.closeIdleConnections();
+      await new Promise((resolve) => {
+        server.close(resolve);
+        const timer = setTimeout(() => server.closeAllConnections(), 1500);
+        timer.unref();
+      });
+      await Promise.allSettled([accountsDrain, ...inFlightTasks]);
+    },
+  };
+}
