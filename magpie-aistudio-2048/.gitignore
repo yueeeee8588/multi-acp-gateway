@@ -1,0 +1,25 @@
+evidence/
+node_modules/
+*.tgz
+.runtime/
+.env
+backend-build/
+studio-build/
+backend-source/
+.DS_Store
+.env.*
+*.db
+*.db-wal
+*.db-shm
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+
+# Notes, captures and probes from researching the Gemini app: kept local only
+docs/research/
+docs/design/
+scripts/research/
+data/
+*.exe
+*.zip

@@ -239,6 +239,14 @@ pub fn app(state: Shared) -> Router {
         .route("/v1beta/models/{*rest}", post(proxy::gemini_generate))
         .route("/acp-api", axum::routing::any(acp_proxy::handle))
         .route("/acp-api/{*rest}", axum::routing::any(acp_proxy::handle))
+        .route(
+            "/aistudio-api",
+            axum::routing::any(crate::acp_proxy::handle_aistudio),
+        )
+        .route(
+            "/aistudio-api/{*rest}",
+            axum::routing::any(crate::acp_proxy::handle_aistudio),
+        )
         .layer(DefaultBodyLimit::max(16 * 1024 * 1024))
         .fallback(console)
         .with_state(state)
@@ -247,6 +255,8 @@ async fn console(State(state): State<Shared>, headers: HeaderMap, uri: Uri) -> R
     let path = uri.path();
     if path.starts_with("/api/")
         || path.starts_with("/acp-api/")
+        || path == "/aistudio-api"
+        || path.starts_with("/aistudio-api/")
         || path.starts_with("/v1/")
         || path.starts_with("/v1beta/")
     {

@@ -1,0 +1,198 @@
+// Historical managed-artifact check. The plugin now installs official releases; this script
+// explicitly verifies and stages an archived fork to keep its patches reproducible.
+// No Google accounts, generation or applied update.
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import { DatabaseSync } from 'node:sqlite';
+import { execFileSync, spawn } from 'node:child_process';
+
+const root = fileURLToPath(new URL('..', import.meta.url));
+const args = process.argv.slice(2);
+const packageRoot = args.find(arg => arg.startsWith('--package-root='))?.slice('--package-root='.length) || root;
+const download = args.includes('--download');
+const { ensureStudio, ensureStudioConfig, localStudio, pickStudioPort, stopStudio, studioAdmin, studioBrowserSession, studioStatus, computeFileHash } = await import(pathToFileURL(path.join(packageRoot, 'lib/studio-native.mjs')));
+const release = JSON.parse(fs.readFileSync(path.join(packageRoot, 'lib/studio-release.json'), 'utf8'));
+const STUDIO_VERSION = `v${release.version}`;
+const key = `${process.platform}-${process.arch}`;
+const pin = release.binaries[key];
+assert.ok(pin, `Unsupported platform ${key}`);
+let archivePath = path.join(root, 'studio-build/release', pin.asset);
+const source = download ? 'GitHub release' : 'local release artifact';
+const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'magpie-studio-managed-smoke-'));
+let local;
+const startOptions = { dataDir, managementOnly: true, spawnFn: (file, args, options) => spawn(file, args, {
+  ...options, env: { ...options.env, WAA_BACKEND: 'spidermonkey' }
+}) };
+try {
+  if (download) {
+    archivePath = path.join(dataDir, pin.asset);
+    execFileSync('curl', ['--fail', '--location', '--silent', '--show-error', '--max-time', '300', '-o', archivePath,
+      `https://github.com/${release.repository}/releases/download/${release.tag}/${pin.asset}`]);
+  }
+  assert.equal(computeFileHash(archivePath), pin.sha256, 'historical archive hash');
+  const extracted = path.join(dataDir, 'extracted');
+  fs.mkdirSync(extracted);
+  if (process.platform === 'win32') {
+    execFileSync('powershell', ['-NoProfile', '-NonInteractive', '-Command', "Expand-Archive -LiteralPath $env:SMOKE_ARCHIVE -DestinationPath $env:SMOKE_DEST"], {
+      env: { ...process.env, SMOKE_ARCHIVE: archivePath, SMOKE_DEST: extracted }, windowsHide: true
+    });
+  } else execFileSync('tar', ['-xzf', archivePath, '-C', extracted]);
+  const entries = fs.readdirSync(extracted);
+  const top = entries.length === 1 && fs.statSync(path.join(extracted, entries[0])).isDirectory() ? path.join(extracted, entries[0]) : extracted;
+  fs.renameSync(top, path.join(dataDir, 'package'));
+  ensureStudioConfig(dataDir, undefined, { port: await pickStudioPort(0) });
+  local = localStudio({ dataDir });
+  const bin = path.join(dataDir, 'package', process.platform === 'win32' ? 'aistudio2api.exe' : 'aistudio2api');
+  assert.equal(computeFileHash(bin), pin.binarySha256);
+  // A pre-0.2.17 ledger must survive the real process's first startup.
+  fs.mkdirSync(path.join(dataDir, 'runtime'), { recursive: true });
+  const db = new DatabaseSync(path.join(dataDir, 'runtime', 'requests.db'));
+  try {
+    db.exec(`CREATE TABLE bodies (seq INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT NOT NULL UNIQUE, time INTEGER NOT NULL,
+      request TEXT NOT NULL, request_size INTEGER NOT NULL, response TEXT NOT NULL, response_size INTEGER NOT NULL)`);
+    db.prepare('INSERT INTO bodies (id,time,request,request_size,response,response_size) VALUES (?,?,?,?,?,?)')
+      .run('legacy-smoke', 1234, '旧请求', 100, 'old response', 200);
+  } finally { db.close(); }
+  // Both values would be reset by upstream's legacy full-.env migration.
+  fs.appendFileSync(path.join(dataDir, '.env'), 'FIRST_EVENT_HEDGE=off\nREQUEST_TIMEOUT=5m\nSEARCH_MODEL_ALIASES=false\n');
+  await ensureStudio(startOptions);
+  const migratedBody = await studioAdmin(local, 'GET', '/api/requests/legacy-smoke/body');
+  assert.equal(migratedBody.request, '旧请求');
+  assert.equal(migratedBody.response, 'old response');
+  assert.equal(migratedBody.request_size, 100);
+  assert.equal(migratedBody.response_size, 200);
+  const config = await studioAdmin(local, 'GET', '/api/config');
+  assert.equal(config.first_event_hedge, 'off');
+  assert.equal(config.request_timeout, '5m0s');
+  // Generation's WAA runs in the service itself, on SpiderMonkey, with no copies of the models
+  assert.equal(config.waa_backend, 'spidermonkey');
+  assert.equal(config.search_model_aliases, false);
+  const extendedConfig = release.upstream.version.localeCompare('0.3.7', undefined, { numeric: true }) >= 0;
+  if (extendedConfig) {
+    assert.equal(config.discover_hidden_models, false);
+    assert.equal(config.max_account_switches, 3);
+  }
+  assert.equal(config.strip_thought_signatures, false);
+  assert.equal(config.hide_dock_icon, false);
+  const taskStatus = await studioAdmin(local, 'GET', '/api/accounts/tasks');
+  assert.deepEqual(taskStatus.tasks, []);
+  if (release.patches.some(name => name.endsWith('-magpie-signin.patch'))) {
+    assert.equal(taskStatus.magpie_signin, 1);
+    const { openStudioConnect } = await import(pathToFileURL(path.join(packageRoot, 'lib/studio-connect.mjs')));
+    const bridge = await openStudioConnect({ prepare: async () => local, deadline: Date.now() + 15000 });
+    const pending = bridge.start();
+    try {
+      let ready = false;
+      for (let i = 0; i < 40; i++) {
+        if ((await (await fetch(bridge.url + '/status')).json()).ready) { ready = true; break; }
+        await new Promise(r => setTimeout(r, 100));
+      }
+      assert.ok(ready, 'sign-in bridge must prepare the real backend');
+      const managed = await fetch(bridge.url + '/manage', { method: 'POST', headers: { Origin: new URL(bridge.url).origin } });
+      assert.equal(managed.status, 200);
+      const destination = new URL((await managed.json()).url);
+      assert.equal(destination.origin, local.origin);
+      const state = new URLSearchParams(destination.hash.slice(1));
+      assert.equal(state.get('callback'), bridge.url + '/finish');
+      const cookie = await studioBrowserSession(local);
+      assert.ok(managed.headers.get('set-cookie').startsWith(cookie + ';'));
+      // Invalid cookie text fails locally before touching Google; this still exercises a real
+      // asynchronous task, authenticated browser writes, client correlation and retry semantics.
+      const imported = await fetch(local.origin + '/api/accounts/import/cookies', {
+        method: 'POST', headers: { Origin: local.origin, Cookie: cookie, 'Content-Type': 'application/json', 'X-Magpie-Signin': state.get('magpie') },
+        body: JSON.stringify({ items: [{ email: 'smoke@example.invalid', cookies: 'not-a-cookie' }] })
+      });
+      assert.equal(imported.status, 202);
+      const { task } = await imported.json();
+      assert.equal(task.client_id, state.get('magpie'));
+      let saved;
+      for (let i = 0; i < 40; i++) {
+        saved = (await studioAdmin(local, 'GET', '/api/accounts/tasks')).tasks.find(t => t.id === task.id);
+        if (saved.state !== 'running') break;
+        await new Promise(r => setTimeout(r, 100));
+      }
+      assert.equal(saved.state, 'failed');
+      assert.equal(saved.client_id, task.client_id);
+      assert.equal((await (await fetch(bridge.url + '/status')).json()).done, false);
+      await fetch(bridge.url + '/cancel', { method: 'POST', headers: { Origin: new URL(bridge.url).origin } });
+      await assert.rejects(pending, /取消/);
+      await studioAdmin(local, 'DELETE', `/api/accounts/tasks/${encodeURIComponent(task.id)}`);
+      console.log('PASS automatic sign-in: session handoff, capability, task correlation and failed-import retry');
+    } finally { bridge.close(); }
+  }
+  // Save upstream defaults that differ from this plugin's defaults. They must stay explicit
+  // through the backend's Save and the plugin's next config sync, not get silently re-seeded.
+  const choices = {
+    search_model_aliases: true, strip_thought_signatures: true, hide_dock_icon: true, routing_strategy: 'round-robin',
+    account_order: 'smoke-b@example.com,smoke-a@example.com', per_account_concurrency: 2,
+    ...(extendedConfig ? { max_account_switches: 5, discover_hidden_models: true } : {}),
+    first_event_hedge: 'auto', first_event_hedge_models: 'gemini-3.8-flash',
+    api_key_accounts: `${local.apiKey}:smoke@example.com`,
+    model_accounts: 'gemini-3.1-pro-preview:smoke-b@example.com|smoke-a@example.com'
+  };
+  const saved = await studioAdmin(local, 'PUT', '/api/config', {
+    ...config, ...choices,
+    // These fields belong to the plugin and must stay locked even if submitted by a client.
+    listen_addr: '127.0.0.1:1', waa_backend: 'camoufox'
+  });
+  assert.equal(saved.listen_addr, config.listen_addr);
+  assert.equal(saved.waa_backend, 'spidermonkey');
+  assert.ok(saved.environment.includes('WAA_BACKEND'));
+  for (const [key, value] of Object.entries(choices)) assert.equal(saved[key], value, key);
+  const pidBefore = fs.readFileSync(path.join(dataDir, 'backend.pid'), 'utf8');
+  const status = await studioAdmin(local, 'GET', '/api/status');
+  assert.equal(status.version, STUDIO_VERSION);
+  for (const query of ['', '?refresh=1']) {
+    const update = await studioAdmin(local, 'GET', `/api/update${query}`);
+    assert.equal(update.mode, 'managed');
+    assert.equal(update.managed_by, 'magpie-gemini-web');
+    assert.equal(update.available, false);
+    assert.equal(update.updating, false);
+    assert.equal(update.current, STUDIO_VERSION);
+  }
+  let updateHTTP;
+  await assert.rejects(studioAdmin(local, 'POST', '/api/update', null, {
+    fetchFn: async (...args) => {
+      const response = await fetch(...args);
+      if (String(args[0]).endsWith('/api/update')) updateHTTP = response.status;
+      return response;
+    }
+  }), /magpie-gemini-web/);
+  assert.equal(updateHTTP, 409);
+  assert.equal(computeFileHash(bin), pin.binarySha256, 'update must not replace the binary');
+  assert.equal(fs.readFileSync(path.join(dataDir, 'backend.pid'), 'utf8'), pidBefore, 'update must not restart');
+  const html = await (await fetch(local.origin)).text();
+  const entry = /src="([^"]+\.js)"/.exec(html)?.[1];
+  assert.ok(entry, 'admin page must load');
+  const js = await (await fetch(new URL(entry, local.origin))).text();
+  const versionPanel = /(?:\.\/|\/assets\/)?(VersionPanel-[\w-]+\.js)/.exec(js)?.[1];
+  assert.ok(versionPanel, 'built admin version panel must exist');
+  const panel = await (await fetch(`${local.origin}/assets/${versionPanel}`)).text();
+  // Upstream's panel keeps its install button for other builds and shows a managed build's note
+  // in its place; the refusal above is what keeps the binary
+  assert.match(panel, /version\.managed/);
+  assert.deepEqual(await stopStudio({ dataDir }), { stopped: true });
+  assert.equal((await studioStatus({ dataDir })).status, 'stopped');
+  await ensureStudio(startOptions);
+  assert.deepEqual(await studioAdmin(local, 'GET', '/api/requests/legacy-smoke/body'), migratedBody);
+  const restarted = await studioAdmin(local, 'GET', '/api/config');
+  for (const [key, value] of Object.entries(choices)) assert.equal(restarted[key], value, `${key} after restart`);
+  assert.equal(restarted.request_timeout, '5m0s');
+  assert.equal(restarted.waa_backend, 'spidermonkey');
+  assert.deepEqual(await stopStudio({ dataDir }), { stopped: true });
+  console.log(`PASS ${key}: ${STUDIO_VERSION} (${source}), legacy body migration/restart, saved admin settings across restart, locked plugin settings, SpiderMonkey WAA, managed status, update HTTP 409, unchanged executable/PID, managed UI, clean stop`);
+} finally {
+  let stopped = !local;
+  if (local) stopped = (await stopStudio({ dataDir }).catch(() => ({ stopped: false }))).stopped;
+  if (stopped) {
+    const pkg = path.join(dataDir, 'package');
+    if (fs.existsSync(pkg)) fs.chmodSync(pkg, 0o755);
+    fs.rmSync(dataDir, { recursive: true, force: true });
+  } else {
+    console.error(`Could not confirm backend exit; preserved ${dataDir}`);
+    process.exitCode = 1;
+  }
+}

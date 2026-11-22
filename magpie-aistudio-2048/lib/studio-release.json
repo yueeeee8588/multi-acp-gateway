@@ -1,0 +1,122 @@
+{
+  "version": "0.3.5-magpie.1",
+  "repository": "BUKOWSKIREAL/magpie-gemini-web",
+  "tag": "studio-v0.3.5-magpie.1",
+  "goVersion": "1.27.1",
+  "toolchains": {
+    "zig": "0.16.0",
+    "xcode": {
+      "version": "26.3",
+      "build": "17C529"
+    },
+    "llvmMingw": {
+      "version": "20261020",
+      "clang": "clang version 23.1.4 (https://github.com/llvm/llvm-project.git 7a941dfb2877a0b8cf30323fefa85ad019e0b0f5)",
+      "hosts": {
+        "darwin": {
+          "asset": "llvm-mingw-20261020-ucrt-macos-universal.tar.xz",
+          "sha256": "e9c13e4ede38e715003ffc674d4d00a1088df8235439d1f0c16188ff0704c17e"
+        },
+        "linux-x64": {
+          "asset": "llvm-mingw-20261020-ucrt-ubuntu-22.04-x86_64.tar.xz",
+          "sha256": "55064b60b991a1e1e8090b8c2f84e82b22cfe5903d12c159d65064cf5e8ae335"
+        },
+        "win32-x64": {
+          "asset": "llvm-mingw-20261020-ucrt-x86_64.zip",
+          "sha256": "fd5462b7f5d93b2ff981fcd3f9c7e427e47f3203c64ea91c27bcc444eebd74cd"
+        }
+      }
+    },
+    "spidermonkey": {
+      "release": "v152.0.4-aistudio2api.1",
+      "repository": "Mag1cFall/firefox",
+      "targets": {
+        "darwin-arm64": {
+          "asset": "spidermonkey-v152.0.4-aistudio2api.1-darwin-arm64.tar.gz",
+          "sha256": "19f690d52ce2cfe7dbaedcc9771976145fff0dbd81f24e89a2dd094a1424b673"
+        },
+        "darwin-x64": {
+          "asset": "spidermonkey-v152.0.4-aistudio2api.1-darwin-amd64.tar.gz",
+          "sha256": "8063d69f56711c72b1244c8415b6c5096aa64ae8b022f555722667531acfe659"
+        },
+        "linux-x64": {
+          "asset": "spidermonkey-v152.0.4-aistudio2api.1-linux-amd64.tar.gz",
+          "sha256": "d3ecebf1890355426ad261ab8723038849a524b348af53e1bb440ca53cc2cacb"
+        },
+        "linux-arm64": {
+          "asset": "spidermonkey-v152.0.4-aistudio2api.1-linux-arm64.tar.gz",
+          "sha256": "b3c9539b8d8378d99f86b267e0e3d007dd01ff80acebf4f52f3e1d6ac04d9d00"
+        },
+        "win32-x64": {
+          "asset": "spidermonkey-v152.0.4-aistudio2api.1-windows-amd64.tar.gz",
+          "sha256": "942a3b57b202f899d799cac678b7471d01d0b34714070f0810c18fca37ffd721"
+        }
+      }
+    },
+    "libwebp": {
+      "release": "v1.6.0-aistudio2api.1",
+      "repository": "Mag1cFall/libwebp",
+      "targets": {
+        "darwin-arm64": {
+          "asset": "libwebp-v1.6.0-aistudio2api.1-darwin-arm64.tar.gz",
+          "sha256": "66394cee457fe48408718c2dafd34808077f446a25678d54b4c504f711e579a6"
+        },
+        "darwin-x64": {
+          "asset": "libwebp-v1.6.0-aistudio2api.1-darwin-amd64.tar.gz",
+          "sha256": "d526ba604c0d2937122587eee4d13a01edd7c6c3e7e6bfdc72ab453ab18ae89f"
+        },
+        "linux-x64": {
+          "asset": "libwebp-v1.6.0-aistudio2api.1-linux-amd64.tar.gz",
+          "sha256": "d5047d17eace8b9639a08786b750e46ee83a1f251b7b961cd0f049371974ab78"
+        },
+        "linux-arm64": {
+          "asset": "libwebp-v1.6.0-aistudio2api.1-linux-arm64.tar.gz",
+          "sha256": "299028ab369a7f8b34feefd41f68cebdc6118c1306d37a57731da9503cd64084"
+        },
+        "win32-x64": {
+          "asset": "libwebp-v1.6.0-aistudio2api.1-windows-amd64.tar.gz",
+          "sha256": "ca38ca4cfae9bfe5808dbcfa11707d81efd534d723d2b7622cd32ef1114dea1d"
+        }
+      }
+    }
+  },
+  "upstream": {
+    "version": "0.3.5",
+    "repository": "https://github.com/Mag1cFall/AIStudio2API.git",
+    "commit": "bab7209eef0d5a8f9baed4652d7e4158a3adad7b",
+    "camoufox": "152.0.4-beta.29"
+  },
+  "patches": [
+    "studio-0.2.17-preserve-request-bodies.patch",
+    "studio-0.2.19-managed-config.patch",
+    "studio-0.3.4-magpie-signin.patch",
+    "studio-0.3.5-signin-reauth.patch"
+  ],
+  "binaries": {
+    "darwin-arm64": {
+      "asset": "aistudio2api-v0.3.5-magpie.1-darwin-arm64.tar.gz",
+      "sha256": "1fa2d437da8dc3a87b1d669e8d693e96d55868895f54fd1a64aa4776e157aec9",
+      "binarySha256": "ca676c94b0ad767cb91cba6a03797dd3d2d923fde21155324432917504e82cc8"
+    },
+    "darwin-x64": {
+      "asset": "aistudio2api-v0.3.5-magpie.1-darwin-amd64.tar.gz",
+      "sha256": "a028d74255bb4876cb4f2b6e4435e15e5f87e716f1e6dc135eea8a9f7b21a906",
+      "binarySha256": "f6de8169393aa88aa25d0296503377c85b7ee68f3705dc33731ae95b6a468bca"
+    },
+    "linux-x64": {
+      "asset": "aistudio2api-v0.3.5-magpie.1-linux-amd64.tar.gz",
+      "sha256": "1c848849b4eb83603029319b6044096ecc41e967fd3094b3088c234bd6981566",
+      "binarySha256": "f5e523f13f6b807be33547a336b19aaa2376b444b1fef9aa58a23cd1a9a87106"
+    },
+    "linux-arm64": {
+      "asset": "aistudio2api-v0.3.5-magpie.1-linux-arm64.tar.gz",
+      "sha256": "9e6a489c5500b34f580eeb50084fce3bfcb650fd0ea4efd008d87f4f8512289c",
+      "binarySha256": "7528407d1f44f6acb9a0dad59e8985ac7b1598f863ff90bd04f9ac83046bd730"
+    },
+    "win32-x64": {
+      "asset": "aistudio2api-v0.3.5-magpie.1-windows-amd64.zip",
+      "sha256": "b219d8edd341b6bfd2f701811ce5d579742f98b1595d4a2dbc015db09b8718fe",
+      "binarySha256": "e76be0e4902d2eed3dd2ca4182c090135f97fbdfa07a1fa26c2094075549ee0c"
+    }
+  }
+}

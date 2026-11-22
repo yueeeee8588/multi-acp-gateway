@@ -1,0 +1,8 @@
+Upstream Repository: https://github.com/BUKOWSKIREAL/magpie-gemini-web
+Branch: main
+Commit SHA: 6fdc899a37321226ccfb52adb2ac8b43f8ef2feb
+Commit Author: Ruijia Zhang
+Commit Date: Fri Nov 20 17:30:46 2026 +0800
+Commit Subject: docs: add contribution and issue reporting guide
+Synced At: 2026-11-22
+Notes: Nested .git removed to keep outer git worktree clean.

@@ -1,0 +1,30 @@
+name: Verify published package
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Tag or commit SHA to verify
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Compare public npm and GitHub packages
+        run: node scripts/verify-published-package.mjs --attempts 15 --retry-ms 10000 --out-dir published-package
+      - name: Install and start the publicly distributed package
+        run: |
+          tar -xzf published-package/package.tgz -C published-package
+          node scripts/backend-smoke.mjs --download --package-root=published-package/package

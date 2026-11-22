@@ -1,0 +1,1793 @@
+import { describe, it, before, after } from 'node:test';
+import assert from 'node:assert/strict';
+import http from 'node:http';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import crypto from 'node:crypto';
+import { spawn, execFileSync } from 'node:child_process';
+import {
+  studioDataDir,
+  localStudio,
+  installStudio,
+  ensureStudio,
+  studioAdmin,
+  studioAccounts,
+  stopStudio,
+  studioStatus,
+  ensureStudioConfig,
+  serviceEnv,
+  readStudioEnv,
+  saveStudioProxy,
+  studioProxy,
+  nodeFetch,
+  redactProxy,
+  validateConfig,
+  validateProxy,
+  verifyProcessIdentity,
+  computeFileHash,
+  checkStudioHealth,
+  isConnectRefused,
+  pickStudioPort,
+  studioCommand,
+  studioProcessPids,
+  studioListenerPids,
+  setupStep,
+  downloadProgress,
+  camoufoxState,
+  parseAccountOrder,
+  validateAccountOrder,
+  parseModelAccounts,
+  validateModelAccounts
+} from '../lib/studio-native.mjs';
+import { STUDIO_VERSION, PINNED_ARCHIVES, CAMOUFOX_VERSION } from './helpers/studio-legacy.mjs';
+import { officialArchive } from './helpers/studio-official.mjs';
+import { proxyLine } from '../lib/studio.mjs';
+import { openProgressPage } from '../lib/studio-page.mjs';
+
+const offlineFetch = async () => { throw Object.assign(new Error('offline fixture'), {code:'ECONNREFUSED'}); };
+
+// An earlier install of the service, answering this setup's admin login as v0.2.11.
+const earlierVersionFetch = async (url) => {
+  if (url.includes('/api/auth/login')) {
+    return new Response('{}', { headers: { 'Set-Cookie': 'aistudio_admin=t; Path=/', 'Content-Type': 'application/json' } });
+  }
+  if (url.includes('/api/status')) {
+    return Response.json({ version: 'v0.2.11', running: true, ready: true, state: 'RUNNING', accounts: { total: 1, ready: 1 } });
+  }
+  return Response.json({ object: 'list', data: [] });
+};
+
+// Source of a stand-in service run by a copy of node at the binary's path, answering as VERSION.
+const STAND_IN_SERVICE = `
+const http = require('node:http');
+http.createServer((req, res) => {
+  const json = body => { res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(body)); };
+  if (req.url === '/api/auth/login') {
+    res.writeHead(200, { 'Set-Cookie': 'aistudio_admin=s; Path=/', 'Content-Type': 'application/json' });
+    return res.end('{}');
+  }
+  if (req.url === '/api/status') return json({ version: process.env.VERSION, ready: true, running: true, state: 'RUNNING', accounts: { total: 1, ready: 1 } });
+  if (req.url === '/v1/models') return json({ object: 'list', data: [] });
+  if (req.url === '/api/control/stop') return json({});
+  res.writeHead(404);
+  res.end();
+}).listen(Number(process.env.PORT), '127.0.0.1');
+`;
+
+// adminFetch answers as this setup's service, reporting statusBody() and calling onStart for
+// each request to start generation.
+function adminFetch(statusBody, onStart = () => {}) {
+  return async (url) => {
+    if (url.includes('/api/auth/login')) {
+      return new Response('{}', { headers: { 'Set-Cookie': 'aistudio_admin=t; Path=/', 'Content-Type': 'application/json' } });
+    }
+    if (url.includes('/api/control/start')) {
+      onStart();
+      return Response.json({});
+    }
+    if (url.includes('/api/status')) return Response.json(statusBody());
+    return Response.json({ object: 'list', data: [] });
+  };
+}
+
+const runningStatus = accounts => ({ version: STUDIO_VERSION, state: 'RUNNING', running: true, ready: accounts.ready + accounts.busy > 0, accounts });
+const launchingStatus = (state, accounts) => ({ version: STUDIO_VERSION, state, running: false, ready: false, accounts });
+
+async function freePort() {
+  const server = http.createServer();
+  await new Promise(r => server.listen(0, '127.0.0.1', r));
+  const { port } = server.address();
+  await new Promise(r => server.close(r));
+  return port;
+}
+
+function writeValidManifest(dataDir, bin) {
+  const pin = PINNED_ARCHIVES[`${process.platform}-${process.arch}`];
+  fs.writeFileSync(path.join(dataDir, 'install-manifest.json'), JSON.stringify({
+    version: STUDIO_VERSION.slice(1),
+    platform: process.platform,
+    arch: process.arch,
+    archiveSha256: pin.sha256,
+    binarySha256: computeFileHash(bin)
+  }, null, 2) + '\n', { mode: 0o600 });
+}
+
+describe('AI Studio Native Lifecycle & Safety Unit Tests', () => {
+  let tmpRoot, official;
+
+  before(() => {
+    tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'magpie-studio-native-test-'));
+    official = officialArchive(path.join(tmpRoot, 'official-fixture'));
+  });
+
+  after(() => {
+    if (tmpRoot) {
+      // Some fixtures simulate historical read-only package directories.
+      for (const entry of fs.readdirSync(tmpRoot)) {
+        const pkg = path.join(tmpRoot, entry, 'package');
+        if (fs.existsSync(pkg)) fs.chmodSync(pkg, 0o755);
+      }
+      fs.rmSync(tmpRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('1. connection settings are private and upstream owns generation defaults', () => {
+    const dataDir = path.join(tmpRoot, 'env-recipe-test');
+    const config = ensureStudioConfig(dataDir);
+    const envContent = fs.readFileSync(path.join(dataDir, '.env'), 'utf8');
+
+    for (const key of ['WAA_BACKEND', 'UPSTREAM_CHANNELS', 'BUILD_NATIVE_NONSTREAM', 'NONSTREAM_KEEPALIVE', 'PER_ACCOUNT_CONCURRENCY', 'WARM_WORKER_LIMIT', 'MAX_ACTIVE_WORKERS', 'REQUEST_TIMEOUT', 'INIT_TIMEOUT', 'SEARCH_MODEL_ALIASES', 'FIRST_EVENT_HEDGE']) {
+      assert.equal(readStudioEnv(dataDir)[key], undefined, `${key} must use the backend default`);
+    }
+    assert.ok(envContent.includes(`LISTEN_ADDR=127.0.0.1:${config.port}`));
+    assert.ok(envContent.includes('PREVIEW_LISTEN_ADDR=127.0.0.1:2050'));
+    assert.ok(envContent.includes(`PROXY_API_KEY=${config.apiKey}`));
+    assert.ok(envContent.includes(`ADMIN_PASSWORD=${config.adminPassword}`));
+
+    // The service is started with this plugin's settings only; PROXY when the plugin sets one
+    const env = serviceEnv(dataDir, config, { proxy: 'http://127.0.0.1:1082' });
+    assert.equal(env.PROXY, 'http://127.0.0.1:1082');
+    assert.equal(env.LISTEN_ADDR, `127.0.0.1:${config.port}`);
+    assert.equal(env.REQUEST_TIMEOUT, undefined, 'a setting the admin page owns is not passed over .env');
+  });
+
+  it('1b. .env keeps what the admin page saved, and only this plugin\'s settings are written over', () => {
+    const dataDir = path.join(tmpRoot, 'env-owner-test');
+    const config = ensureStudioConfig(dataDir);
+    const envPath = path.join(dataDir, '.env');
+    assert.equal(readStudioEnv(dataDir).PROXY, '', 'a new setup saves no proxy');
+
+    // As the admin page saves it: every key, its own values, one quoted
+    const saved = readStudioEnv(dataDir);
+    Object.assign(saved, {
+      PROXY: 'socks5://127.0.0.1:7890',
+      REQUEST_TIMEOUT: '45m',
+      STRIP_THOUGHT_SIGNATURES: 'true',
+      HIDE_DOCK_ICON: 'true',
+      FIRST_EVENT_HEDGE: 'auto',
+      FIRST_EVENT_HEDGE_MODELS: 'gemini-4-argon,gemini-3.8-flash',
+      API_KEY_ACCOUNTS: `${config.apiKey}:test@example.com`,
+      ACCOUNT_ORDER: 'b@example.com,a@example.com',
+      MAX_ACCOUNT_SWITCHES: '5',
+      DISCOVER_HIDDEN_MODELS: 'true',
+      MODEL_ACCOUNTS: 'gemini-3.1-pro-preview:b@example.com|a@example.com',
+      MODEL_MAPPING: 'a=b',
+      LISTEN_ADDR: '127.0.0.1:1',
+      ADMIN_PASSWORD: 'changed'
+    });
+    fs.writeFileSync(envPath, Object.entries(saved).map(([k, v]) => `${k}=${v}`).join('\n') + '\nROUTING_STRATEGY="round robin"\n');
+
+    ensureStudioConfig(dataDir, 'http://127.0.0.1:9393', {
+      accountOrder: 'x@example.com',
+      modelAccounts: 'gemini-3-flash-preview:x@example.com'
+    });
+    const after = readStudioEnv(dataDir);
+    assert.equal(after.PROXY, 'socks5://127.0.0.1:7890', 'the saved proxy is kept over one given');
+    assert.equal(after.REQUEST_TIMEOUT, '45m');
+    assert.equal(after.STRIP_THOUGHT_SIGNATURES, 'true');
+    assert.equal(after.HIDE_DOCK_ICON, 'true');
+    assert.equal(after.FIRST_EVENT_HEDGE, 'auto');
+    assert.equal(after.FIRST_EVENT_HEDGE_MODELS, saved.FIRST_EVENT_HEDGE_MODELS);
+    assert.equal(after.API_KEY_ACCOUNTS, saved.API_KEY_ACCOUNTS);
+    assert.equal(after.ACCOUNT_ORDER, saved.ACCOUNT_ORDER, 'admin-saved ACCOUNT_ORDER is kept over initial option');
+    assert.equal(after.MAX_ACCOUNT_SWITCHES, '5');
+    assert.equal(after.DISCOVER_HIDDEN_MODELS, 'true');
+    assert.equal(after.MODEL_ACCOUNTS, saved.MODEL_ACCOUNTS, 'admin-saved MODEL_ACCOUNTS is kept over initial option');
+    assert.equal(after.MODEL_MAPPING, 'a=b');
+    assert.equal(after.ROUTING_STRATEGY, 'round robin');
+    assert.equal(after.LISTEN_ADDR, `127.0.0.1:${config.port}`, 'this plugin\'s settings are its own');
+    assert.equal(after.ADMIN_PASSWORD, config.adminPassword);
+
+    saveStudioProxy(dataDir, 'http://127.0.0.1:1082');
+    assert.equal(readStudioEnv(dataDir).PROXY, 'http://127.0.0.1:1082');
+    assert.equal(readStudioEnv(dataDir).REQUEST_TIMEOUT, '45m');
+    assert.equal(readStudioEnv(dataDir).STRIP_THOUGHT_SIGNATURES, 'true');
+    assert.equal(readStudioEnv(dataDir).HIDE_DOCK_ICON, 'true');
+    assert.equal(readStudioEnv(dataDir).FIRST_EVENT_HEDGE, 'auto');
+    assert.equal(readStudioEnv(dataDir).FIRST_EVENT_HEDGE_MODELS, saved.FIRST_EVENT_HEDGE_MODELS);
+    assert.equal(readStudioEnv(dataDir).API_KEY_ACCOUNTS, saved.API_KEY_ACCOUNTS);
+    assert.equal(readStudioEnv(dataDir).ACCOUNT_ORDER, saved.ACCOUNT_ORDER);
+    assert.equal(readStudioEnv(dataDir).MAX_ACCOUNT_SWITCHES, '5');
+    assert.equal(readStudioEnv(dataDir).DISCOVER_HIDDEN_MODELS, 'true');
+    assert.equal(readStudioEnv(dataDir).MODEL_ACCOUNTS, saved.MODEL_ACCOUNTS);
+  });
+
+  it('1c. a missing PROXY, ACCOUNT_ORDER, or MODEL_ACCOUNTS is seeded from options when .env has none', () => {
+    const dataDir = path.join(tmpRoot, 'env-legacy-proxy-test');
+    fs.mkdirSync(dataDir, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(path.join(dataDir, 'config.json'), JSON.stringify({ version: 1, port: 2048, apiKey: 'k', adminUsername: 'u', adminPassword: 'p', proxy: 'http://127.0.0.1:1082' }));
+    ensureStudioConfig(dataDir);
+    assert.equal(readStudioEnv(dataDir).PROXY, 'http://127.0.0.1:1082');
+    assert.equal(readStudioEnv(dataDir).PER_ACCOUNT_CONCURRENCY, '1', 'an existing configuration retains legacy defaults');
+
+    const fresh = path.join(tmpRoot, 'env-seed-proxy-test');
+    ensureStudioConfig(fresh, 'socks5://127.0.0.1:7890', {
+      accountOrder: ['b@example.com', 'a@example.com'],
+      modelAccounts: { 'gemini-3.1-pro-preview': ['b@example.com', 'a@example.com'] }
+    });
+    assert.equal(readStudioEnv(fresh).PROXY, 'socks5://127.0.0.1:7890');
+    assert.equal(readStudioEnv(fresh).ACCOUNT_ORDER, 'b@example.com,a@example.com');
+    assert.equal(readStudioEnv(fresh).MODEL_ACCOUNTS, 'gemini-3.1-pro-preview:b@example.com|a@example.com');
+    assert.equal('proxy' in JSON.parse(fs.readFileSync(path.join(fresh, 'config.json'), 'utf8')), false, 'config.json keeps no proxy');
+
+    // Empty ACCOUNT_ORDER= / MODEL_ACCOUNTS= written by an earlier Admin UI save can still be seeded
+    const emptyRouting = path.join(tmpRoot, 'env-empty-routing-test');
+    ensureStudioConfig(emptyRouting);
+    fs.appendFileSync(path.join(emptyRouting, '.env'), 'ACCOUNT_ORDER=\nMODEL_ACCOUNTS=\n');
+    ensureStudioConfig(emptyRouting, '', {
+      accountOrder: 'c@example.com,a@example.com',
+      modelAccounts: 'gemini-3-flash-preview:c@example.com'
+    });
+    assert.equal(readStudioEnv(emptyRouting).ACCOUNT_ORDER, 'c@example.com,a@example.com');
+    assert.equal(readStudioEnv(emptyRouting).MODEL_ACCOUNTS, 'gemini-3-flash-preview:c@example.com');
+
+    assert.deepEqual(parseAccountOrder(' b@g.com , a@g.com , b@g.com '), ['b@g.com', 'a@g.com']);
+    assert.equal(validateAccountOrder(['b@g.com', 'a@g.com', 'b@g.com']), 'b@g.com,a@g.com');
+    assert.equal(validateModelAccounts({ 'gemini-3.1-pro-preview': ['b@g.com', 'a@g.com'], 'gemini-3-flash-preview': 'c@g.com' }), 'gemini-3.1-pro-preview:b@g.com|a@g.com,gemini-3-flash-preview:c@g.com');
+    assert.deepEqual([...parseModelAccounts('gemini-3.1-pro-preview:b@g.com|a@g.com').entries()], [['gemini-3.1-pro-preview', ['b@g.com', 'a@g.com']]]);
+    assert.throws(() => validateModelAccounts('gemini-3.1-pro-preview'), /Invalid studio\.modelAccounts entry/);
+    assert.throws(() => validateModelAccounts('gemini-3.1-pro-preview:a@g.com:b@g.com'), /Invalid studio\.modelAccounts entry/);
+  });
+
+  it('1d. studioProxy tells the proxy the service goes out through, where from, and what applies one set', async () => {
+    const dataDir = path.join(tmpRoot, 'proxy-status-test');
+    installedStandIn('proxy-status-test');
+    ensureStudioConfig(dataDir);
+    saveStudioProxy(dataDir, 'socks5://127.0.0.1:7890');
+    const local = localStudio({ dataDir });
+    const withConfig = cfg => async url => {
+      if (url.includes('/api/auth/login')) {
+        return new Response('{}', { headers: { 'Set-Cookie': 'aistudio_admin=t; Path=/', 'Content-Type': 'application/json' } });
+      }
+      if (url.endsWith('/api/config')) return Response.json(cfg);
+      throw new Error(`unexpected ${url}`);
+    };
+    const savedEnv = process.env.AI_STUDIO_PROXY;
+    try {
+      delete process.env.AI_STUDIO_PROXY;
+      // Started by an older plugin with PROXY="" in its environment, which hides the saved one: the
+      // service falls back to the system's proxy. A restart applies the saved one.
+      let p = await studioProxy(local, { fetchFn: withConfig({ proxy: '', active_proxy: 'http://127.0.0.1:9393' }) });
+      assert.deepEqual(p, { active: 'http://127.0.0.1:9393', source: 'startup', saved: 'socks5://127.0.0.1:7890', overridden: null, wanted: 'socks5://127.0.0.1:7890', wantedSource: 'saved', pending: 'restart' });
+      // The CLI can't promise that: with no record of whose PROXY the service was started with,
+      // starting it from Magpie again may set it again
+      p = await studioProxy(local, { standalone: true, fetchFn: withConfig({ proxy: '', active_proxy: 'http://127.0.0.1:9393' }) });
+      assert.deepEqual([p.overridden, p.pending], ['unknown', 'restart']);
+
+      // Saved in the admin page, not yet in the generation service
+      p = await studioProxy(local, { fetchFn: withConfig({ proxy: 'socks5://127.0.0.1:7890', active_proxy: 'http://127.0.0.1:9393' }) });
+      assert.equal(p.pending, 'generation');
+
+      p = await studioProxy(local, { fetchFn: withConfig({ proxy: 'socks5://127.0.0.1:7890', active_proxy: 'socks5://127.0.0.1:7890' }) });
+      assert.deepEqual([p.active, p.source, p.pending, p.overridden], ['socks5://127.0.0.1:7890', 'saved', null, null]);
+
+      // studio.proxy is set over the saved one, and says the saved one doesn't apply
+      p = await studioProxy(local, { proxy: 'http://u:secret@127.0.0.1:1082', fetchFn: withConfig({ proxy: 'http://u:secret@127.0.0.1:1082', active_proxy: 'http://u:secret@127.0.0.1:1082' }) });
+      assert.deepEqual([p.active, p.source, p.pending, p.overridden], ['http://u:***@127.0.0.1:1082', 'option', null, 'option']);
+
+      // The CLI reads whose it was from the record of the service's start: no restart applies the
+      // saved one while studio.proxy is set
+      fs.writeFileSync(path.join(dataDir, 'backend.pid'), '4242\n');
+      fs.writeFileSync(path.join(dataDir, 'backend.launch.json'), JSON.stringify({ pid: 4242, proxy: 'option' }));
+      p = await studioProxy(local, { standalone: true, fetchFn: withConfig({ proxy: 'http://127.0.0.1:1082', active_proxy: 'http://127.0.0.1:1082' }) });
+      assert.deepEqual([p.source, p.pending, p.overridden], ['option', null, 'option']);
+      // A record of another process tells nothing
+      fs.writeFileSync(path.join(dataDir, 'backend.pid'), '4243\n');
+      p = await studioProxy(local, { standalone: true, fetchFn: withConfig({ proxy: 'http://127.0.0.1:1082', active_proxy: 'http://127.0.0.1:1082' }) });
+      assert.deepEqual([p.overridden, p.pending], ['unknown', 'restart']);
+      fs.rmSync(path.join(dataDir, 'backend.pid'));
+
+      // Nothing saved: the system's proxy, or none
+      saveStudioProxy(dataDir, '');
+      p = await studioProxy(local, { fetchFn: withConfig({ proxy: '', active_proxy: 'http://127.0.0.1:9393', service_restart_required: false }) });
+      assert.deepEqual([p.source, p.pending], ['system', null]);
+      // Unless an older plugin started it, whose launch record doesn't say proxyEnv: then it may be
+      // one from its environment (Magpie's, a shell's) or the system's, and only that is said
+      fs.writeFileSync(path.join(dataDir, 'backend.pid'), '4242\n');
+      fs.writeFileSync(path.join(dataDir, 'backend.launch.json'), JSON.stringify({ pid: 4242, proxy: null }));
+      p = await studioProxy(local, { standalone: true, fetchFn: withConfig({ proxy: '', active_proxy: 'http://127.0.0.1:9393', service_restart_required: false }) });
+      assert.deepEqual([p.source, p.pending], ['legacy', null]);
+      const line = proxyLine(p, local);
+      assert.match(line, /^http:\/\/127\.0\.0\.1:9393（旧版插件启动的服务自动检测到的，可能来自启动时的环境变量或系统代理设置）。/);
+      assert.match(line, /重启本地服务（.+ stop .+）后就不再使用它，改按管理页设置；如果来自系统代理设置，重启后仍会使用$/);
+      assert.doesNotMatch(line, /Magpie 代理/, 'nothing kept says the proxy is Magpie\'s');
+      fs.writeFileSync(path.join(dataDir, 'backend.launch.json'), JSON.stringify({ pid: 4242, proxy: null, proxyEnv: 'none' }));
+      p = await studioProxy(local, { standalone: true, fetchFn: withConfig({ proxy: '', active_proxy: 'http://127.0.0.1:9393', service_restart_required: false }) });
+      assert.equal(p.source, 'system');
+      fs.rmSync(path.join(dataDir, 'backend.pid'));
+      p = await studioProxy(local, { fetchFn: withConfig({ proxy: '', active_proxy: '' }) });
+      assert.deepEqual([p.active, p.source], ['', 'direct']);
+      // Cleared in the admin page while the generation service still goes out through the old one,
+      // which a fallback to the system's proxy can't be told from
+      p = await studioProxy(local, { fetchFn: withConfig({ proxy: '', active_proxy: 'socks5://127.0.0.1:7890', service_restart_required: true }) });
+      assert.deepEqual([p.source, p.pending], ['unknown', 'generation']);
+    } finally {
+      if (savedEnv === undefined) delete process.env.AI_STUDIO_PROXY;
+      else process.env.AI_STUDIO_PROXY = savedEnv;
+    }
+    assert.equal(redactProxy('http://a:b@h:1, socks5://h:2'), 'http://a:***@h:1,socks5://h:2');
+  });
+
+  it('2. ensureStudioConfig throws on malformed config and preserves bytes without replacement', () => {
+    const dataDir = path.join(tmpRoot, 'corrupt-config-test');
+    fs.mkdirSync(dataDir, { recursive: true, mode: 0o700 });
+    const configPath = path.join(dataDir, 'config.json');
+
+    // Invalid JSON
+    const malformedBytes = '{"port": 2048, INVALID_JSON';
+    fs.writeFileSync(configPath, malformedBytes, { mode: 0o600 });
+    assert.throws(() => ensureStudioConfig(dataDir), /Invalid JSON/);
+    assert.equal(fs.readFileSync(configPath, 'utf8'), malformedBytes, 'Malformed bytes must be preserved');
+
+    // Unsupported version
+    fs.writeFileSync(configPath, JSON.stringify({ version: 2, port: 2048, apiKey: 'k', adminUsername: 'u', adminPassword: 'p', proxy: '' }), { mode: 0o600 });
+    assert.throws(() => ensureStudioConfig(dataDir), /Unsupported configuration version/);
+
+    // Invalid port
+    fs.writeFileSync(configPath, JSON.stringify({ version: 1, port: 99999, apiKey: 'k', adminUsername: 'u', adminPassword: 'p', proxy: '' }), { mode: 0o600 });
+    assert.throws(() => ensureStudioConfig(dataDir), /Invalid port number/);
+  });
+
+  it('3. private POSIX file modes for directories and generated config', { skip: process.platform === 'win32' }, () => {
+    const dataDir = path.join(tmpRoot, 'modes-test');
+    ensureStudioConfig(dataDir);
+
+    const dirStat = fs.statSync(dataDir);
+    assert.equal(dirStat.mode & 0o777, 0o700, 'Data dir mode must be 0700');
+
+    const configStat = fs.statSync(path.join(dataDir, 'config.json'));
+    assert.equal(configStat.mode & 0o777, 0o600, 'config.json mode must be 0600');
+
+    const envStat = fs.statSync(path.join(dataDir, '.env'));
+    assert.equal(envStat.mode & 0o777, 0o600, '.env mode must be 0600');
+
+    const authStat = fs.statSync(path.join(dataDir, 'auth'));
+    assert.equal(authStat.mode & 0o777, 0o700, 'auth dir mode must be 0700');
+  });
+
+  it('4. admin cookie authentication 401 renewal and redirect refusal', async () => {
+    let requests = [];
+    let loginCount = 0;
+    let cookieCount = 0;
+
+    const server = http.createServer((req, res) => {
+      let body = '';
+      req.on('data', chunk => { body += chunk; });
+      req.on('end', () => {
+        requests.push({ url: req.url, method: req.method, headers: req.headers });
+
+        if (req.url === '/api/auth/login') {
+          loginCount++;
+          res.writeHead(200, {
+            'Set-Cookie': `aistudio_admin=cookie_session_${loginCount}; Path=/; HttpOnly`,
+            'Content-Type': 'application/json'
+          });
+          res.end(JSON.stringify({ authenticated: true }));
+          return;
+        }
+
+        if (req.url === '/api/status') {
+          const cookie = req.headers.cookie;
+          if (cookie === 'aistudio_admin=cookie_session_1') {
+            // First cookie expired
+            res.writeHead(401, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'unauthorized' }));
+            return;
+          }
+          if (cookie === 'aistudio_admin=cookie_session_2') {
+            cookieCount++;
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ status: 'ok', version: STUDIO_VERSION, running: true, ready: true, accounts: { total: 1, ready: 1 } }));
+            return;
+          }
+          res.writeHead(401);
+          res.end();
+          return;
+        }
+
+        if (req.url === '/api/redirect') {
+          res.writeHead(302, { 'Location': 'http://127.0.0.1/evil' });
+          res.end();
+          return;
+        }
+
+        res.writeHead(404);
+        res.end();
+      });
+    });
+
+    await new Promise(r => server.listen(0, '127.0.0.1', r));
+    const port = server.address().port;
+    const local = {
+      origin: `http://127.0.0.1:${port}`,
+      baseURL: `http://127.0.0.1:${port}/v1`,
+      adminUsername: 'magpie',
+      adminPassword: 'pw'
+    };
+
+    try {
+      const status = await studioAdmin(local, 'GET', '/api/status');
+      assert.equal(status.status, 'ok');
+      assert.equal(loginCount, 2, 'Should have logged in twice due to 401 renewal');
+      assert.equal(cookieCount, 1);
+
+      // Redirect refusal
+      await assert.rejects(async () => {
+        await studioAdmin(local, 'GET', '/api/redirect');
+      }, /returned redirect; foreign listener detected/);
+    } finally {
+      server.close();
+    }
+  });
+
+  it('5. status does not auto-start a stopped service', async () => {
+    const dataDir = path.join(tmpRoot, 'status-no-start');
+    ensureStudioConfig(dataDir);
+    // Package exists but service is stopped
+    const pkgDir = path.join(dataDir, 'package');
+    fs.mkdirSync(pkgDir, { recursive: true, mode: 0o700 });
+    const bin = path.join(pkgDir, process.platform === 'win32' ? 'aistudio2api.exe' : 'aistudio2api');
+    fs.writeFileSync(bin, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+
+    const status = await studioStatus({ dataDir, fetchFn: offlineFetch });
+    assert.equal(status.status, 'stopped');
+    assert.ok(!fs.existsSync(path.join(dataDir, 'backend.pid')), 'Must not have started process');
+  });
+
+  it('6. foreign listener is not spawned or stopped, and foreign status is reported', async () => {
+    // Start a server that returns 401 on login
+    const foreignServer = http.createServer((req, res) => {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'unauthorized' }));
+    });
+    await new Promise(r => foreignServer.listen(0, '127.0.0.1', r));
+    const port = foreignServer.address().port;
+
+    const dataDir = path.join(tmpRoot, 'foreign-listener-test');
+    fs.mkdirSync(dataDir, { recursive: true, mode: 0o700 });
+    const config = {
+      version: 1,
+      port,
+      apiKey: 'test-key',
+      adminUsername: 'magpie',
+      adminPassword: 'wrong-password',
+      proxy: ''
+    };
+    fs.writeFileSync(path.join(dataDir, 'config.json'), JSON.stringify(config, null, 2) + '\n', { mode: 0o600 });
+    const pkgDir = path.join(dataDir, 'package');
+    fs.mkdirSync(pkgDir, { recursive: true, mode: 0o700 });
+    const bin = path.join(pkgDir, process.platform === 'win32' ? 'aistudio2api.exe' : 'aistudio2api');
+    fs.writeFileSync(bin, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+
+    try {
+      const status = await studioStatus({ dataDir });
+      assert.equal(status.status, 'foreign', 'Must identify foreign listener');
+
+      let spawned = false;
+      const fakeSpawn = () => { spawned = true; return { pid: 99999, on: () => {}, unref: () => {} }; };
+
+      await assert.rejects(async () => {
+        await ensureStudio({ dataDir, spawnFn: fakeSpawn });
+      }, /already used by another service/);
+      assert.equal(spawned, false, 'Must not spawn over foreign listener');
+
+      // Stop refuses foreign
+      await assert.rejects(async () => {
+        await stopStudio({ dataDir });
+      }, /foreign/);
+    } finally {
+      foreignServer.close();
+    }
+  });
+
+  for (const denied of [false, true]) it(`7. reused PID is cleared on stop and startup without signaling its owner${denied ? ' (EPERM)' : ''}`, async t => {
+    const { dataDir } = installedStandIn(`reused-pid-${denied}`);
+    const pidFile = path.join(dataDir, 'backend.pid');
+    const unrelatedChild = spawn(process.execPath, ['-e', 'setInterval(()=>{},1000)'], { stdio: 'ignore' });
+    const exited = new Promise(resolve => unrelatedChild.once('exit', resolve));
+    const unrelatedPid = unrelatedChild.pid;
+    const kill = process.kill.bind(process);
+    const probe = t.mock.method(process, 'kill', (pid, signal) => {
+      if (pid === unrelatedPid) {
+        assert.equal(signal, 0, 'must never signal an unrelated process');
+        if (denied) throw Object.assign(new Error('permission denied'), { code: 'EPERM' });
+      }
+      return kill(pid, signal);
+    });
+    try {
+      fs.writeFileSync(pidFile, `${unrelatedPid}\n`);
+      assert.deepEqual(await stopStudio({ dataDir, fetchFn: offlineFetch }), { stopped: true });
+      assert.equal(fs.existsSync(pidFile), false);
+      assert.equal(kill(unrelatedPid, 0), true, 'unrelated process survives stop');
+
+      // Startup must also recover directly, without requiring a preceding stop.
+      fs.writeFileSync(pidFile, `${unrelatedPid}\n`);
+      let spawned = 0;
+      const up = adminFetch(() => runningStatus({ total: 1, ready: 1, busy: 0 }));
+      const local = await ensureStudio({
+        dataDir,
+        fetchFn: (...args) => spawned ? up(...args) : offlineFetch(...args),
+        spawnFn: () => {
+          assert.equal(fs.existsSync(pidFile), false, 'stale record is removed before launch');
+          spawned++;
+          return { unref() {} };
+        }
+      });
+      assert.equal(local.dataDir, dataDir);
+      assert.equal(spawned, 1);
+      assert.equal(kill(unrelatedPid, 0), true, 'unrelated process survives startup');
+
+      fs.writeFileSync(pidFile, `${unrelatedPid}\n`);
+      await assert.rejects(installStudio({ dataDir, fetchFn: offlineFetch }), /ECONNREFUSED/);
+      assert.equal(fs.existsSync(pidFile), false, 'install also discards the reused PID before attempting download');
+      assert.equal(kill(unrelatedPid, 0), true, 'unrelated process survives install');
+    } finally {
+      probe.mock.restore();
+      unrelatedChild.kill('SIGKILL');
+      await exited;
+    }
+  });
+
+  it('8. a user-updated local binary starts unchanged without downloading or rewriting install history', async () => {
+    const dataDir = path.join(tmpRoot, 'mutated-binary-test');
+    ensureStudioConfig(dataDir);
+    const pkgDir = path.join(dataDir, 'package');
+    fs.mkdirSync(pkgDir, { recursive: true, mode: 0o700 });
+    const bin = path.join(pkgDir, process.platform === 'win32' ? 'aistudio2api.exe' : 'aistudio2api');
+    fs.writeFileSync(bin, '#!/bin/sh\necho ok\n', { mode: 0o755 });
+
+    const pin = PINNED_ARCHIVES[`${process.platform}-${process.arch}`];
+    const manifest = {
+      version: STUDIO_VERSION.slice(1),
+      platform: process.platform,
+      arch: process.arch,
+      archiveSha256: pin.sha256,
+      binarySha256: computeFileHash(bin)
+    };
+    fs.writeFileSync(path.join(dataDir, 'install-manifest.json'), JSON.stringify(manifest, null, 2) + '\n', { mode: 0o600 });
+
+    // Mutate 1 byte of the binary
+    fs.appendFileSync(bin, '# mutated\n');
+
+    const updatedHash = computeFileHash(bin);
+    let spawned = false;
+    await ensureStudio({ dataDir, startTimeoutMs: 1000,
+      fetchFn: (url, init) => {
+        assert.ok(!url.includes('github.com'), 'restart must not check for updates');
+        return spawned ? adminFetch(() => runningStatus({ total: 0 }))(url, init) : offlineFetch();
+      },
+      spawnFn: file => {
+        spawned = true;
+        assert.equal(computeFileHash(file), updatedHash);
+        return { on() {}, unref() {} };
+      }
+    });
+    assert.equal(spawned, true);
+    assert.equal(JSON.parse(fs.readFileSync(path.join(dataDir, 'install-manifest.json'))).binarySha256, manifest.binarySha256);
+  });
+
+  it('older official and historical managed versions remain usable without migration', async () => {
+    const { dataDir } = installedStandIn('managed-version-upgrade');
+    const local = localStudio({ dataDir });
+    // Authentication and capabilities, rather than a version comparison, govern reuse.
+    for (const version of ['v0.2.12', 'v0.2.14', 'v0.2.15', 'v0.2.16', 'v0.2.17', 'v0.2.18', 'v0.2.19', 'v0.2.20', 'v0.3.0', 'v0.3.1', 'v0.3.2', 'v0.3.3', 'v0.3.4', 'v0.3.5', STUDIO_VERSION.replace(/-magpie\.\d+$/, ''), 'v0.3.4-magpie.1', 'v0.3.3-magpie.1', 'v0.3.2-magpie.1', 'v0.3.0-magpie.1', 'v0.3.0-magpie.2', 'v0.2.19-magpie.1', 'v0.2.19-magpie.2', 'v0.3.1-magpie.1', 'v0.2.18-magpie.1', 'v0.2.18-magpie.2', 'v0.2.16-magpie.1', 'v0.2.16-magpie.2', 'v0.2.17-magpie.1', 'v0.2.17-magpie.2', 'v0.2.13-magpie.1', 'v0.2.14-magpie.1', 'v0.2.15-magpie.9', 'v0.1.99-magpie.3']) {
+      const fetchFn = adminFetch(() => ({ ...runningStatus({ total: 0 }), version }));
+      assert.equal((await checkStudioHealth(local, fetchFn)).state, 'up');
+    }
+    const fetchFn = adminFetch(() => runningStatus({ total: 0 }));
+    assert.equal((await checkStudioHealth(local, fetchFn)).state, 'up');
+  });
+
+  it('newer or custom admin-updated versions are reused without stopping or installing', async () => {
+    const dataDir = path.join(tmpRoot, 'admin-update-conflict');
+    ensureStudioConfig(dataDir);
+    fs.mkdirSync(path.join(dataDir, 'package'));
+    fs.writeFileSync(path.join(dataDir, 'package', process.platform === 'win32' ? 'aistudio2api.exe' : 'aistudio2api'), 'stand-in');
+    let mutations = 0;
+    // Cover official upgrades, rebuilt forks and unknown version formats.
+    const [, major, minor, patch, revision] = STUDIO_VERSION.match(/^v(\d+)\.(\d+)\.(\d+)-magpie\.(\d+)$/);
+    const nextUpstream = `v${major}.${minor}.${Number(patch) + 1}`;
+    const nextManaged = `v${major}.${minor}.${patch}-magpie.${Number(revision) + 1}`;
+    for (const version of [nextUpstream, `v${Number(major) + 1}.0.0`, nextManaged, `${nextUpstream}-magpie.1`, 'v0.2.15-custom', 'unknown']) {
+      const fetchFn = async (url, init) => {
+        if (url.includes('/api/control/') || url.includes('github.com')) mutations++;
+        return adminFetch(() => ({ ...runningStatus({ total: 0 }), version }))(url, init);
+      };
+      const status = await studioStatus({ dataDir, fetchFn });
+      assert.equal(status.status, 'running');
+      assert.equal(status.version, version);
+      assert.equal((await ensureStudio({ dataDir, fetchFn, spawnFn: () => { mutations++; } })).port, status.port);
+      await assert.rejects(installStudio({ dataDir, fetchFn }), /while service is running/);
+    }
+    assert.equal(mutations, 0);
+  });
+
+  it('a restart with HTTP closed never reinstalls or spawns; a new PID can be stopped', async () => {
+    const dataDir = path.join(tmpRoot, 'restart gap with spaces');
+    ensureStudioConfig(dataDir, '', { port: await freePort() });
+    const pkg = path.join(dataDir, 'package');
+    fs.mkdirSync(pkg);
+    const bin = path.join(pkg, process.platform === 'win32' ? 'aistudio2api.exe' : 'aistudio2api');
+    fs.copyFileSync(process.execPath, bin, fs.constants.COPYFILE_FICLONE);
+    writeValidManifest(dataDir, bin);
+    const manifest = path.join(dataDir, 'install-manifest.json');
+    const old = JSON.parse(fs.readFileSync(manifest));
+    old.binarySha256 = '0'.repeat(64); // updated executable no longer matches the old manifest
+    fs.writeFileSync(manifest, JSON.stringify(old));
+    const nodeLib = path.join(path.dirname(fs.realpathSync(process.execPath)), '..', 'lib');
+    const child = spawn(bin, ['-e', `process.on('message', () => { ${STAND_IN_SERVICE} }); process.send('ready');`], {
+      env: { ...process.env, PORT: String(localStudio({ dataDir }).port), VERSION: 'v999.0.0', DYLD_LIBRARY_PATH: nodeLib, LD_LIBRARY_PATH: nodeLib },
+      stdio: ['ignore', 'ignore', 'ignore', 'ipc']
+    });
+    const exited = new Promise(resolve => child.on('exit', resolve));
+    try {
+      await new Promise((resolve, reject) => { child.once('message', resolve); child.once('error', reject); child.once('exit', () => reject(new Error('stand-in exited early'))); });
+      const pidFile = path.join(dataDir, 'backend.pid');
+      fs.writeFileSync(pidFile, `${child.pid}\n`);
+      const hash = computeFileHash(bin);
+      const manifestBytes = fs.readFileSync(manifest, 'utf8');
+      let spawned = false;
+      const opts = { dataDir, fetchFn: offlineFetch, spawnFn: () => { spawned = true; } };
+      await assert.rejects(ensureStudio(opts), /still be running or restarting/);
+      await assert.rejects(installStudio(opts), /still be running or restarting/);
+      assert.equal(fs.readFileSync(pidFile, 'utf8'), `${child.pid}\n`);
+      // Recover the real process even when its recorded PID is dead or reused.
+      for (const stale of [9999999, process.pid]) {
+        fs.writeFileSync(pidFile, `${stale}\n`);
+        await assert.rejects(ensureStudio(opts), /still be running or restarting/);
+        await assert.rejects(installStudio(opts), /still be running or restarting/);
+      }
+      assert.equal(spawned, false);
+      assert.equal(computeFileHash(bin), hash);
+      assert.equal(fs.readFileSync(manifest, 'utf8'), manifestBytes);
+      child.send('serve');
+      const deadline = Date.now() + 10000;
+      while ((await studioStatus({ dataDir })).status !== 'running') {
+        assert.ok(Date.now() < deadline, 'replacement did not begin listening');
+        await new Promise(r => setTimeout(r, 50));
+      }
+      assert.equal((await ensureStudio({ dataDir })).port, localStudio({ dataDir }).port);
+      // Exited as stopStudio tells it, by asking the OS (process.kill(pid, 0)). On Windows that
+      // answers before this process's loop has taken the child's exit, so exitCode alone can still
+      // be null at stopStudio's first request after it, and no reset was made (Windows CI, #28).
+      // The child's handle, open until exitCode is set, keeps its PID from being reused.
+      const exitedNow = () => {
+        if (child.exitCode !== null || child.signalCode !== null) return true;
+        try {
+          process.kill(child.pid, 0);
+          return false;
+        } catch (err) {
+          return err.code === 'ESRCH';
+        }
+      };
+      let resetAfterExit = false;
+      const fetchFn = async (...args) => {
+        if (!resetAfterExit && exitedNow()) {
+          resetAfterExit = true;
+          throw Object.assign(new Error('pooled connection reset after exit'), { code: 'ECONNRESET' });
+        }
+        return fetch(...args);
+      };
+      assert.deepEqual(await stopStudio({ dataDir, fetchFn }), { stopped: true });
+      assert.equal(resetAfterExit, true);
+      await exited;
+      assert.equal(fs.existsSync(pidFile), false);
+    } finally {
+      child.kill('SIGKILL');
+      await exited;
+    }
+  });
+
+  it('a child that exits during startup does not leave backend.pid behind', { skip: process.platform === 'win32' }, async () => {
+    const { dataDir } = installedStandIn('exited-child');
+    await assert.rejects(ensureStudio({ dataDir, fetchFn: offlineFetch, startTimeoutMs: 2000 }), /exited during startup/);
+    assert.equal(fs.existsSync(path.join(dataDir, 'backend.pid')), false);
+  });
+
+  it('Windows process discovery uses the full binary path and listener ownership', () => {
+    const calls = [];
+    const run = (...args) => { calls.push(args); return '123\r\n123\r\n456\r\n'; };
+    assert.deepEqual(studioProcessPids('/custom dir/package/aistudio2api.exe', 'win32', run), [123, 456]);
+    assert.equal(calls[0][2].env.TARGET_BINARY, path.resolve('/custom dir/package/aistudio2api.exe'));
+    assert.match(calls[0][1].at(-1), /Get-CimInstance Win32_Process \| Where-Object/);
+    assert.ok(!calls[0][1].at(-1).includes('aistudio2api.exe'), 'filenames are passed through environment variables, never interpolated into PowerShell');
+    assert.match(calls[0][1].at(-1), /ExecutablePath -eq \$env:TARGET_BINARY/);
+    assert.equal(calls[0][2].timeout, 20000);
+    assert.deepEqual(studioListenerPids(2048, 'win32', run), [123, 456]);
+    assert.equal(calls[1][2].env.TARGET_PORT, '2048');
+    assert.equal(calls[1][2].timeout, 20000);
+    assert.match(calls[1][1].at(-1), /Get-NetTCPConnection.*OwningProcess/);
+    assert.throws(() => studioListenerPids('2048;bad', 'win32', run), /Invalid listener port/);
+  });
+
+  it('Windows process inspection failures explain recovery with the correct data directory', () => {
+    const dataDir = path.join(tmpRoot, 'powershell failure');
+    const bin = path.join(dataDir, 'package', 'aistudio2api.exe');
+    for (const code of ['ETIMEDOUT', 'ENOENT', 'EACCES']) {
+      const cause = Object.assign(new Error('PowerShell unavailable'), { code });
+      assert.throws(() => studioProcessPids(bin, 'win32', () => { throw cause; }), err => {
+        assert.match(err.message, /Cannot check for remaining AIStudio2API processes/);
+        assert.ok(err.message.includes(studioCommand('stop', { dataDir })));
+        assert.equal(err.cause, cause);
+        return true;
+      });
+    }
+  });
+
+  it('unlocking old package permissions is best effort for an already healthy service', { skip: process.platform === 'win32' }, async t => {
+    const { dataDir } = installedStandIn('best-effort-protection');
+    const pkg = path.join(dataDir, 'package');
+    const chmod = fs.chmodSync;
+    chmod(pkg, 0o555);
+    let attempts = 0;
+    const patch = t.mock.method(fs, 'chmodSync', (file, mode) => {
+      if (file === pkg) {
+        attempts++;
+        throw Object.assign(new Error('operation not permitted'), { code: 'EPERM' });
+      }
+      return chmod(file, mode);
+    });
+    try {
+      const fetchFn = adminFetch(() => runningStatus({ total: 1, ready: 1, busy: 0 }));
+      const local = await ensureStudio({ dataDir, fetchFn });
+      assert.equal(local.dataDir, dataDir);
+      assert.equal(attempts, 1);
+      chmod(pkg, 0o755);
+      await ensureStudio({ dataDir, fetchFn });
+      assert.equal(attempts, 1, 'an already writable package does not need chmod again');
+    } finally { patch.mock.restore(); }
+  });
+
+  it('9. startup lock dead owner recovery', async () => {
+    const dataDir = path.join(tmpRoot, 'lock-recovery-test');
+    ensureStudioConfig(dataDir);
+    const lockPath = path.join(dataDir, '.setup.lock');
+
+    // Write a lock file pointing to a dead PID (9999999)
+    fs.writeFileSync(lockPath, `9999999\n${Date.now()}\nfake-token\n`, { mode: 0o600 });
+
+    const pkgDir = path.join(dataDir, 'package');
+    fs.mkdirSync(pkgDir, { recursive: true, mode: 0o700 });
+    const bin = path.join(pkgDir, process.platform === 'win32' ? 'aistudio2api.exe' : 'aistudio2api');
+    fs.writeFileSync(bin, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+
+    const pin = PINNED_ARCHIVES[`${process.platform}-${process.arch}`];
+    fs.writeFileSync(path.join(dataDir, 'install-manifest.json'), JSON.stringify({
+      version: STUDIO_VERSION.slice(1),
+      platform: process.platform,
+      arch: process.arch,
+      archiveSha256: pin.sha256,
+      binarySha256: computeFileHash(bin)
+    }, null, 2) + '\n', { mode: 0o600 });
+
+    let spawnCount = 0;
+    const mockSpawn = () => {
+      spawnCount++;
+      return { pid: 23456, on: () => {}, unref: () => {} };
+    };
+
+    // Mock fetchFn returning down until spawn, then ready
+    const mockFetch = async (url) => {
+      if (url.includes('/api/auth/login')) {
+        return new Response(JSON.stringify({ authenticated: true }), {
+          headers: { 'Set-Cookie': 'aistudio_admin=tok; Path=/' }
+        });
+      }
+      if (url.includes('/api/status')) {
+        if (spawnCount === 0) {
+          const err = new Error('ECONNREFUSED');
+          err.code = 'ECONNREFUSED';
+          throw err;
+        }
+        return Response.json({ version: STUDIO_VERSION, running: true, ready: true, accounts: { total: 0 } });
+      }
+      return Response.json({});
+    };
+
+    const local = await ensureStudio({ dataDir, fetchFn: mockFetch, spawnFn: mockSpawn });
+    assert.ok(local, 'Should recover dead lock and return local setup');
+    assert.equal(spawnCount, 1, 'Spawn must be executed after reclaiming lock');
+    assert.equal(fs.existsSync(lockPath), false, 'Lock file must be cleaned up on completion');
+  });
+
+  it('10. startup concurrency spawns exactly one child', async () => {
+    const dataDir = path.join(tmpRoot, 'singleflight-test');
+    ensureStudioConfig(dataDir);
+    const pkgDir = path.join(dataDir, 'package');
+    fs.mkdirSync(pkgDir, { recursive: true, mode: 0o700 });
+    const bin = path.join(pkgDir, process.platform === 'win32' ? 'aistudio2api.exe' : 'aistudio2api');
+    fs.writeFileSync(bin, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+
+    const pin = PINNED_ARCHIVES[`${process.platform}-${process.arch}`];
+    const manifest = {
+      version: STUDIO_VERSION.slice(1),
+      platform: process.platform,
+      arch: process.arch,
+      archiveSha256: pin.sha256,
+      binarySha256: computeFileHash(bin)
+    };
+    fs.writeFileSync(path.join(dataDir, 'install-manifest.json'), JSON.stringify(manifest, null, 2) + '\n', { mode: 0o600 });
+
+    let spawnCount = 0;
+    const mockSpawn = () => {
+      spawnCount++;
+      return { pid: 12345, on: () => {}, unref: () => {} };
+    };
+
+    const mockFetch = async (url) => {
+      if (url.includes('/api/auth/login')) {
+        return new Response(JSON.stringify({ authenticated: true }), {
+          headers: { 'Set-Cookie': 'aistudio_admin=tok; Path=/' }
+        });
+      }
+      if (url.includes('/api/status')) {
+        if (spawnCount === 0) {
+          const err = new Error('ECONNREFUSED');
+          err.code = 'ECONNREFUSED';
+          throw err;
+        }
+        return Response.json({ version: STUDIO_VERSION, running: true, ready: true, accounts: { total: 0 } });
+      }
+      return Response.json({});
+    };
+
+    // Run 3 concurrent ensureStudio calls
+    const results = await Promise.all([
+      ensureStudio({ dataDir, fetchFn: mockFetch, spawnFn: mockSpawn }),
+      ensureStudio({ dataDir, fetchFn: mockFetch, spawnFn: mockSpawn }),
+      ensureStudio({ dataDir, fetchFn: mockFetch, spawnFn: mockSpawn })
+    ]);
+
+    assert.equal(spawnCount, 1, 'Singleflight must spawn only one child');
+    assert.equal(results.length, 3);
+  });
+
+  it('11. failed checksum keeps previous install', async () => {
+    const dataDir = path.join(tmpRoot, 'checksum-rollback-test');
+    ensureStudioConfig(dataDir);
+    const pkgDir = path.join(dataDir, 'package');
+    fs.mkdirSync(pkgDir, { recursive: true, mode: 0o700 });
+    const bin = path.join(pkgDir, process.platform === 'win32' ? 'aistudio2api.exe' : 'aistudio2api');
+    fs.writeFileSync(bin, '#!/bin/sh\necho original\n', { mode: 0o755 });
+    const originalHash = computeFileHash(bin);
+
+    // Corrupt archive
+    const corruptArchive = path.join(tmpRoot, 'corrupt.tar.gz');
+    fs.writeFileSync(corruptArchive, 'bad-bytes', { mode: 0o600 });
+
+    await assert.rejects(async () => {
+      await installStudio({ dataDir, archivePath: corruptArchive, fetchFn: official.fetchFn });
+    }, /SHA256 checksum mismatch/);
+
+    assert.equal(computeFileHash(bin), originalHash, 'Previous binary must be preserved');
+  });
+
+  it('12. import source preserved, no overwrite on conflict, and invalid dirs refused', async () => {
+    const dataDir = path.join(tmpRoot, 'import-test');
+    ensureStudioConfig(dataDir);
+
+    const srcDir = path.join(tmpRoot, 'import-src');
+    fs.mkdirSync(srcDir, { recursive: true, mode: 0o700 });
+
+    // Invalid dir without storage-state.json
+    const emptyAccount = path.join(srcDir, 'empty-acc');
+    fs.mkdirSync(emptyAccount, { recursive: true, mode: 0o700 });
+
+    // Valid account dir
+    const validAccount = path.join(srcDir, 'user@example.com');
+    fs.mkdirSync(validAccount, { recursive: true, mode: 0o700 });
+    const validState = {
+      cookies: [{ name: 'SAPISID', value: 'secret123', domain: '.google.com' }],
+      origins: []
+    };
+    const srcStateFile = path.join(validAccount, 'storage-state.json');
+    fs.writeFileSync(srcStateFile, JSON.stringify(validState, null, 2) + '\n', { mode: 0o600 });
+    const originalBytes = fs.readFileSync(srcStateFile);
+
+    // Run import via child process or script
+    const studioScript = path.resolve('scripts/studio.mjs');
+    const child1 = spawn(process.execPath, [studioScript, 'import', srcDir, '--data-dir', dataDir], {
+      encoding: 'utf8'
+    });
+    const [code1] = await Promise.all([
+      new Promise(r => child1.on('close', r))
+    ]);
+    assert.equal(code1, 0, 'Initial import should succeed');
+
+    // Verify imported
+    const destFile = path.join(dataDir, 'auth', 'user@example.com', 'storage-state.json');
+    assert.ok(fs.existsSync(destFile));
+    if (process.platform !== 'win32') {
+      assert.equal(fs.statSync(destFile).mode & 0o777, 0o600);
+      assert.equal(fs.statSync(path.join(dataDir, 'auth', 'user@example.com')).mode & 0o777, 0o700);
+    }
+
+    // Source bytes preserved
+    assert.deepEqual(fs.readFileSync(srcStateFile), originalBytes);
+
+    // Re-importing same bytes succeeds without error
+    const child2 = spawn(process.execPath, [studioScript, 'import', srcDir, '--data-dir', dataDir], {
+      encoding: 'utf8'
+    });
+    const [code2] = await Promise.all([
+      new Promise(r => child2.on('close', r))
+    ]);
+    assert.equal(code2, 0, 'Re-importing identical bytes must succeed');
+
+    // Modify destination file to cause conflict
+    fs.writeFileSync(destFile, '{"conflicting": true}', { mode: 0o600 });
+
+    // Conflicting import must be rejected without overwriting
+    const child3 = spawn(process.execPath, [studioScript, 'import', srcDir, '--data-dir', dataDir], {
+      encoding: 'utf8'
+    });
+    let stderr3 = '';
+    child3.stderr.on('data', d => { stderr3 += d; });
+    const [code3] = await Promise.all([
+      new Promise(r => child3.on('close', r))
+    ]);
+    assert.notEqual(code3, 0, 'Conflicting import must fail');
+    assert.ok(stderr3.includes('Conflict') || stderr3.includes('already exists'));
+    assert.equal(fs.readFileSync(destFile, 'utf8'), '{"conflicting": true}', 'Conflicting file must not be overwritten');
+  });
+
+  it('13. cached admin cookie + server closed returns down (causes preserved)', async () => {
+    let requests = [];
+    const server = http.createServer((req, res) => {
+      res.setHeader('Connection', 'close');
+      requests.push(req.url);
+      if (req.url === '/api/auth/login') {
+        res.writeHead(200, {
+          'Set-Cookie': 'aistudio_admin=valid_cookie; Path=/',
+          'Content-Type': 'application/json'
+        });
+        res.end(JSON.stringify({ authenticated: true }));
+        return;
+      }
+      if (req.url === '/api/status') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ version: STUDIO_VERSION, running: true, ready: false, accounts: { total: 0 } }));
+        return;
+      }
+      if (req.url === '/v1/models') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ object: 'list', data: [] }));
+        return;
+      }
+      res.writeHead(404);
+      res.end();
+    });
+
+    await new Promise(r => server.listen(0, '127.0.0.1', r));
+    const port = server.address().port;
+    const local = {
+      origin: `http://127.0.0.1:${port}`,
+      baseURL: `http://127.0.0.1:${port}/v1`,
+      adminUsername: 'magpie',
+      adminPassword: 'pw'
+    };
+
+    try {
+      // First call caches cookie
+      const initialHealth = await checkStudioHealth(local, globalThis.fetch);
+      assert.equal(initialHealth.state, 'up');
+
+      server.closeAllConnections?.();
+      await new Promise(r => server.close(r));
+
+      // Calling checkStudioHealth with cached cookie must return 'down', not 'foreign'!
+      const closedHealth = await checkStudioHealth(local, globalThis.fetch);
+      assert.equal(closedHealth.state, 'down', 'Must return down on ECONNREFUSED even with cached cookie');
+    } finally {
+      server.closeAllConnections?.();
+      try { server.close(); } catch {}
+    }
+  });
+
+  it('13b. Bun ConnectionRefused error is recognized as down (with or without cached admin cookie)', async () => {
+    const local = {
+      origin: 'http://127.0.0.1:19876',
+      baseURL: 'http://127.0.0.1:19876/v1',
+      adminUsername: 'magpie',
+      adminPassword: 'pw'
+    };
+    const bunRefusedError = () =>
+      Object.assign(new TypeError('Unable to connect. Is the computer able to access the url?'), {
+        code: 'ConnectionRefused'
+      });
+    const bunRefusedFetch = async () => {
+      throw bunRefusedError();
+    };
+
+    assert.equal(isConnectRefused(bunRefusedError()), true);
+
+    // 1. Before any admin session cookie is cached (fails in login step of studioAdmin)
+    const uncachedHealth = await checkStudioHealth(local, bunRefusedFetch);
+    assert.deepEqual(uncachedHealth, { state: 'down', reason: 'ECONNREFUSED' });
+
+    // 2. Cache admin session cookie via mock fetchFn, then fail with Bun ConnectionRefused
+    const healthyFetch = adminFetch(() => runningStatus({ total: 1, ready: 1, busy: 0 }));
+    const initialHealth = await checkStudioHealth(local, healthyFetch);
+    assert.equal(initialHealth.state, 'up');
+
+    const cachedClosedHealth = await checkStudioHealth(local, bunRefusedFetch);
+    assert.deepEqual(cachedClosedHealth, { state: 'down', reason: 'ECONNREFUSED' });
+  });
+
+  it('14. readiness helper polls and handles state transitions properly', async () => {
+    const dataDir = path.join(tmpRoot, 'readiness-test');
+    ensureStudioConfig(dataDir);
+    const pkgDir = path.join(dataDir, 'package');
+    fs.mkdirSync(pkgDir, { recursive: true, mode: 0o700 });
+    const bin = path.join(pkgDir, process.platform === 'win32' ? 'aistudio2api.exe' : 'aistudio2api');
+    fs.writeFileSync(bin, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+
+    const pin = PINNED_ARCHIVES[`${process.platform}-${process.arch}`];
+    fs.writeFileSync(path.join(dataDir, 'install-manifest.json'), JSON.stringify({
+      version: STUDIO_VERSION.slice(1),
+      platform: process.platform,
+      arch: process.arch,
+      archiveSha256: pin.sha256,
+      binarySha256: computeFileHash(bin)
+    }, null, 2) + '\n', { mode: 0o600 });
+
+    // Transition: LAUNCHING -> RUNNING (requires >= 2 status polls); running is true only in RUNNING
+    let polls = 0;
+    let startTriggered = 0;
+    const mockFetchTransition = async (url, init) => {
+      if (url.includes('/api/auth/login')) {
+        return new Response(JSON.stringify({ authenticated: true }), { headers: { 'Set-Cookie': 'aistudio_admin=t; Path=/' } });
+      }
+      if (url.includes('/api/control/start')) {
+        startTriggered++;
+        return Response.json({ success: true });
+      }
+      if (url.includes('/api/status')) {
+        polls++;
+        if (polls < 3) {
+          return Response.json({ version: STUDIO_VERSION, running: false, ready: false, state: 'LAUNCHING', accounts: { total: 1, ready: 0 } });
+        }
+        return Response.json({ version: STUDIO_VERSION, running: true, ready: true, state: 'RUNNING', accounts: { total: 1, ready: 1 } });
+      }
+      if (url.includes('/models')) {
+        return Response.json({ object: 'list', data: [] });
+      }
+      return Response.json({});
+    };
+
+    const localReady = await ensureStudio({ dataDir, fetchFn: mockFetchTransition });
+    assert.ok(localReady);
+    assert.ok(polls >= 2, 'Must poll status at least twice during LAUNCHING');
+
+    // Always not ready with low generationTimeoutMs rejects
+    const mockFetchNeverReady = async (url) => {
+      if (url.includes('/api/auth/login')) return new Response(JSON.stringify({ authenticated: true }), { headers: { 'Set-Cookie': 'aistudio_admin=t; Path=/' } });
+      if (url.includes('/api/status')) return Response.json({ version: STUDIO_VERSION, running: false, ready: false, state: 'LAUNCHING', accounts: { total: 1, ready: 0 } });
+      return Response.json({});
+    };
+    await assert.rejects(async () => {
+      await ensureStudio({ dataDir, fetchFn: mockFetchNeverReady, generationTimeoutMs: 20 });
+    }, /AI Studio generation did not become ready/);
+
+    // Start HTTP 500 rejects
+    const mockFetchStart500 = async (url) => {
+      if (url.includes('/api/auth/login')) return new Response(JSON.stringify({ authenticated: true }), { headers: { 'Set-Cookie': 'aistudio_admin=t; Path=/' } });
+      if (url.includes('/api/control/start')) return new Response(JSON.stringify({ error: 'fail' }), { status: 500, headers: { 'Content-Type': 'application/json' } });
+      if (url.includes('/api/status')) return Response.json({ version: STUDIO_VERSION, running: false, ready: false, state: 'STOPPED', accounts: { total: 1, ready: 0 } });
+      return Response.json({});
+    };
+    await assert.rejects(async () => {
+      await ensureStudio({ dataDir, fetchFn: mockFetchStart500 });
+    }, /500/);
+
+    // managementOnly: true does not wait for generation start
+    let startCalledManagementOnly = false;
+    const mockFetchManagementOnly = async (url) => {
+      if (url.includes('/api/auth/login')) return new Response(JSON.stringify({ authenticated: true }), { headers: { 'Set-Cookie': 'aistudio_admin=t; Path=/' } });
+      if (url.includes('/api/control/start')) { startCalledManagementOnly = true; return Response.json({}); }
+      if (url.includes('/api/status')) return Response.json({ version: STUDIO_VERSION, running: false, ready: false, state: 'STOPPED', accounts: { total: 1, ready: 0 } });
+      return Response.json({});
+    };
+    const localMgmt = await ensureStudio({ dataDir, fetchFn: mockFetchManagementOnly, managementOnly: true });
+    assert.ok(localMgmt);
+    assert.equal(startCalledManagementOnly, false, 'managementOnly: true must not trigger control/start');
+  });
+
+  it('15. verifyProcessIdentity rejects child named like binary with different path', async () => {
+    const dummyDir = path.join(tmpRoot, 'other-path-测试');
+    fs.mkdirSync(dummyDir, { recursive: true, mode: 0o700 });
+    const dummyBin = path.join(dummyDir, process.platform === 'win32' ? 'aistudio2api.exe' : 'aistudio2api');
+
+    // Use a real executable on every platform; a shell script is not a Windows PE.
+    fs.copyFileSync(process.execPath, dummyBin, fs.constants.COPYFILE_FICLONE);
+    const nodeLib = path.join(path.dirname(fs.realpathSync(process.execPath)), '..', 'lib');
+    const child = spawn(dummyBin, ['-e', 'process.send("ready"); setInterval(()=>{},1000)'], {
+      env: { ...process.env, DYLD_LIBRARY_PATH: nodeLib, LD_LIBRARY_PATH: nodeLib },
+      stdio: ['ignore', 'ignore', 'ignore', 'ipc']
+    });
+    const exited = new Promise(resolve => child.on('exit', resolve));
+    const pid = child.pid;
+
+    const expectedDir = path.join(tmpRoot, 'expected-path-test');
+    fs.mkdirSync(expectedDir, { recursive: true, mode: 0o700 });
+    const expectedBin = path.join(expectedDir, process.platform === 'win32' ? 'aistudio2api.exe' : 'aistudio2api');
+    fs.writeFileSync(expectedBin, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+
+    try {
+      await new Promise((resolve, reject) => {
+        child.once('message', resolve);
+        child.once('error', reject);
+        child.once('exit', () => reject(new Error('identity stand-in exited early')));
+      });
+      assert.equal(verifyProcessIdentity(pid, dummyBin), true, 'the actual executable must match');
+      const match = verifyProcessIdentity(pid, expectedBin);
+      assert.equal(match, false, 'verifyProcessIdentity must return false when paths differ');
+    } finally {
+      try { process.kill(pid, 'SIGKILL'); } catch {}
+      await exited;
+    }
+  });
+
+  it('16. import preflight rejects new account containing symlink without creating destination', async () => {
+    const dataDir = path.join(tmpRoot, 'import-symlink-test');
+    ensureStudioConfig(dataDir);
+
+    const srcDir = path.join(tmpRoot, 'import-symlink-src');
+    fs.mkdirSync(srcDir, { recursive: true, mode: 0o700 });
+
+    const accDir = path.join(srcDir, 'symlink-user@example.com');
+    fs.mkdirSync(accDir, { recursive: true, mode: 0o700 });
+
+    const validState = {
+      cookies: [{ name: 'SAPISID', value: 'secret123', domain: '.google.com' }],
+      origins: []
+    };
+    fs.writeFileSync(path.join(accDir, 'storage-state.json'), JSON.stringify(validState, null, 2) + '\n', { mode: 0o600 });
+
+    // Create an extra symlink file inside the account
+    const fixtureTarget = path.join(srcDir, 'dummy-target.txt');
+    fs.writeFileSync(fixtureTarget, 'fixture content\n');
+    fs.symlinkSync(fixtureTarget, path.join(accDir, 'evil-symlink.txt'));
+
+    const studioScript = path.resolve('scripts/studio.mjs');
+    const child = spawn(process.execPath, [studioScript, 'import', srcDir, '--data-dir', dataDir], {
+      encoding: 'utf8'
+    });
+    const [code] = await Promise.all([
+      new Promise(r => child.on('close', r))
+    ]);
+
+    assert.notEqual(code, 0, 'Import must fail when an account contains a symlink');
+    const destAccDir = path.join(dataDir, 'auth', 'symlink-user@example.com');
+    assert.equal(fs.existsSync(destAccDir), false, 'Destination account directory must NOT be created');
+    assert.ok(fs.existsSync(fixtureTarget), 'Source fixture must be unchanged');
+  });
+
+  it('17. an earlier install is usable and explicit installation requires it to stop', async () => {
+    const dataDir = path.join(tmpRoot, 'outdated-status-test');
+    ensureStudioConfig(dataDir);
+    const pkgDir = path.join(dataDir, 'package');
+    fs.mkdirSync(pkgDir, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(path.join(pkgDir, process.platform === 'win32' ? 'aistudio2api.exe' : 'aistudio2api'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+
+    const health = await checkStudioHealth(localStudio({ dataDir }), earlierVersionFetch);
+    assert.equal(health.state, 'up');
+
+    const status = await studioStatus({ dataDir, fetchFn: earlierVersionFetch });
+    assert.equal(status.status, 'running');
+    assert.equal(status.version, 'v0.2.11');
+
+    await assert.rejects(
+      installStudio({ dataDir, fetchFn: earlierVersionFetch }),
+      /while service is running/
+    );
+  });
+
+  it('18. ensureStudio reuses a running legacy install without changing its PID or credentials', async () => {
+    const dataDir = path.join(tmpRoot, 'outdated-replace-test');
+    const port = await freePort();
+    const pkgDir = path.join(dataDir, 'package');
+    fs.mkdirSync(pkgDir, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(path.join(dataDir, 'config.json'), JSON.stringify({
+      version: 1, port, apiKey: 'outdated-key', adminUsername: 'magpie', adminPassword: 'outdated-pw', proxy: ''
+    }) + '\n', { mode: 0o600 });
+
+    // The earlier install: a copy of node at the binary's path, so the PID passes the identity check
+    const bin = path.join(pkgDir, process.platform === 'win32' ? 'aistudio2api.exe' : 'aistudio2api');
+    fs.copyFileSync(process.execPath, bin, fs.constants.COPYFILE_FICLONE);
+    writeValidManifest(dataDir, bin);
+    // A node linked to its own libnode (Homebrew) finds it next to the original
+    const nodeLib = path.join(path.dirname(fs.realpathSync(process.execPath)), '..', 'lib');
+    const earlier = spawn(bin, ['-e', STAND_IN_SERVICE], {
+      env: { ...process.env, PORT: String(port), VERSION: 'v0.2.11', DYLD_LIBRARY_PATH: nodeLib, LD_LIBRARY_PATH: nodeLib },
+      stdio: 'ignore'
+    });
+    const earlierExit = new Promise(resolve => earlier.on('exit', resolve));
+    fs.writeFileSync(path.join(dataDir, 'backend.pid'), `${earlier.pid}\n`, { mode: 0o600 });
+
+    let spawned = 0;
+    try {
+      const deadline = Date.now() + 10000;
+      while ((await studioStatus({ dataDir })).status !== 'running') {
+        assert.ok(Date.now() < deadline, 'stand-in for the earlier install did not come up');
+        await new Promise(r => setTimeout(r, 100));
+      }
+
+      const before = fs.readFileSync(path.join(dataDir, 'config.json'), 'utf8');
+      const local = await ensureStudio({ dataDir, spawnFn: () => { spawned++; } });
+      assert.equal(local.port, port);
+      assert.equal(spawned, 0);
+      assert.equal(earlier.exitCode, null);
+      assert.equal(fs.readFileSync(path.join(dataDir, 'backend.pid'), 'utf8').trim(), String(earlier.pid));
+      assert.equal(fs.readFileSync(path.join(dataDir, 'config.json'), 'utf8'), before);
+      assert.equal((await studioStatus({ dataDir })).status, 'running');
+    } finally {
+      try { earlier.kill('SIGKILL'); } catch {}
+      await earlierExit;
+    }
+  });
+
+  it('19. authenticated legacy service is reused without a PID; installation still refuses', async () => {
+    const dataDir = path.join(tmpRoot, 'outdated-unverified-test');
+    ensureStudioConfig(dataDir);
+    const pkgDir = path.join(dataDir, 'package');
+    fs.mkdirSync(pkgDir, { recursive: true, mode: 0o700 });
+    const bin = path.join(pkgDir, process.platform === 'win32' ? 'aistudio2api.exe' : 'aistudio2api');
+    fs.writeFileSync(bin, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+    writeValidManifest(dataDir, bin);
+    // No backend.pid: nothing says which process to stop
+
+    let spawned = false;
+    await ensureStudio({ dataDir, fetchFn: earlierVersionFetch, spawnFn: () => { spawned = true; } });
+    await assert.rejects(installStudio({ dataDir, fetchFn: earlierVersionFetch }), /while service is running/);
+    assert.equal(spawned, false, 'nothing may be started while the earlier install holds the port');
+  });
+
+  // installedStandIn sets up dataDir as an installed setup whose binary is a placeholder.
+  function installedStandIn(name) {
+    const dataDir = path.join(tmpRoot, name);
+    ensureStudioConfig(dataDir);
+    const bin = path.join(dataDir, 'package', process.platform === 'win32' ? 'aistudio2api.exe' : 'aistudio2api');
+    fs.mkdirSync(path.dirname(bin), { recursive: true, mode: 0o700 });
+    fs.writeFileSync(bin, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+    writeValidManifest(dataDir, bin);
+    return { dataDir, bin };
+  }
+
+  it('20. a service that answers with errors or times out is unresponsive, not foreign', async () => {
+    const { dataDir } = installedStandIn('unresponsive-test');
+    const local = localStudio({ dataDir });
+
+    const loginFails = status => async () => new Response('busy', { status });
+    assert.equal((await checkStudioHealth(local, loginFails(503))).state, 'unresponsive');
+    assert.equal((await checkStudioHealth(local, loginFails(429))).state, 'unresponsive');
+    assert.equal((await checkStudioHealth(local, loginFails(401))).state, 'foreign');
+
+    const statusTimesOut = async url => {
+      if (url.includes('/api/auth/login')) {
+        return new Response('{}', { headers: { 'Set-Cookie': 'aistudio_admin=t; Path=/' } });
+      }
+      throw new DOMException('The operation was aborted due to timeout', 'TimeoutError');
+    };
+    assert.equal((await checkStudioHealth(local, statusTimesOut)).state, 'unresponsive');
+    assert.equal((await studioStatus({ dataDir, fetchFn: loginFails(503) })).status, 'unresponsive');
+
+    // One that stays so is reported as not responding, and nothing is started over it
+    let spawned = false;
+    await assert.rejects(
+      ensureStudio({ dataDir, fetchFn: loginFails(503), unresponsiveTimeoutMs: 300, spawnFn: () => { spawned = true; return { pid: 1, on: () => {}, unref: () => {} }; } }),
+      err => /not responding/.test(err.message) && !/another service/.test(err.message)
+    );
+    assert.equal(spawned, false);
+  });
+
+  it('21. a service that answers with errors while it starts is waited for', async () => {
+    const { dataDir } = installedStandIn('starting-errors-test');
+    let spawned = 0;
+    let loginsAfterSpawn = 0;
+    const fetchFn = async url => {
+      if (!spawned) throw Object.assign(new Error('refused'), { code: 'ECONNREFUSED' });
+      if (url.includes('/api/auth/login')) {
+        if (++loginsAfterSpawn <= 3) return new Response('starting', { status: 503 });
+        return new Response('{}', { headers: { 'Set-Cookie': 'aistudio_admin=t; Path=/' } });
+      }
+      if (url.includes('/api/status')) return Response.json(runningStatus({ total: 1, ready: 1, busy: 0, cooldown: 0, auth_required: 0 }));
+      return Response.json({ object: 'list', data: [] });
+    };
+    let stepAtSpawn;
+    const spawnFn = () => { spawned++; stepAtSpawn = setupStep(dataDir); return { pid: 9999999, on: () => {}, unref: () => {} }; };
+
+    const local = await ensureStudio({ dataDir, fetchFn, spawnFn, startTimeoutMs: 5000 });
+    assert.ok(local);
+    assert.equal(spawned, 1);
+    assert.ok(loginsAfterSpawn > 3, 'the 503 answers were waited out');
+    // A sign-in's progress page saw it starting, and sees nothing once it is up
+    assert.deepEqual(stepAtSpawn, { step: 'start' });
+    assert.equal(setupStep(dataDir), null);
+  });
+
+  it('22. RUNNING takes requests with no account ready; accounts that all need to sign in fail fast', async () => {
+    const { dataDir } = installedStandIn('readiness-accounts-test');
+
+    // All accounts cooling down: the backend answers requests saying so, nothing to wait for
+    const started = Date.now();
+    await ensureStudio({ dataDir, fetchFn: adminFetch(() => runningStatus({ total: 1, ready: 0, busy: 0, cooldown: 1, auth_required: 0 })) });
+    assert.ok(Date.now() - started < 2000, 'must not wait for an account to come out of cooldown');
+
+    let starts = 0;
+    const signedOut = state => adminFetch(() => launchingStatus(state, { total: 2, ready: 0, busy: 0, cooldown: 0, auth_required: 2 }), () => { starts++; });
+    await assert.rejects(ensureStudio({ dataDir, fetchFn: signedOut('LAUNCHING') }), /need to sign in again \(2 of 2\)/);
+    await assert.rejects(ensureStudio({ dataDir, fetchFn: signedOut('STOPPED') }), /need to sign in again/);
+    assert.equal(starts, 0, 'generation is not started for accounts that cannot serve');
+  });
+
+  it('23. a management-only caller does not wait for generation, and a full caller is not answered by one', async () => {
+    const { dataDir } = installedStandIn('mixed-callers-test');
+    let launched = false;
+    const fetchFn = adminFetch(() => launched
+      ? runningStatus({ total: 1, ready: 1, busy: 0, cooldown: 0, auth_required: 0 })
+      : launchingStatus('LAUNCHING', { total: 1, ready: 0, busy: 0, cooldown: 0, auth_required: 0 }));
+
+    // A full caller in flight: a management-only caller must not wait for it
+    const full = ensureStudio({ dataDir, fetchFn, generationTimeoutMs: 5000 });
+    let fullDone = false;
+    full.then(() => { fullDone = true; }, () => {});
+    await ensureStudio({ dataDir, fetchFn, managementOnly: true });
+    assert.equal(fullDone, false, 'generation is still launching');
+    launched = true;
+    await full;
+
+    // A management-only caller in flight: a full caller must still wait for generation
+    launched = false;
+    const management = ensureStudio({ dataDir, fetchFn, managementOnly: true });
+    const full2 = ensureStudio({ dataDir, fetchFn, generationTimeoutMs: 5000 });
+    let full2Done = false;
+    full2.then(() => { full2Done = true; }, () => {});
+    await management;
+    await new Promise(r => setTimeout(r, 300));
+    assert.equal(full2Done, false, 'a full caller waits for RUNNING');
+    launched = true;
+    await full2;
+  });
+
+  it('24. stop without a live process in backend.pid reports a service that still answers', async () => {
+    const { dataDir } = installedStandIn('stop-no-pid-test');
+    const pidFile = path.join(dataDir, 'backend.pid');
+    const up = adminFetch(() => runningStatus({ total: 1, ready: 1, busy: 0, cooldown: 0, auth_required: 0 }));
+
+    const noPid = await stopStudio({ dataDir, fetchFn: up });
+    assert.equal(noPid.stopped, false);
+    assert.match(noPid.reported, /Cannot identify a verified AIStudio2API process/);
+
+    fs.writeFileSync(pidFile, '9999999\n', { mode: 0o600 });
+    const stalePid = await stopStudio({ dataDir, fetchFn: up });
+    assert.equal(stalePid.stopped, false);
+    assert.equal(fs.existsSync(pidFile), false, 'a stale pid file is removed');
+
+    assert.deepEqual(await stopStudio({ dataDir, fetchFn: offlineFetch }), { stopped: true });
+  });
+
+  it('25. a download goes through the proxy saved in .env', { skip: process.platform === 'win32' }, async () => {
+    const dataDir = path.join(tmpRoot, 'saved-proxy-test');
+    ensureStudioConfig(dataDir, 'http://127.0.0.1:1082', { port: await freePort() });
+
+    // A curl that records its arguments and fails like a refused download
+    const fakeBin = path.join(tmpRoot, 'fake-curl-bin');
+    fs.mkdirSync(fakeBin, { recursive: true });
+    fs.writeFileSync(path.join(fakeBin, 'curl'), '#!/bin/sh\nprintf "%s\\n" "$@" > "$CURL_ARGS"\nfor arg do case "$arg" in https://api.github.com/*) cp "$CURL_ARGS" "$CURL_ARGS.api"; cat "$CURL_RELEASE"; exit 0;; esac; done\necho "curl: (7) Failed to connect to 127.0.0.1 port 1082" >&2\nexit 7\n', { mode: 0o755 });
+    const argsFile = path.join(tmpRoot, 'curl-args.txt');
+    const curlArgs = () => fs.readFileSync(argsFile, 'utf8').split('\n');
+
+    const saved = { PATH: process.env.PATH, AI_STUDIO_PROXY: process.env.AI_STUDIO_PROXY, CURL_ARGS: process.env.CURL_ARGS, CURL_RELEASE: process.env.CURL_RELEASE };
+    try {
+      process.env.PATH = `${fakeBin}${path.delimiter}${process.env.PATH}`;
+      delete process.env.AI_STUDIO_PROXY;
+      process.env.CURL_ARGS = argsFile;
+      process.env.CURL_RELEASE = path.join(tmpRoot, 'curl-release.json');
+      fs.writeFileSync(process.env.CURL_RELEASE, JSON.stringify(official.release));
+
+      // The error says why curl failed
+      await assert.rejects(installStudio({ dataDir }), /via curl \(status: 7\): curl: \(7\) Failed to connect to 127\.0\.0\.1 port 1082/);
+      assert.equal(curlArgs()[curlArgs().indexOf('--proxy') + 1], 'http://127.0.0.1:1082');
+      const metadataArgs = fs.readFileSync(`${argsFile}.api`, 'utf8').split('\n');
+      assert.equal(metadataArgs[metadataArgs.indexOf('--proxy') + 1], 'http://127.0.0.1:1082');
+
+      // An explicit empty proxy turns it off
+      await assert.rejects(installStudio({ dataDir, proxy: '' }), /via curl/);
+      assert.ok(!curlArgs().includes('--proxy'));
+
+      // A proxy an older config.json kept counts only while .env saves none, not one cleared
+      const configPath = path.join(dataDir, 'config.json');
+      fs.writeFileSync(configPath, JSON.stringify({ ...JSON.parse(fs.readFileSync(configPath, 'utf8')), proxy: 'http://127.0.0.1:9393' }));
+      saveStudioProxy(dataDir, '');
+      await assert.rejects(installStudio({ dataDir }), /via curl/);
+      assert.ok(!curlArgs().includes('--proxy'), 'a proxy cleared in the admin page stays cleared');
+    } finally {
+      for (const [k, v] of Object.entries(saved)) {
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      }
+    }
+  });
+
+  it('26. the admin session cookie is found among several Set-Cookie headers', async () => {
+    let sentCookie;
+    const fetchFn = async (url, init) => {
+      if (url.includes('/api/auth/login')) {
+        const headers = new Headers({ 'Content-Type': 'application/json' });
+        headers.append('Set-Cookie', 'theme=dark; Path=/');
+        headers.append('Set-Cookie', 'aistudio_admin=second; Path=/; HttpOnly');
+        return new Response('{}', { headers });
+      }
+      sentCookie = init.headers.get('Cookie');
+      return Response.json({ ok: true });
+    };
+    const local = {
+      origin: 'http://127.0.0.1:1',
+      baseURL: 'http://127.0.0.1:1/v1',
+      adminUsername: 'magpie',
+      adminPassword: crypto.randomBytes(8).toString('hex')
+    };
+    await studioAdmin(local, 'GET', '/api/status', null, { fetchFn });
+    assert.equal(sentCookie, 'aistudio_admin=second');
+  });
+
+  it('26b. a sign-in from the command line goes through nodeFetch as through fetch', async () => {
+    const server = http.createServer((req, res) => {
+      if (req.url === '/api/auth/login') {
+        res.writeHead(200, { 'Content-Type': 'application/json', 'Set-Cookie': ['theme=dark; Path=/', 'aistudio_admin=second; Path=/'] });
+        return res.end('{}');
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ account: { id: req.headers.cookie } }));
+    });
+    await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+    const origin = `http://127.0.0.1:${server.address().port}`;
+    try {
+      const local = { origin, baseURL: `${origin}/v1`, adminUsername: 'magpie', adminPassword: crypto.randomBytes(8).toString('hex') };
+      const res = await studioAdmin(local, 'POST', '/api/accounts', {}, { fetchFn: nodeFetch });
+      assert.equal(res.account.id, 'aistudio_admin=second');
+    } finally {
+      server.close();
+    }
+  });
+
+  it('27. a new setup takes the default port only when nothing uses it, and keeps an existing one', async () => {
+    const free = await freePort();
+    assert.equal(await pickStudioPort(free), free);
+
+    // Taken on loopback, or on all addresses (which on macOS still lets 127.0.0.1 be bound)
+    for (const host of ['127.0.0.1', '0.0.0.0']) {
+      const taken = http.createServer();
+      await new Promise(r => taken.listen(0, host, r));
+      const { port } = taken.address();
+      try {
+        const picked = await pickStudioPort(port);
+        assert.notEqual(picked, port, `a port used on ${host} is not picked`);
+        assert.ok(picked > 0);
+      } finally {
+        await new Promise(r => taken.close(r));
+      }
+    }
+
+    // A first start with its preferred port taken writes another one, and starts on it
+    const taken = http.createServer();
+    await new Promise(r => taken.listen(0, '127.0.0.1', r));
+    const busy = taken.address().port;
+    try {
+      const { dataDir, bin } = installedStandIn('first-port-test');
+      fs.rmSync(path.join(dataDir, 'config.json'));
+      let spawned = 0;
+      const fetchFn = async (url) => {
+        if (!spawned) throw Object.assign(new Error('refused'), { code: 'ECONNREFUSED' });
+        return adminFetch(() => runningStatus({ total: 0, ready: 0, busy: 0, cooldown: 0, auth_required: 0 }))(url);
+      };
+      const local = await ensureStudio({ dataDir, fetchFn, preferredPort: busy, spawnFn: () => { spawned++; return { on: () => {}, unref: () => {} }; } });
+      assert.ok(fs.existsSync(bin));
+      assert.notEqual(local.port, busy);
+      assert.equal(JSON.parse(fs.readFileSync(path.join(dataDir, 'config.json'), 'utf8')).port, local.port);
+
+      // Once written, the port is kept even when it is the one taken
+      const config = JSON.parse(fs.readFileSync(path.join(dataDir, 'config.json'), 'utf8'));
+      fs.writeFileSync(path.join(dataDir, 'config.json'), JSON.stringify({ ...config, port: busy }) + '\n', { mode: 0o600 });
+      assert.equal(ensureStudioConfig(dataDir).port, busy);
+
+      // PREVIEW_LISTEN_ADDR avoids LISTEN_ADDR's port and moves off a busy port before launch
+      const previewDir = path.join(tmpRoot, 'preview-port-test');
+      ensureStudioConfig(previewDir, '', { port: 2050 });
+      assert.equal(readStudioEnv(previewDir).PREVIEW_LISTEN_ADDR, '127.0.0.1:2051');
+      const envPath = path.join( dataDir, '.env');
+      fs.writeFileSync(envPath, fs.readFileSync(envPath, 'utf8').replace(/PREVIEW_LISTEN_ADDR=.*/, `PREVIEW_LISTEN_ADDR=127.0.0.1:${busy}`));
+      fs.writeFileSync(path.join(dataDir, 'config.json'), JSON.stringify(config) + '\n', { mode: 0o600 });
+      spawned = 0;
+      await ensureStudio({ dataDir, fetchFn, spawnFn: () => { spawned++; return { on: () => {}, unref: () => {} }; } });
+      assert.notEqual(readStudioEnv(dataDir).PREVIEW_LISTEN_ADDR, `127.0.0.1:${busy}`);
+      assert.notEqual(readStudioEnv(dataDir).PREVIEW_LISTEN_ADDR, `127.0.0.1:${config.port}`);
+    } finally {
+      await new Promise(r => taken.close(r));
+    }
+  });
+
+  it('28. a start sets a large backend.log aside', async () => {
+    const dataDir = path.join(tmpRoot, 'log-rotate-test');
+    installedStandIn('log-rotate-test');
+    ensureStudioConfig(dataDir);
+    const log = path.join(dataDir, 'backend.log');
+    fs.writeFileSync(`${log}.1`, 'older');
+    fs.writeFileSync(log, 'big');
+    fs.truncateSync(log, 11 * 1024 * 1024);
+
+    let spawned = 0;
+    const fetchFn = async (url) => {
+      if (!spawned) throw Object.assign(new Error('refused'), { code: 'ECONNREFUSED' });
+      return adminFetch(() => runningStatus({ total: 0, ready: 0, busy: 0, cooldown: 0, auth_required: 0 }))(url);
+    };
+    const spawnFn = () => { spawned++; return { pid: 9999999, on: () => {}, unref: () => {} }; };
+    await ensureStudio({ dataDir, fetchFn, spawnFn });
+    assert.equal(fs.statSync(`${log}.1`).size, 11 * 1024 * 1024, 'the large log replaces the one set aside before');
+    assert.equal(fs.statSync(log).size, 0);
+
+    // A small log is kept as it is
+    fs.writeFileSync(log, 'small');
+    spawned = 0;
+    await ensureStudio({ dataDir, fetchFn, spawnFn });
+    assert.equal(fs.readFileSync(log, 'utf8'), 'small');
+  });
+
+  it('29. messages that ask for a command give one that runs from anywhere', async () => {
+    const command = studioCommand('relogin');
+    const [, script] = /^node "(.+)" relogin$/.exec(command);
+    assert.ok(path.isAbsolute(script) && fs.existsSync(script), 'the CLI is named by its full path');
+
+    const dataDir = path.join(tmpRoot, 'relogin-hint-test');
+    installedStandIn('relogin-hint-test');
+    ensureStudioConfig(dataDir);
+    const signedOut = adminFetch(() => launchingStatus('STOPPED', { total: 1, ready: 0, busy: 0, cooldown: 0, auth_required: 1 }));
+    await assert.rejects(ensureStudio({ dataDir, fetchFn: signedOut }), err => err.message.includes('用 Google 账号登录（推荐）') && err.message.includes(studioCommand('relogin', { dataDir })));
+  });
+
+  it('30. an install takes the archive an earlier one kept only when it checks out', async () => {
+    const dataDir = path.join(tmpRoot, 'kept-archive-test');
+    ensureStudioConfig(dataDir, '');
+    // A damaged copy is downloaded again (here: offline, so the install fails saying so)
+    fs.writeFileSync(path.join(dataDir, official.name), 'damaged', { mode: 0o600 });
+    await assert.rejects(installStudio({ dataDir, fetchFn: url => url.includes('api.github.com') ? official.fetchFn(url) : offlineFetch() }), /offline fixture/);
+  });
+
+  it('30c. a sign-in\'s progress page answers while the archive unpacks', { skip: process.platform === 'win32' }, async () => {
+    const dataDir = path.join(tmpRoot, 'unpack-progress-test');
+    ensureStudioConfig(dataDir, '');
+    fs.copyFileSync(official.archive, path.join(dataDir, official.name));
+    // A tar that says when it starts to unpack, and takes a second
+    const realTar = execFileSync('sh', ['-c', 'command -v tar'], { encoding: 'utf8' }).trim();
+    const slowBin = path.join(tmpRoot, 'slow-tar-bin');
+    const unpacking = path.join(tmpRoot, 'unpacking');
+    fs.mkdirSync(slowBin, { recursive: true });
+    fs.writeFileSync(path.join(slowBin, 'tar'), `#!/bin/sh\ncase "$1" in -xzf) touch "${unpacking}"; sleep 1;; esac\nexec "${realTar}" "$@"\n`, { mode: 0o755 });
+    const savedPath = process.env.PATH;
+    const page = await openProgressPage(() => setupStep(dataDir));
+    try {
+      process.env.PATH = `${slowBin}${path.delimiter}${savedPath}`;
+      let installed = false;
+      const install = installStudio({ dataDir, fetchFn: official.fetchFn }).finally(() => { installed = true; });
+      while (!installed && !fs.existsSync(unpacking)) await new Promise(r => setTimeout(r, 20));
+      const status = await (await fetch(`${page.url}/status`)).json();
+      assert.equal(installed, false, 'the page answered while the archive unpacked');
+      assert.deepEqual(status, { step: 'install' });
+      assert.ok(await install);
+    } finally {
+      process.env.PATH = savedPath;
+      page.close();
+    }
+  });
+
+  it('30b. a verified official archive is reused; updates persist and explicit installs roll back safely', { skip: process.platform === 'win32' }, async t => {
+    const dataDir = path.join(tmpRoot, 'kept-archive-ok-test');
+    ensureStudioConfig(dataDir, '');
+    fs.copyFileSync(official.archive, path.join(dataDir, official.name));
+    const older = official.name.replace('v0.3.7', 'v0.2.11');
+    fs.writeFileSync(path.join(dataDir, older), 'old');
+    fs.writeFileSync(path.join(dataDir, 'notes.tar.gz'), 'not ours');
+    // Metadata is resolved, but the verified local archive avoids a second asset download
+    const local = await installStudio({ dataDir, fetchFn: official.fetchFn });
+    assert.ok(local && fs.existsSync(path.join(dataDir, 'package')));
+    assert.ok(fs.existsSync(path.join(dataDir, official.name)));
+    assert.equal(fs.existsSync(path.join(dataDir, older)), false);
+    assert.ok(fs.existsSync(path.join(dataDir, 'notes.tar.gz')));
+
+    // Simulate an upstream update. Normal startup preserves it and the installation history.
+    const bin = path.join(dataDir, 'package', 'aistudio2api');
+    const verifiedHash = computeFileHash(bin);
+    const configBefore = fs.readFileSync(path.join(dataDir, 'config.json'), 'utf8');
+    fs.mkdirSync(path.join(dataDir, 'auth'), { recursive: true });
+    fs.writeFileSync(path.join(dataDir, 'auth', 'sentinel'), 'account data');
+    fs.appendFileSync(bin, '\nchanged by updater');
+    const updatedHash = computeFileHash(bin);
+    fs.chmodSync(path.join(dataDir, 'package'), 0o555); // old plugin permissions
+    let spawned = false;
+    const fetchFn = async (url, init) => {
+      assert.ok(!url.includes('github.com'));
+      if (!spawned) return offlineFetch();
+      return adminFetch(() => runningStatus({ total: 0 }))(url, init);
+    };
+    await ensureStudio({ dataDir, fetchFn, spawnFn: file => {
+      assert.equal(computeFileHash(file), updatedHash);
+      spawned = true;
+      return { on() {}, unref() {} };
+    } });
+    assert.equal(spawned, true);
+    assert.equal(fs.readFileSync(path.join(dataDir, 'config.json'), 'utf8'), configBefore);
+    assert.equal(fs.readFileSync(path.join(dataDir, 'auth', 'sentinel'), 'utf8'), 'account data');
+    assert.equal(JSON.parse(fs.readFileSync(path.join(dataDir, 'install-manifest.json'))).binarySha256, verifiedHash);
+    assert.equal(fs.statSync(path.join(dataDir, 'package')).mode & 0o777, 0o755);
+    fs.writeFileSync(path.join(dataDir, 'package', '.aistudio2api.new'), 'upstream updater can write here');
+    // An explicit install can replace a protected package and remove its backup.
+    await installStudio({ dataDir, fetchFn: official.fetchFn });
+    assert.equal(fs.statSync(path.join(dataDir, 'package')).mode & 0o777, 0o755);
+    assert.equal(fs.readdirSync(dataDir).some(n => n.startsWith('.package.backup.')), false);
+
+    // Failure after swapping must restore the previous protected directory and manifest.
+    const previousManifest = fs.readFileSync(path.join(dataDir, 'install-manifest.json'), 'utf8');
+    const chmod = fs.chmodSync;
+    let injected = false;
+    const patch = t.mock.method(fs, 'chmodSync', (file, mode) => {
+      if (!injected && file === path.join(dataDir, 'install-manifest.json')) {
+        injected = true;
+        throw new Error('simulated manifest permission failure');
+      }
+      return chmod(file, mode);
+    });
+    try {
+      await assert.rejects(installStudio({ dataDir, fetchFn: official.fetchFn }), /simulated manifest permission failure/);
+    } finally { patch.mock.restore(); }
+    assert.equal(computeFileHash(bin), verifiedHash);
+    assert.equal(fs.readFileSync(path.join(dataDir, 'install-manifest.json'), 'utf8'), previousManifest);
+    assert.equal(fs.statSync(path.join(dataDir, 'package')).mode & 0o777, 0o755);
+    assert.equal(fs.readdirSync(dataDir).some(n => n.startsWith('.package.backup.')), false);
+  });
+
+  it('31. the service is started with no proxy of its starter\'s, and empty ones the plugin host keeps', async t => {
+    const { dataDir } = installedStandIn('proxy-env-test');
+    // What Magpie's plugin host or a shell may have
+    for (const [k, v] of Object.entries({ HTTPS_PROXY: 'http://127.0.0.1:9393', https_proxy: 'http://127.0.0.1:9393', ALL_PROXY: 'socks5://127.0.0.1:9394', FIRST_EVENT_HEDGE: '1', FIRST_EVENT_HEDGE_MODELS: 'gemini-3.8-flash', API_KEY_ACCOUNTS: 'host-key:host@example.com', ACCOUNT_ORDER: 'host@example.com', MAX_ACCOUNT_SWITCHES: '9', DISCOVER_HIDDEN_MODELS: 'true', MODEL_ACCOUNTS: 'gemini-3.1-pro-preview:host@example.com', SEARCH_MODEL_ALIASES: 'true', STRIP_THOUGHT_SIGNATURES: 'true', HIDE_DOCK_ICON: 'true', AI_STUDIO_PROXY: undefined })) {
+      const saved = process.env[k];
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+      t.after(() => { if (saved === undefined) delete process.env[k]; else process.env[k] = saved; });
+    }
+    let env;
+    const fetchFn = async url => {
+      if (!env) throw Object.assign(new Error('refused'), { code: 'ECONNREFUSED' });
+      return adminFetch(() => runningStatus({ total: 0 }))(url);
+    };
+    const spawnFn = (_file, _args, options) => { env = options.env; return { pid: 9999999, on: () => {}, unref: () => {} }; };
+
+    await ensureStudio({ dataDir, fetchFn, spawnFn });
+    const proxies = Object.entries(env).filter(([k]) => /^(?:https?|all)_proxy$/i.test(k));
+    assert.deepEqual(Object.fromEntries(proxies), { HTTP_PROXY: '', HTTPS_PROXY: '', ALL_PROXY: '' });
+    assert.equal('PROXY' in env, false, 'the saved proxy is left to .env');
+    assert.equal('FIRST_EVENT_HEDGE' in env, false, 'host environment cannot override the saved hedge setting');
+    assert.equal('SEARCH_MODEL_ALIASES' in env, false, 'nor the saved search aliases setting');
+    assert.equal('STRIP_THOUGHT_SIGNATURES' in env, false);
+    assert.equal('HIDE_DOCK_ICON' in env, false, 'host environment cannot override the saved Dock visibility setting');
+    assert.equal('FIRST_EVENT_HEDGE_MODELS' in env, false);
+    assert.equal('API_KEY_ACCOUNTS' in env, false);
+    assert.equal('ACCOUNT_ORDER' in env, false);
+    assert.equal('MAX_ACCOUNT_SWITCHES' in env, false);
+    assert.equal('DISCOVER_HIDDEN_MODELS' in env, false);
+    assert.equal('MODEL_ACCOUNTS' in env, false);
+    assert.equal(JSON.parse(fs.readFileSync(path.join(dataDir, 'backend.launch.json'), 'utf8')).proxyEnv, 'none');
+
+    // studio.proxy is still given as PROXY
+    env = undefined;
+    fs.rmSync(path.join(dataDir, 'backend.pid'), { force: true });
+    await ensureStudio({ dataDir, fetchFn, spawnFn, proxy: 'http://127.0.0.1:7890' });
+    assert.equal(env.PROXY, 'http://127.0.0.1:7890');
+    assert.equal(env.HTTPS_PROXY, '');
+  });
+});
+
+describe('Sign-in progress sources', () => {
+  let dir;
+  before(() => { dir = fs.mkdtempSync(path.join(os.tmpdir(), 'magpie-studio-progress-')); });
+  after(() => fs.rmSync(dir, { recursive: true, force: true }));
+
+  it('reads a curl download from the file so far and the last response\'s Content-Length', () => {
+    const file = path.join(dir, 'archive.zip');
+    const headers = path.join(dir, 'headers.txt');
+    assert.deepEqual(downloadProgress(file, headers), { step: 'download', received: 0, total: 0 });
+    fs.writeFileSync(file, Buffer.alloc(1000));
+    // GitHub's redirect comes first: until the archive's own headers come, its size isn't known
+    fs.writeFileSync(headers, 'HTTP/2 302\r\nlocation: https://objects.example/a\r\ncontent-length: 0\r\n\r\n');
+    assert.deepEqual(downloadProgress(file, headers), { step: 'download', received: 1000, total: 0 });
+    fs.appendFileSync(headers, 'HTTP/2 200\r\nContent-Type: application/octet-stream\r\nContent-Length: 24281003\r\n\r\n');
+    assert.deepEqual(downloadProgress(file, headers), { step: 'download', received: 1000, total: 24281003 });
+  });
+
+  it('says whether Camoufox is there, else how far the service has got downloading it', () => {
+    const data = path.join(dir, 'service');
+    const runtime = path.join(data, 'runtime');
+    assert.deepEqual(camoufoxState(data, 'linux', {}), { ready: false, received: 0, total: 0, unpacking: false });
+
+    fs.mkdirSync(runtime, { recursive: true });
+    const part = path.join(runtime, `camoufox-${CAMOUFOX_VERSION}-lin.x86_64.zip.part`);
+    fs.writeFileSync(part, Buffer.alloc(3 * 1048576 + 5));
+    assert.deepEqual(camoufoxState(data, 'linux', {}), { ready: false, received: 3 * 1048576 + 5, total: 0, unpacking: false });
+    // The size comes from the service's log, the last download's
+    fs.writeFileSync(path.join(data, 'backend.log'), [
+      JSON.stringify({ level: 'INFO', msg: 'Camoufox 下载已开始', size_mib: 1, resume_mib: 0 }),
+      JSON.stringify({ level: 'INFO', msg: '正在下载 Camoufox', version: CAMOUFOX_VERSION }),
+      JSON.stringify({ level: 'INFO', msg: 'Camoufox 下载已开始', size_mib: 300, resume_mib: 0 }),
+      'not json',
+      ''
+    ].join('\n'));
+    assert.deepEqual(camoufoxState(data, 'linux', {}), { ready: false, received: 3 * 1048576 + 5, total: 300 * 1048576, unpacking: false });
+    // Official builds can emit English logs. A different component's size is unrelated.
+    fs.appendFileSync(path.join(data, 'backend.log'), [
+      JSON.stringify({ level: 'INFO', msg: 'Camoufox download started', size_mib: 301, resume_mib: 0 }),
+      JSON.stringify({ level: 'INFO', msg: 'SpiderMonkey download started', size_mib: 10 })
+    ].join('\n') + '\n');
+    assert.equal(camoufoxState(data, 'linux', {}).total, 301 * 1048576);
+    // which it rounds down to a MiB: the bytes received past it are the size
+    fs.writeFileSync(part, Buffer.alloc(301 * 1048576 + 7));
+    assert.equal(camoufoxState(data, 'linux', {}).total, 301 * 1048576 + 7);
+
+    fs.mkdirSync(path.join(runtime, '.camoufox-stage-123'));
+    assert.equal(camoufoxState(data, 'linux', {}).unpacking, true);
+  });
+
+  it('reports installed browser files while letting each backend select its own version', () => {
+    const data = path.join(dir, 'versions');
+    const folder = path.join(data, 'runtime', 'camoufox');
+    fs.mkdirSync(folder, { recursive: true });
+    fs.writeFileSync(path.join(folder, 'camoufox-bin'), '');
+    const ini = path.join(folder, 'application.ini');
+    // The plugin has no pinned browser version; upstream performs its own validation.
+    assert.equal(camoufoxState(data, 'linux', {}).ready, true, 'no application.ini');
+    fs.writeFileSync(ini, '[App]\nName=Camoufox\n');
+    assert.equal(camoufoxState(data, 'linux', {}).ready, true, 'no Version in it');
+    fs.writeFileSync(ini, '[App]\nVersion=135.0.1-beta.24\n');
+    assert.equal(camoufoxState(data, 'linux', {}).ready, true, 'an older version');
+    fs.writeFileSync(ini, `[App]\r\nName=Camoufox\r\nVersion=${CAMOUFOX_VERSION}\r\n`);
+    assert.deepEqual(camoufoxState(data, 'linux', {}), { ready: true });
+    assert.equal(camoufoxState(data, 'win32', {}).ready, false, 'each platform has its own executable');
+
+    // macOS keeps it in the app's Resources
+    const app = path.join(dir, 'mac', 'runtime', 'camoufox', 'Camoufox.app', 'Contents');
+    fs.mkdirSync(path.join(app, 'MacOS'), { recursive: true });
+    fs.mkdirSync(path.join(app, 'Resources'), { recursive: true });
+    fs.writeFileSync(path.join(app, 'MacOS', 'camoufox'), '');
+    fs.writeFileSync(path.join(app, 'Resources', 'application.ini'), `Version=${CAMOUFOX_VERSION}\n`);
+    assert.deepEqual(camoufoxState(path.join(dir, 'mac'), 'darwin', {}), { ready: true });
+
+    // On Windows the service also takes the one in LOCALAPPDATA
+    const cache = path.join(dir, 'appdata', 'camoufox', 'camoufox', 'Cache');
+    fs.mkdirSync(cache, { recursive: true });
+    fs.writeFileSync(path.join(cache, 'camoufox.exe'), '');
+    fs.writeFileSync(path.join(cache, 'application.ini'), `Version=${CAMOUFOX_VERSION}\n`);
+    assert.deepEqual(camoufoxState(path.join(dir, 'none'), 'win32', { LOCALAPPDATA: path.join(dir, 'appdata') }), { ready: true });
+    // One CAMOUFOX_PATH names is the only one it takes, and it downloads none over it
+    assert.deepEqual(camoufoxState(path.join(dir, 'none'), 'linux', { CAMOUFOX_PATH: '/opt/camoufox/camoufox-bin' }), { ready: true });
+  });
+});

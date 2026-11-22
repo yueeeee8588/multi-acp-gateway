@@ -31,6 +31,8 @@ import { SettingsPage } from "./Settings";
 import { PromptRulesPage } from "./PromptRules";
 import { AcpConsolePage } from "./acp/AcpConsolePage";
 import { useAcpGateway } from "./acp/useAcpGateway";
+import { AiStudioConsolePage } from "./aistudio/AiStudioConsolePage";
+import { useAiStudioGateway } from "./aistudio/useAiStudioGateway";
 import { PromoBanner } from "./PromoBanner";
 import { Mascot } from "./Mascot";
 import { useUpdateCheck } from "./useUpdateCheck";
@@ -58,10 +60,11 @@ const navigation = [
   { id: "providers", label: "服务提供商", icon: Server },
   { id: "prompts", label: "提示词与风控", icon: Sparkles },
   { id: "acp", label: "ACP 控制台", icon: Server },
+  { id: "aistudio", label: "AI Studio", icon: Sparkles },
   { id: "settings", label: "系统设置", icon: Settings2, section: "系统设置" },
 ] as const;
 type Page = (typeof navigation)[number]["id"];
-const independentlyLoadedPages: readonly Page[] = ["dashboard", "providers", "acp"];
+const independentlyLoadedPages: readonly Page[] = ["dashboard", "providers", "acp", "aistudio"];
 
 function Brand() {
   return (
@@ -416,6 +419,7 @@ export default function App() {
   const [updateFocusRequest, setUpdateFocusRequest] = useState(0);
   const updateCheck = useUpdateCheck(!!state);
   const acp = useAcpGateway(!!state && page === "acp");
+  const aistudio = useAiStudioGateway(!!state && page === "aistudio");
   const [notice, setNotice] = useState<{ text: string; error: boolean } | null>(
     null,
   );
@@ -532,6 +536,12 @@ export default function App() {
       setRevision((value) => value + 1);
       if (page === "acp") {
         await acp.refreshAll();
+      } else if (page === "aistudio") {
+        const res = await aistudio.refreshAll();
+        if (!res.ok) {
+          notify(res.error || "AI Studio 刷新失败", true);
+          return;
+        }
       }
       notify("数据已刷新");
     } catch (failure) {
@@ -729,6 +739,13 @@ export default function App() {
                 void navigate("playground");
                 notify(`已切换到聊天页，可选择模型 ${modelId}`);
               }}
+            />
+          )}
+          {page === "aistudio" && (
+            <AiStudioConsolePage
+              aistudio={aistudio}
+              notify={notify}
+              onLoadingChange={reportPageLoading}
             />
           )}
           {page === "settings" && !pageLoading && (
