@@ -464,7 +464,7 @@ export function AcpSettingsView({
                   type="text"
                   value={draft.agyPath}
                   onChange={(e) => updateField('agyPath', e.target.value)}
-                  placeholder="例如 D:\path\to\agy.exe"
+                  placeholder="例如 C:\path\to\agy.exe"
                 />
               </Field>
 

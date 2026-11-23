@@ -1073,7 +1073,7 @@ export class AccountManager {
     let conn: AcpProbeConnectionLike | null = null;
     let timeoutTimer: ReturnType<typeof setTimeout> | undefined;
     try {
-      const binaryPath = resolveAgyBinary();
+      const binaryPath = resolveAgyBinary(getConfig().agyPath);
       const cwd = getDataRoot();
       const args = buildAgyWorkerArgs({
         homeDir: acc.homeDir,

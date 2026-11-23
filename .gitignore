@@ -2,6 +2,8 @@
 **/data/
 **/node_modules/
 **/dist/
+dist/
+.cache/
 *.log*
 *.db*
 master.key

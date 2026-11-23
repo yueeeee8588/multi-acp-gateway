@@ -1,0 +1,9 @@
+pub const APP_DISPLAY_NAME: &str = "Multi-ACP Gateway";
+pub const APP_DATA_FOLDER: &str = "MultiAcpGateway";
+pub const AUTOSTART_REG_NAME: &str = "MultiAcpGateway";
+pub const MUTEX_NAME: &str = "Local\\MultiAcpGatewayTraySingleton";
+pub const STOP_EVENT_NAME: &str = "Local\\MultiAcpGatewayTrayStop";
+pub const SHOW_EVENT_NAME: &str = "Local\\MultiAcpGatewayTrayShow";
+pub const GATEWAY_EXE_NAME: &str = "multi-acp-gateway.exe";
+pub const ACP_8048_DIR_CANDIDATES: &[&str] = &["acp-gateway-8048"];
+pub const CONSOLE_URL: &str = "http://127.0.0.1:8046";

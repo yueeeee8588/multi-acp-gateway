@@ -179,21 +179,16 @@ input[type="date"]::-webkit-calendar-picker-indicator { opacity: 0.55; cursor: p
   place-items: center;
   width: 42px;
   height: 42px;
-  border-radius: 15px;
-  background: var(--primary-gradient);
-  color: #fff;
-  box-shadow: 0 8px 18px -8px rgb(214 55 122 / 70%), inset 0 1px 0 rgb(255 255 255 / 30%);
-  transform: rotate(-6deg);
+  overflow: hidden;
+  border-radius: 12px;
+  background: #111214;
+  box-shadow: 0 8px 18px -10px rgb(0 0 0 / 55%);
 }
-.brand-mark::after {
-  content: "";
-  position: absolute;
-  top: -4px;
-  right: -4px;
-  width: 13px;
-  height: 13px;
-  background: var(--honey-400);
-  clip-path: polygon(50% 0, 62% 38%, 100% 50%, 62% 62%, 50% 100%, 38% 62%, 0 50%, 38% 38%);
+.brand-mark > img {
+  width: 100%;
+  height: 100%;
+  display: block;
+  object-fit: cover;
 }
 .brand-word { font-family: var(--font-serif); font-size: 22px; line-height: 1; font-weight: 700; color: var(--pink-500); letter-spacing: 0.04em; }
 .brand-word > span { display: block; font-family: var(--font-ui); font-size: 10px; font-weight: 600; margin-top: 6px; color: var(--muted); letter-spacing: 0.14em; }
@@ -1287,7 +1282,7 @@ td strong { font-weight: 700; color: var(--ink); }
 .full-loading .brand-mark { animation: brand-bob 1.8s ease-in-out infinite; }
 .full-loading > svg { color: var(--pink-500); }
 .full-loading .error-box { max-width: 440px; }
-@keyframes brand-bob { 50% { transform: rotate(-6deg) translateY(-6px); } }
+@keyframes brand-bob { 50% { transform: translateY(-6px); } }
 .nav-backdrop { display: none; }
 /* Decorative glyphs are hidden from assistive technology where alt text is supported. */
 .nav-label::before { content: "✦ "; content: "✦ " / ""; }

@@ -34,7 +34,7 @@ import { useAcpGateway } from "./acp/useAcpGateway";
 import { AiStudioConsolePage } from "./aistudio/AiStudioConsolePage";
 import { useAiStudioGateway } from "./aistudio/useAiStudioGateway";
 import { PromoBanner } from "./PromoBanner";
-import { Mascot } from "./Mascot";
+import { Mascot, ANTIGRAVITY_ICON_DATA_URI } from "./Mascot";
 import { useUpdateCheck } from "./useUpdateCheck";
 import { useMinSpin } from "./useMinSpin";
 import { version } from "../package.json";
@@ -70,26 +70,14 @@ function Brand() {
   return (
     <div className="brand">
       <span className="brand-mark">
-        <svg
-          width={23}
-          height={23}
-          viewBox="0 0 24 24"
-          fill="none"
-          stroke="currentColor"
-          strokeWidth={2.2}
-          strokeLinecap="round"
-          strokeLinejoin="round"
+        <img
+          src={ANTIGRAVITY_ICON_DATA_URI}
+          width={42}
+          height={42}
+          alt=""
           aria-hidden="true"
-        >
-          <path d="M12 5c-2.8 0-5 1.1-6.5 2.5L3.5 3.5l1.8 6.2C4.5 11.2 4 12.8 4 14.5 4 18.6 7.6 21 12 21s8-2.4 8-6.5c0-1.7-.5-3.3-1.3-4.8L20.5 3.5l-2 4C17 6.1 14.8 5 12 5Z" />
-          <circle cx="9" cy="13.5" r="1" fill="currentColor" />
-          <circle cx="15" cy="13.5" r="1" fill="currentColor" />
-          <path d="M10.2 16.5c.8.6 1.2.6 1.8.6s1-.1 1.8-.6" />
-          <path d="M6 14H2" />
-          <path d="M6 16.5H3" />
-          <path d="M18 14h4" />
-          <path d="M18 16.5h3" />
-        </svg>
+          draggable={false}
+        />
       </span>
       <span className="brand-word">
         多功能 ACP<span>聚合网关</span>

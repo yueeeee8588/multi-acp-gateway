@@ -21,6 +21,8 @@ concurrency:
 jobs:
   release:
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -88,3 +90,87 @@ jobs:
             exit 0
           fi
           gh release create "$TAG" --title "$TAG" --target "$GITHUB_SHA" --generate-notes
+
+  build-windows-installer:
+    runs-on: windows-latest
+    needs: release
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: 'web/package-lock.json'
+
+      - name: Build frontend
+        working-directory: web
+        shell: pwsh
+        run: |
+          npm ci
+          npm run build
+
+      - name: Setup Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release binaries
+        shell: pwsh
+        run: cargo build --release --locked
+
+      - name: Run sensitive info zero-leak gate
+        shell: pwsh
+        run: pwsh -File scripts/scan-sensitive.ps1 -TargetDir .
+
+      - name: Stage Windows bundle
+        shell: pwsh
+        run: pwsh -File scripts/stage-windows-bundle.ps1 -Profile public -SkipBuild
+
+      - name: Compile Inno Setup installer
+        shell: pwsh
+        env:
+          APP_VERSION: ${{ needs.release.outputs.version }}
+        run: |
+          $isccCmd = Get-Command iscc -ErrorAction SilentlyContinue
+          if ($null -ne $isccCmd) {
+            $iscc = $isccCmd.Source
+          } else {
+            $fallback = 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe'
+            if (-not (Test-Path -LiteralPath $fallback)) {
+              throw "Inno Setup compiler (ISCC.exe) not found in PATH or at $fallback"
+            }
+            $iscc = $fallback
+          }
+          & $iscc "/DAppVersion=$env:APP_VERSION" "installer\setup.iss"
+          if ($LASTEXITCODE -ne 0) {
+            throw "ISCC.exe failed with exit code $LASTEXITCODE"
+          }
+
+      - name: Generate SHA256SUMS.txt
+        shell: pwsh
+        env:
+          APP_VERSION: ${{ needs.release.outputs.version }}
+        run: |
+          $installerName = "MultiAcpGateway-v$env:APP_VERSION-win64-Setup.exe"
+          $installerPath = Join-Path "dist" $installerName
+          if (-not (Test-Path -LiteralPath $installerPath)) {
+            throw "Expected installer not found at $installerPath"
+          }
+          $hash = (Get-FileHash -LiteralPath $installerPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  $installerName" | Set-Content -LiteralPath "dist\SHA256SUMS.txt" -Encoding ascii
+
+      - name: Upload Windows installer assets to GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          APP_VERSION: ${{ needs.release.outputs.version }}
+        run: |
+          $tag = "v$env:APP_VERSION"
+          $installerPath = "dist/MultiAcpGateway-v$env:APP_VERSION-win64-Setup.exe"
+          gh release upload "$tag" "$installerPath" "dist/SHA256SUMS.txt" --clobber
+          if ($LASTEXITCODE -ne 0) {
+            throw "gh release upload failed with exit code $LASTEXITCODE"
+          }

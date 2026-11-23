@@ -258,7 +258,7 @@ function spawnAgyModelsList(): Promise<string[]> {
             return;
           }
         }
-        const binaryPath = resolveAgyBinary();
+        const binaryPath = resolveAgyBinary(cfg.agyPath);
         const env = buildIsolatedAgyEnv({
           homeDir: readyAccount.homeDir,
           proxyUrl: effectiveProxy,

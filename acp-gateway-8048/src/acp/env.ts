@@ -70,13 +70,52 @@ export function getBrowserShimDir(dataRoot?: string): string {
   return shimDir;
 }
 
-export function resolveOfficialAgyBinary(agyPath?: string): string {
-  const explicit = agyPath || process.env.AGY_PATH;
-  if (explicit) {
-    if (fs.existsSync(explicit)) {
-      return explicit;
+function isExistingFile(filePath: string): boolean {
+  try {
+    return fs.existsSync(filePath) && fs.statSync(filePath).isFile();
+  } catch {
+    return false;
+  }
+}
+
+function collectAntigravityProgramDirs(baseProgramsDir: string): string[] {
+  const dirs: string[] = [];
+  try {
+    if (!fs.existsSync(baseProgramsDir)) {
+      return dirs;
     }
-    throw new Error(`AGY_PATH set to '${explicit}' but file does not exist`);
+    const entries = fs.readdirSync(baseProgramsDir, { withFileTypes: true });
+    for (const entry of entries) {
+      if (entry.isDirectory() && /^antigravity/i.test(entry.name)) {
+        const fullDir = path.join(baseProgramsDir, entry.name);
+        dirs.push(path.join(fullDir, "bin"), fullDir);
+      }
+    }
+  } catch {
+    // Ignore unreadable program directories during auto-detection.
+  }
+  return dirs;
+}
+
+export function resolveOfficialAgyBinary(agyPath?: string): string {
+  const envAgyPath = process.env.AGY_PATH?.trim();
+  if (envAgyPath) {
+    if (isExistingFile(envAgyPath)) {
+      return envAgyPath;
+    }
+    console.warn(
+      `[acp-8048] AGY_PATH is set to '${envAgyPath}', but file does not exist; falling back to config/auto-detection.`,
+    );
+  }
+
+  const configAgyPath = agyPath?.trim();
+  if (configAgyPath) {
+    if (isExistingFile(configAgyPath)) {
+      return configAgyPath;
+    }
+    console.warn(
+      `[acp-8048] Configured agyPath '${configAgyPath}' does not exist; falling back to auto-detection.`,
+    );
   }
 
   const windows = process.platform === "win32";
@@ -88,14 +127,21 @@ export function resolveOfficialAgyBinary(agyPath?: string): string {
     pathsToSearch.push(...pathEnv.split(path.delimiter).filter(Boolean));
   }
 
-  const home = HOST_HOME || os.homedir();
+  const home = HOST_HOME || process.env.USERPROFILE || os.homedir();
   if (windows) {
+    const localAppData = process.env.LOCALAPPDATA || path.join(home, "AppData", "Local");
     pathsToSearch.push(
-      path.join(process.env.LOCALAPPDATA || path.join(home, "AppData", "Local"), "agy", "bin"),
-      path.join(process.env.LOCALAPPDATA || path.join(home, "AppData", "Local"), "Programs", "Antigravity", "bin"),
+      ...collectAntigravityProgramDirs(path.join(localAppData, "Programs")),
+      path.join(localAppData, "agy", "bin"),
+      path.join(localAppData, "agy"),
       path.join(home, ".local", "bin"),
       path.join(home, ".gemini", "bin"),
     );
+    if (process.env.ProgramFiles) {
+      pathsToSearch.push(
+        ...collectAntigravityProgramDirs(process.env.ProgramFiles),
+      );
+    }
   } else {
     pathsToSearch.push(
       "/opt/homebrew/bin",
@@ -105,23 +151,28 @@ export function resolveOfficialAgyBinary(agyPath?: string): string {
     );
   }
 
+  const seenDirs = new Set<string>();
+
   for (const dir of pathsToSearch) {
+    const normalizedDir = windows ? path.resolve(dir).toLowerCase() : path.resolve(dir);
+    if (seenDirs.has(normalizedDir)) continue;
+    seenDirs.add(normalizedDir);
+
     for (const name of names) {
       const candidate = path.join(dir, name);
-      try {
-        if (fs.existsSync(candidate) && fs.statSync(candidate).isFile()) {
-          return candidate;
-        }
-      } catch {}
+      if (isExistingFile(candidate)) {
+        return candidate;
+      }
     }
   }
 
-  throw new Error("Antigravity CLI (agy) binary not found. Please install agy or set AGY_PATH.");
+  throw new Error(
+    "Antigravity CLI (agy.exe / agy) binary not found. Checked AGY_PATH, config.agyPath, PATH, and standard install directories. Please install agy.exe or specify its path in config.agyPath or AGY_PATH.",
+  );
 }
 
 export function resolveAgyBinary(agyPath?: string): string {
-  const explicit = agyPath || process.env.AGY_PATH;
-  return resolveOfficialAgyBinary(explicit);
+  return resolveOfficialAgyBinary(agyPath);
 }
 
 function mergeNoProxy(existing?: string): string {

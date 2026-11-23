@@ -25,6 +25,11 @@ use std::{
 };
 use store::{StickyBinding, Store};
 
+#[derive(rust_embed::RustEmbed)]
+#[folder = "web/dist"]
+#[allow_missing = true]
+struct EmbeddedWeb;
+
 #[derive(Default, Clone, serde::Serialize)]
 pub struct Runtime {
     pub active: u32,
@@ -292,17 +297,24 @@ async fn console(State(state): State<Shared>, headers: HeaderMap, uri: Uri) -> R
     if asset && (path.contains("..") || path.contains('\\')) {
         return StatusCode::NOT_FOUND.into_response();
     }
-    let file = state
-        .web_dir
-        .join(if asset { &path[1..] } else { "index.html" });
-    match tokio::fs::read(file).await {
-        Ok(bytes) => {
+    let rel_path = if asset { &path[1..] } else { "index.html" };
+    let bytes = if !state.web_dir.as_os_str().is_empty() && state.web_dir.is_dir() {
+        tokio::fs::read(state.web_dir.join(rel_path)).await.ok()
+    } else {
+        EmbeddedWeb::get(rel_path).map(|file| file.data.into_owned())
+    };
+    match bytes {
+        Some(bytes) => {
             let content = if path.ends_with(".js") {
                 "application/javascript"
             } else if path.ends_with(".css") {
                 "text/css"
             } else if path.ends_with(".svg") {
                 "image/svg+xml"
+            } else if path.ends_with(".png") {
+                "image/png"
+            } else if path.ends_with(".ico") {
+                "image/x-icon"
             } else if path.ends_with(".woff2") {
                 "font/woff2"
             } else if path.ends_with(".woff") {
@@ -338,11 +350,17 @@ async fn console(State(state): State<Shared>, headers: HeaderMap, uri: Uri) -> R
             }
             response
         }
-        Err(_) => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Frontend is not built. Run npm ci && npm run build in web/.",
-        )
-            .into_response(),
+        None => {
+            if asset {
+                StatusCode::NOT_FOUND.into_response()
+            } else {
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Frontend is not built. Run npm ci && npm run build in web/.",
+                )
+                    .into_response()
+            }
+        }
     }
 }
 pub fn new_app(data_dir: &std::path::Path, web_dir: std::path::PathBuf) -> Result<Shared, String> {
@@ -403,4 +421,95 @@ pub fn new_app(data_dir: &std::path::Path, web_dir: std::path::PathBuf) -> Resul
         web_dir,
         autostart_sync: std::sync::atomic::AtomicBool::new(false),
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::to_bytes;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn console_falls_back_to_embedded_web_when_web_dir_empty_or_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = new_app(dir.path(), std::path::PathBuf::new()).unwrap();
+        let security_path = state.store.config().unwrap().settings.security_path;
+        let router = app(state.clone());
+
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/{security_path}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get("content-type").unwrap(),
+            "text/html; charset=utf-8"
+        );
+        assert!(resp.headers().contains_key("content-security-policy"));
+        let body = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let html = String::from_utf8_lossy(&body);
+        assert!(html.contains("<html"));
+
+        // Non-existent web_dir also falls back to embedded
+        let state_missing = new_app(dir.path(), dir.path().join("nonexistent-web")).unwrap();
+        let resp_missing = app(state_missing)
+            .oneshot(
+                Request::builder()
+                    .uri("/favicon.svg")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_missing.status(), StatusCode::OK);
+        assert_eq!(
+            resp_missing.headers().get("content-type").unwrap(),
+            "image/svg+xml"
+        );
+
+        // Path traversal is blocked
+        let resp_traversal = router
+            .oneshot(
+                Request::builder()
+                    .uri("/assets/../index.html")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_traversal.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn console_prefers_external_web_dir_when_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let ext_web = dir.path().join("ext-web");
+        std::fs::create_dir_all(&ext_web).unwrap();
+        std::fs::write(ext_web.join("index.html"), "<html>external-override</html>").unwrap();
+
+        let state = new_app(dir.path(), ext_web).unwrap();
+        let security_path = state.store.config().unwrap().settings.security_path;
+        let resp = app(state)
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/{security_path}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&body),
+            "<html>external-override</html>"
+        );
+    }
 }
