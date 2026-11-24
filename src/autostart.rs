@@ -760,6 +760,29 @@ fn aistudio_available_in_tray(
                 return true;
             }
         }
+        for rel in [
+            ["services", "magpie-aistudio-2048", "bin", "aistudio2api.exe"].as_slice(),
+            ["services", "magpie-aistudio-2048", "data", "aistudio2api.exe"].as_slice(),
+            ["magpie-aistudio-2048", "data", "aistudio2api.exe"].as_slice(),
+        ] {
+            let candidate = rel.iter().fold(dir.clone(), |acc, seg| acc.join(seg));
+            if candidate.is_file() {
+                return true;
+            }
+        }
+    }
+
+    for rel in [
+        ["services", "magpie-aistudio-2048", "bin", "aistudio2api.exe"].as_slice(),
+        ["services", "magpie-aistudio-2048", "data", "aistudio2api.exe"].as_slice(),
+        ["magpie-aistudio-2048", "data", "aistudio2api.exe"].as_slice(),
+    ] {
+        let candidate = rel
+            .iter()
+            .fold(work_dir.to_path_buf(), |acc, seg| acc.join(seg));
+        if candidate.is_file() {
+            return true;
+        }
     }
 
     resolve_aistudio_dir(work_dir, aistudio_gateway_dir_env)
@@ -1202,5 +1225,43 @@ mod tests {
         assert!(!startup_dir.join(ACP_8048_SCRIPT).exists());
         assert!(!startup_dir.join(APP2API_8049_SCRIPT).exists());
         assert!(startup_dir.join(AISTUDIO_2048_SCRIPT).exists());
+    }
+
+    #[test]
+    fn aistudio_available_in_tray_checks_bundled_2048_exe_paths() {
+        for rel in [
+            ["services", "magpie-aistudio-2048", "bin", "aistudio2api.exe"].as_slice(),
+            ["services", "magpie-aistudio-2048", "data", "aistudio2api.exe"].as_slice(),
+            ["magpie-aistudio-2048", "data", "aistudio2api.exe"].as_slice(),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let tray_dir = dir.path().join("install");
+            let work_dir = dir.path().join("work");
+            std::fs::create_dir_all(&tray_dir).unwrap();
+            std::fs::create_dir_all(&work_dir).unwrap();
+            let tray_exe = tray_dir.join("gateway-tray.exe");
+
+            assert!(!aistudio_available_in_tray(
+                &work_dir,
+                None,
+                None,
+                Some(tray_exe.to_str().unwrap()),
+            ));
+
+            let exe_path = rel.iter().fold(tray_dir.clone(), |acc, seg| acc.join(seg));
+            std::fs::create_dir_all(exe_path.parent().unwrap()).unwrap();
+            std::fs::write(&exe_path, b"").unwrap();
+
+            assert!(
+                aistudio_available_in_tray(
+                    &work_dir,
+                    None,
+                    None,
+                    Some(tray_exe.to_str().unwrap()),
+                ),
+                "expected available=true for {}",
+                exe_path.display()
+            );
+        }
     }
 }

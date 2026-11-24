@@ -4,6 +4,7 @@ import {
   Activity,
   ArrowRight,
   ChevronRight,
+  Cpu,
   Database,
   Eye,
   EyeOff,
@@ -31,6 +32,8 @@ import { SettingsPage } from "./Settings";
 import { PromptRulesPage } from "./PromptRules";
 import { AcpConsolePage } from "./acp/AcpConsolePage";
 import { useAcpGateway } from "./acp/useAcpGateway";
+import { App2ApiConsolePage } from "./app2api/App2ApiConsolePage";
+import { useApp2ApiGateway } from "./app2api/useApp2ApiGateway";
 import { AiStudioConsolePage } from "./aistudio/AiStudioConsolePage";
 import { useAiStudioGateway } from "./aistudio/useAiStudioGateway";
 import { PromoBanner } from "./PromoBanner";
@@ -60,11 +63,12 @@ const navigation = [
   { id: "providers", label: "服务提供商", icon: Server },
   { id: "prompts", label: "提示词与风控", icon: Sparkles },
   { id: "acp", label: "ACP 控制台", icon: Server },
+  { id: "app2api", label: "Gemini App", icon: Cpu },
   { id: "aistudio", label: "AI Studio", icon: Sparkles },
   { id: "settings", label: "系统设置", icon: Settings2, section: "系统设置" },
 ] as const;
 type Page = (typeof navigation)[number]["id"];
-const independentlyLoadedPages: readonly Page[] = ["dashboard", "providers", "acp", "aistudio"];
+const independentlyLoadedPages: readonly Page[] = ["dashboard", "providers", "acp", "app2api", "aistudio"];
 
 function Brand() {
   return (
@@ -407,6 +411,7 @@ export default function App() {
   const [updateFocusRequest, setUpdateFocusRequest] = useState(0);
   const updateCheck = useUpdateCheck(!!state);
   const acp = useAcpGateway(!!state && page === "acp");
+  const app2api = useApp2ApiGateway(!!state && page === "app2api");
   const aistudio = useAiStudioGateway(!!state && page === "aistudio");
   const [notice, setNotice] = useState<{ text: string; error: boolean } | null>(
     null,
@@ -524,6 +529,8 @@ export default function App() {
       setRevision((value) => value + 1);
       if (page === "acp") {
         await acp.refreshAll();
+      } else if (page === "app2api") {
+        await app2api.refreshAll();
       } else if (page === "aistudio") {
         const res = await aistudio.refreshAll();
         if (!res.ok) {
@@ -727,6 +734,13 @@ export default function App() {
                 void navigate("playground");
                 notify(`已切换到聊天页，可选择模型 ${modelId}`);
               }}
+            />
+          )}
+          {page === "app2api" && (
+            <App2ApiConsolePage
+              app2api={app2api}
+              notify={notify}
+              onLoadingChange={reportPageLoading}
             />
           )}
           {page === "aistudio" && (

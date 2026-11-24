@@ -15,6 +15,7 @@ use std::{
 };
 
 const DEFAULT_ACP_UPSTREAM_BASE: &str = "http://127.0.0.1:8048";
+const DEFAULT_APP2API_UPSTREAM_BASE: &str = "http://127.0.0.1:8049";
 const DEFAULT_AISTUDIO_UPSTREAM_BASE: &str = "http://127.0.0.1:2048";
 const AISTUDIO_GATEWAY_LABEL: &str = "2048 AIStudio gateway";
 const AISTUDIO_PRE_REFRESH_BUFFER: Duration = Duration::from_secs(60);
@@ -82,7 +83,7 @@ fn should_strip_request_header(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     matches!(
         lower.as_str(),
-        "host" | "cookie" | "x-console-path"
+        "host" | "cookie" | "x-console-path" | "x-zako-trusted-proxy"
     ) || is_hop_by_hop_header(&lower)
 }
 
@@ -123,6 +124,15 @@ fn forward_request_headers(headers: &HeaderMap, method: &Method) -> reqwest::hea
     out
 }
 
+fn inject_trusted_proxy_header(headers: &mut reqwest::header::HeaderMap, prefix: &str) {
+    if prefix == "/app2api-api" {
+        headers.insert(
+            reqwest::header::HeaderName::from_static("x-zako-trusted-proxy"),
+            reqwest::header::HeaderValue::from_static("1"),
+        );
+    }
+}
+
 async fn proxy_with_config(
     state: Shared,
     req: Request,
@@ -146,7 +156,8 @@ async fn proxy_with_config(
     let target_url = build_target_url(&base, prefix, req.uri());
     let method = reqwest::Method::from_bytes(req.method().as_str().as_bytes())
         .unwrap_or(reqwest::Method::GET);
-    let headers = forward_request_headers(req.headers(), req.method());
+    let mut headers = forward_request_headers(req.headers(), req.method());
+    inject_trusted_proxy_header(&mut headers, prefix);
 
     let mut builder = client().request(method, &target_url).headers(headers);
     if *req.method() != Method::GET && *req.method() != Method::HEAD {
@@ -194,6 +205,21 @@ pub async fn handle(State(state): State<Shared>, req: Request) -> Result<Respons
         "ACP_UPSTREAM_BASE",
         DEFAULT_ACP_UPSTREAM_BASE,
         "8048 ACP gateway",
+    )
+    .await
+}
+
+pub async fn handle_app2api(
+    State(state): State<Shared>,
+    req: Request,
+) -> Result<Response, ApiError> {
+    proxy_with_config(
+        state,
+        req,
+        "/app2api-api",
+        "APP2API_UPSTREAM_BASE",
+        DEFAULT_APP2API_UPSTREAM_BASE,
+        "8049 App2API gateway",
     )
     .await
 }
@@ -250,15 +276,19 @@ fn parse_aistudio_env_contents(contents: &str) -> AistudioEnvCreds {
     }
 }
 
-fn aistudio_env_candidate_paths() -> Vec<std::path::PathBuf> {
+fn aistudio_env_candidate_paths_from(
+    env_file: Option<&str>,
+    app_data_dir: Option<&std::ffi::OsStr>,
+    user_profile: Option<&std::ffi::OsStr>,
+) -> Vec<std::path::PathBuf> {
     let mut paths = Vec::new();
-    if let Ok(env_file) = std::env::var("AISTUDIO_ENV_FILE") {
-        let trimmed = env_file.trim();
-        if !trimmed.is_empty() {
-            paths.push(std::path::PathBuf::from(trimmed));
-        }
+    if let Some(trimmed) = env_file.map(str::trim).filter(|s| !s.is_empty()) {
+        paths.push(std::path::PathBuf::from(trimmed));
     }
-    if let Some(profile) = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME")) {
+    if let Some(app_data) = app_data_dir.filter(|s| !s.is_empty()) {
+        paths.push(std::path::PathBuf::from(app_data).join("2048").join(".env"));
+    }
+    if let Some(profile) = user_profile {
         paths.push(
             std::path::PathBuf::from(profile)
                 .join(".local")
@@ -273,6 +303,17 @@ fn aistudio_env_candidate_paths() -> Vec<std::path::PathBuf> {
             .join(".env"),
     );
     paths
+}
+
+fn aistudio_env_candidate_paths() -> Vec<std::path::PathBuf> {
+    let env_file = std::env::var("AISTUDIO_ENV_FILE").ok();
+    let app_data = std::env::var_os("APP_DATA_DIR");
+    let profile = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"));
+    aistudio_env_candidate_paths_from(
+        env_file.as_deref(),
+        app_data.as_deref(),
+        profile.as_deref(),
+    )
 }
 
 fn load_aistudio_admin_creds() -> Option<AistudioAdminCreds> {
@@ -747,6 +788,153 @@ pub async fn handle_aistudio(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn build_target_url_strips_prefix_and_preserves_query() {
+        let base = "http://127.0.0.1:8049";
+        assert_eq!(
+            build_target_url(base, "/app2api-api", &"/app2api-api".parse().unwrap()),
+            "http://127.0.0.1:8049/"
+        );
+        assert_eq!(
+            build_target_url(base, "/app2api-api", &"/app2api-api/".parse().unwrap()),
+            "http://127.0.0.1:8049/"
+        );
+        assert_eq!(
+            build_target_url(
+                base,
+                "/app2api-api",
+                &"/app2api-api?tab=accounts".parse().unwrap()
+            ),
+            "http://127.0.0.1:8049/?tab=accounts"
+        );
+        assert_eq!(
+            build_target_url(
+                base,
+                "/app2api-api",
+                &"/app2api-api/api/accounts?page=2&active=true".parse().unwrap()
+            ),
+            "http://127.0.0.1:8049/api/accounts?page=2&active=true"
+        );
+        assert_eq!(
+            build_target_url(
+                "http://127.0.0.1:8048",
+                "/acp-api",
+                &"/acp-api/status?verbose=1".parse().unwrap()
+            ),
+            "http://127.0.0.1:8048/status?verbose=1"
+        );
+    }
+
+    #[test]
+    fn forward_request_headers_preserves_business_headers_and_strips_hop_by_hop() {
+        let mut headers = HeaderMap::new();
+        headers.insert("host", HeaderValue::from_static("example.com"));
+        headers.insert("cookie", HeaderValue::from_static("sid=secret"));
+        headers.insert("x-console-path", HeaderValue::from_static("/admin"));
+        headers.insert("x-zako-trusted-proxy", HeaderValue::from_static("1"));
+        headers.insert("connection", HeaderValue::from_static("keep-alive"));
+        headers.insert("trailer", HeaderValue::from_static("X-Checksum"));
+        headers.insert("trailers", HeaderValue::from_static("X-Checksum"));
+        headers.insert("accept", HeaderValue::from_static("text/event-stream"));
+        headers.insert("content-type", HeaderValue::from_static("application/json"));
+        headers.insert("content-length", HeaderValue::from_static("12"));
+        headers.insert("authorization", HeaderValue::from_static("Bearer token-123"));
+
+        let forwarded = forward_request_headers(&headers, &Method::POST);
+        assert!(forwarded.get("host").is_none());
+        assert!(forwarded.get("cookie").is_none());
+        assert!(forwarded.get("x-console-path").is_none());
+        assert!(forwarded.get("x-zako-trusted-proxy").is_none());
+        assert!(forwarded.get("connection").is_none());
+        assert!(forwarded.get("trailer").is_none());
+        assert!(forwarded.get("trailers").is_none());
+        assert_eq!(forwarded.get("accept").unwrap(), "text/event-stream");
+        assert_eq!(forwarded.get("content-type").unwrap(), "application/json");
+        assert_eq!(forwarded.get("content-length").unwrap(), "12");
+        assert_eq!(forwarded.get("authorization").unwrap(), "Bearer token-123");
+    }
+
+    #[test]
+    fn forward_request_headers_strips_content_length_on_get_and_head() {
+        let mut headers = HeaderMap::new();
+        headers.insert("content-length", HeaderValue::from_static("42"));
+        headers.insert("accept", HeaderValue::from_static("application/json"));
+
+        let get_forwarded = forward_request_headers(&headers, &Method::GET);
+        assert!(get_forwarded.get("content-length").is_none());
+        assert_eq!(get_forwarded.get("accept").unwrap(), "application/json");
+
+        let head_forwarded = forward_request_headers(&headers, &Method::HEAD);
+        assert!(head_forwarded.get("content-length").is_none());
+        assert_eq!(head_forwarded.get("accept").unwrap(), "application/json");
+    }
+
+    #[test]
+    fn inject_trusted_proxy_header_only_targets_app2api() {
+        let mut app2api_headers = reqwest::header::HeaderMap::new();
+        inject_trusted_proxy_header(&mut app2api_headers, "/app2api-api");
+        assert_eq!(
+            app2api_headers.get("x-zako-trusted-proxy").unwrap(),
+            "1"
+        );
+
+        let mut acp_headers = reqwest::header::HeaderMap::new();
+        inject_trusted_proxy_header(&mut acp_headers, "/acp-api");
+        assert!(acp_headers.get("x-zako-trusted-proxy").is_none());
+    }
+
+    #[tokio::test]
+    async fn unauthenticated_proxy_request_returns_401_with_session_expired_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = crate::new_app(dir.path(), dir.path().join("web")).unwrap();
+        let req = axum::http::Request::builder()
+            .method(Method::GET)
+            .uri("/app2api-api/api/accounts")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = handle_app2api(State(state), req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            resp.headers().get("x-zako-auth-error").unwrap(),
+            "session_expired"
+        );
+
+        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let json_body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json_body.get("error").and_then(|v| v.as_str()).is_some());
+    }
+
+    #[test]
+    fn aistudio_env_candidate_paths_includes_app_data_dir_2048_env() {
+        let paths = aistudio_env_candidate_paths_from(
+            Some("/custom/.env"),
+            Some(std::ffi::OsStr::new("/app-data")),
+            Some(std::ffi::OsStr::new("/home/user")),
+        );
+        assert_eq!(paths[0], std::path::PathBuf::from("/custom/.env"));
+        assert_eq!(
+            paths[1],
+            std::path::PathBuf::from("/app-data").join("2048").join(".env")
+        );
+        assert_eq!(
+            paths[2],
+            std::path::PathBuf::from("/home/user")
+                .join(".local")
+                .join("share")
+                .join("magpie-ai-studio")
+                .join(".env")
+        );
+        assert_eq!(
+            paths[3],
+            std::path::PathBuf::from("magpie-aistudio-2048")
+                .join("data")
+                .join(".env")
+        );
+    }
 
     #[test]
     fn build_target_url_for_aistudio_strips_prefix_and_preserves_query() {

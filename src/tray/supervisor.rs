@@ -298,6 +298,13 @@ fn build_service_command(id: ServiceId, paths: &TrayPaths) -> Result<Command, Se
             cmd.env("GATEWAY_TRAY_EXE", &paths.tray_exe);
             cmd.env("GATEWAY_TRAY_CONFIG", &paths.tray_config_path);
             cmd.env("GATEWAY_AUTOSTART_REG_NAME", AUTOSTART_REG_NAME);
+            cmd.env(
+                "AISTUDIO_ENV_FILE",
+                paths.data_root.join("2048").join(".env"),
+            );
+            if let Some(exe_2048) = resolve_2048_exe(&paths.install_dir) {
+                cmd.env("AISTUDIO_2048_EXE", exe_2048);
+            }
             Ok(cmd)
         }
         ServiceId::Acp8048 => {
@@ -993,5 +1000,50 @@ mod tests {
                 "expected {key}=1, got: {envs:?}"
             );
         }
+    }
+
+    #[test]
+    fn proxy_8046_command_injects_aistudio_env_file_and_exe() {
+        let dir = tempfile::tempdir().unwrap();
+        let install_dir = dir.path();
+        fs::write(install_dir.join(GATEWAY_EXE_NAME), b"").unwrap();
+
+        let paths = TrayPaths {
+            install_dir: install_dir.to_path_buf(),
+            data_root: install_dir.join("data"),
+            tray_exe: install_dir.join("gateway-tray.exe"),
+            tray_config_path: install_dir.join("tray.json"),
+        };
+
+        let expected_env_file = paths.data_root.join("2048").join(".env");
+
+        let cmd_without_2048 = build_service_command(ServiceId::Proxy8046, &paths).unwrap();
+        let envs_without: Vec<_> = cmd_without_2048.get_envs().collect();
+        assert!(envs_without.contains(&(
+            std::ffi::OsStr::new("AISTUDIO_ENV_FILE"),
+            Some(expected_env_file.as_os_str())
+        )));
+        assert!(!envs_without
+            .iter()
+            .any(|(k, _)| *k == std::ffi::OsStr::new("AISTUDIO_2048_EXE")));
+
+        let exe_2048 = install_dir
+            .join("services")
+            .join("magpie-aistudio-2048")
+            .join("bin")
+            .join("aistudio2api.exe");
+        fs::create_dir_all(exe_2048.parent().unwrap()).unwrap();
+        fs::write(&exe_2048, b"").unwrap();
+
+        let cmd_with_2048 = build_service_command(ServiceId::Proxy8046, &paths).unwrap();
+        let envs_with: Vec<_> = cmd_with_2048.get_envs().collect();
+        assert!(envs_with.contains(&(
+            std::ffi::OsStr::new("AISTUDIO_ENV_FILE"),
+            Some(expected_env_file.as_os_str())
+        )));
+        assert!(envs_with.contains(&(
+            std::ffi::OsStr::new("AISTUDIO_2048_EXE"),
+            Some(exe_2048.as_os_str())
+        )));
     }
 }

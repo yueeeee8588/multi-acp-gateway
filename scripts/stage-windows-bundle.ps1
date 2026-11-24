@@ -207,6 +207,115 @@ function Ensure-PortableNode {
     Write-Host "Staged Node.js v$Version -> $DestExePath"
 }
 
+function Ensure-AiStudio2048Exe {
+    param(
+        [Parameter(Mandatory = $true)][string]$LocalExePath,
+        [Parameter(Mandatory = $true)][string]$CacheDir,
+        [Parameter(Mandatory = $true)][string]$DestExePath
+    )
+
+    if (Test-Path -LiteralPath $LocalExePath -PathType Leaf) {
+        New-Item -ItemType Directory -Path (Split-Path -Parent $DestExePath) -Force | Out-Null
+        Copy-Item -LiteralPath $LocalExePath -Destination $DestExePath -Force
+        Write-Host "Reusing local AIStudio2API binary: $LocalExePath -> $DestExePath"
+        return
+    }
+
+    $apiUrl = 'https://api.github.com/repos/Mag1cFall/AIStudio2API/releases/latest'
+    $headers = @{
+        'User-Agent' = 'multi-acp-gateway-packager'
+        'Accept'     = 'application/vnd.github+json'
+    }
+    $token = $env:GITHUB_TOKEN
+    if ([string]::IsNullOrWhiteSpace($token)) {
+        $token = $env:GH_TOKEN
+    }
+    if (-not [string]::IsNullOrWhiteSpace($token)) {
+        $headers['Authorization'] = "Bearer $($token.Trim())"
+    }
+
+    Write-Host "Fetching latest AIStudio2API release metadata from $apiUrl ..."
+    $release = Invoke-RestMethod -Uri $apiUrl -Headers $headers -TimeoutSec 60
+    if ($null -eq $release -or $null -eq $release.assets) {
+        throw "Failed to fetch AIStudio2API release assets from $apiUrl"
+    }
+
+    $asset = $release.assets | Where-Object {
+        $_.name -imatch 'windows.*(amd64|x64).*\.(zip|exe)$' -or $_.name -imatch '(amd64|x64).*windows.*\.(zip|exe)$'
+    } | Select-Object -First 1
+    if ($null -eq $asset) {
+        $asset = $release.assets | Where-Object {
+            $_.name -imatch 'windows.*\.(zip|exe)$'
+        } | Select-Object -First 1
+    }
+    if ($null -eq $asset) {
+        throw "No Windows amd64/x64 release asset found in Mag1cFall/AIStudio2API ($($release.tag_name))"
+    }
+
+    $tag = if ([string]::IsNullOrWhiteSpace($release.tag_name)) { 'latest' } else { [string]$release.tag_name }
+    $aistudioCacheDir = Join-Path (Join-Path $CacheDir 'aistudio2api') $tag
+    New-Item -ItemType Directory -Path $aistudioCacheDir -Force | Out-Null
+    $cachedAsset = Join-Path $aistudioCacheDir $asset.name
+
+    $expectedSha = $null
+    if ($null -ne $asset.PSObject.Properties['digest'] -and -not [string]::IsNullOrWhiteSpace($asset.digest)) {
+        $digest = [string]$asset.digest
+        if ($digest -imatch '^sha256:([a-fA-F0-9]{64})$') {
+            $expectedSha = $Matches[1].ToLowerInvariant()
+        }
+    }
+
+    $needDownload = $true
+    if (Test-Path -LiteralPath $cachedAsset -PathType Leaf) {
+        if ($null -ne $expectedSha) {
+            $actual = Get-FileSha256Lower -FilePath $cachedAsset
+            if ($actual -eq $expectedSha) {
+                Write-Host "Reusing cached AIStudio2API asset: $cachedAsset (SHA256 verified)"
+                $needDownload = $false
+            } else {
+                Write-Warning "Cached AIStudio2API asset failed SHA256 check, re-downloading..."
+                Remove-Item -LiteralPath $cachedAsset -Force
+            }
+        } elseif ((Get-Item -LiteralPath $cachedAsset).Length -gt 0) {
+            Write-Host "Reusing cached AIStudio2API asset: $cachedAsset"
+            $needDownload = $false
+        }
+    }
+
+    if ($needDownload) {
+        Write-Host "Downloading AIStudio2API ($tag) from $($asset.browser_download_url) ..."
+        Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $cachedAsset -Headers $headers -UseBasicParsing -TimeoutSec 300
+        if ($null -ne $expectedSha) {
+            try {
+                Assert-Sha256 -FilePath $cachedAsset -ExpectedSha256 $expectedSha -Label "$($asset.name) ($tag)"
+            } catch {
+                Remove-Item -LiteralPath $cachedAsset -Force -ErrorAction SilentlyContinue
+                throw
+            }
+        }
+    }
+
+    New-Item -ItemType Directory -Path (Split-Path -Parent $DestExePath) -Force | Out-Null
+    if ($asset.name -imatch '\.zip$') {
+        $extractDir = Join-Path $aistudioCacheDir 'extracted'
+        if (Test-Path -LiteralPath $extractDir) {
+            Remove-Item -LiteralPath $extractDir -Recurse -Force
+        }
+        Expand-Archive -LiteralPath $cachedAsset -DestinationPath $extractDir -Force
+        $exeFile = Get-ChildItem -Path $extractDir -Filter 'aistudio2api.exe' -Recurse -File | Select-Object -First 1
+        if ($null -eq $exeFile) {
+            $exeFile = Get-ChildItem -Path $extractDir -Filter '*.exe' -Recurse -File | Select-Object -First 1
+        }
+        if ($null -eq $exeFile) {
+            throw "aistudio2api.exe not found inside $cachedAsset"
+        }
+        Copy-Item -LiteralPath $exeFile.FullName -Destination $DestExePath -Force
+    } else {
+        Copy-Item -LiteralPath $cachedAsset -Destination $DestExePath -Force
+    }
+    Write-Host "Staged AIStudio2API ($tag) -> $DestExePath"
+}
+
 function Copy-DirectoryFiltered {
     param(
         [Parameter(Mandatory = $true)][string]$SourceDir,
@@ -339,10 +448,10 @@ $service2048Dest = Join-Path $OutputDir 'services\magpie-aistudio-2048'
 New-Item -ItemType Directory -Path $service2048Dest -Force | Out-Null
 
 $aistudioExeSrc = Join-Path $service2048Src 'data\aistudio2api.exe'
-if (Test-Path -LiteralPath $aistudioExeSrc -PathType Leaf) {
-    $service2048Bin = Join-Path $service2048Dest 'bin'
-    New-Item -ItemType Directory -Path $service2048Bin -Force | Out-Null
-    Copy-Item -LiteralPath $aistudioExeSrc -Destination (Join-Path $service2048Bin 'aistudio2api.exe') -Force
+$staged2048Exe = Join-Path $service2048Dest 'bin\aistudio2api.exe'
+Ensure-AiStudio2048Exe -LocalExePath $aistudioExeSrc -CacheDir $RuntimeCacheDir -DestExePath $staged2048Exe
+if (-not (Test-Path -LiteralPath $staged2048Exe -PathType Leaf)) {
+    throw "Missing required 2048 binary after staging: $staged2048Exe"
 }
 Get-ChildItem -LiteralPath $service2048Src -Filter 'LICENSE*' -File | ForEach-Object {
     Copy-Item -LiteralPath $_.FullName -Destination (Join-Path $service2048Dest $_.Name) -Force
