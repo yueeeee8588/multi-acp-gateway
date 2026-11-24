@@ -5,7 +5,7 @@
   #define AppName "Multi-ACP Gateway"
 #endif
 #ifndef AppVersion
-  #define AppVersion "0.16.1"
+  #define AppVersion "0.16.2"
 #endif
 #ifndef AppPublisher
   #define AppPublisher "Multi-ACP Gateway"
@@ -77,6 +77,7 @@ Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: 
 
 [Run]
 Filename: "{app}\gateway-tray.exe"; Description: "{cm:LaunchProgram,{#StringChange(AppName, '&', '&&')}}"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\gateway-tray.exe"; Parameters: "--minimized"; Flags: nowait runhidden skipifnotsilent
 
 [UninstallRun]
 Filename: "{app}\gateway-tray.exe"; Parameters: "--stop"; Flags: runhidden waituntilterminated; RunOnceId: "StopGatewayTray"

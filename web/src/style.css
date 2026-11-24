@@ -1044,6 +1044,8 @@ td strong { font-weight: 700; color: var(--ink); }
 .setting-toggle-row strong { font-size: 14px; font-weight: 800; color: var(--ink); }
 .setting-toggle-row small { font-size: 12px; font-weight: 600; color: var(--muted); }
 .setting-toggle-row .toggle-label { gap: 0; }
+.setting-toggle-row.busy { opacity: 0.72; pointer-events: none; }
+.setting-toggle-control { display: inline-flex; align-items: center; gap: 10px; flex-shrink: 0; color: var(--muted); }
 .prefixed-input, .suffixed-input, .password-input { display: flex; align-items: center; overflow: hidden; border: 1.5px solid var(--line-strong); border-radius: var(--radius-sm); background: #fff; transition: border-color 160ms ease, box-shadow 160ms ease; }
 .prefixed-input:focus-within, .suffixed-input:focus-within, .password-input:focus-within { border-color: var(--pink-400); box-shadow: var(--ring); }
 .prefixed-input input, .suffixed-input input, .password-input input { height: 40px; border: 0; background: transparent; box-shadow: none; }

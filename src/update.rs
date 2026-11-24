@@ -6,16 +6,18 @@ use axum::{
     http::{HeaderMap, StatusCode},
     routing::get,
 };
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
+    collections::HashSet,
     path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant},
 };
 use tokio::{
-    io::{AsyncBufReadExt, BufReader},
+    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     process::Command,
     sync::Mutex,
 };
@@ -34,6 +36,12 @@ fn repository_git_url() -> String {
 fn release_api_url() -> String {
     format!("https://api.github.com/repos/{}/releases/latest", repository_slug())
 }
+fn release_tag_api_url(tag: &str) -> String {
+    format!(
+        "https://api.github.com/repos/{}/releases/tags/{tag}",
+        repository_slug()
+    )
+}
 fn image_ref() -> String {
     std::env::var("UPDATER_IMAGE")
         .ok()
@@ -42,6 +50,7 @@ fn image_ref() -> String {
         .unwrap_or_else(|| "multi-acp-gateway:latest".to_owned())
 }
 const MAX_LOGS: usize = 150;
+const MAX_INSTALLER_BYTES: u64 = 256 * 1024 * 1024;
 const RELEASE_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
 const RELEASE_RETRY_DELAY: Duration = Duration::from_secs(60);
 static RELEASE_CACHE: Mutex<ReleaseCache> = Mutex::const_new(ReleaseCache {
@@ -49,6 +58,18 @@ static RELEASE_CACHE: Mutex<ReleaseCache> = Mutex::const_new(ReleaseCache {
     result: None,
     latest: None,
 });
+static DESKTOP_UPDATER_JOB: Mutex<Option<Job>> = Mutex::const_new(None);
+
+pub fn is_desktop_updater_enabled() -> bool {
+    cfg!(windows) && std::env::var("GATEWAY_MANAGED_BY_TRAY").ok().as_deref() == Some("1")
+}
+
+pub fn is_newer_tag(candidate: &str, current: &str) -> bool {
+    match (parse_tag(candidate), parse_tag(current)) {
+        (Some(c), Some(cur)) => c > cur,
+        _ => false,
+    }
+}
 
 #[derive(Default)]
 struct ReleaseCache {
@@ -155,18 +176,32 @@ pub struct AgentStatus {
 pub struct UpdateStatus {
     pub current_version: &'static str,
     pub configured: bool,
+    pub mode: &'static str,
+    pub auto_update: bool,
     pub latest: Option<Release>,
     pub update_available: bool,
     pub job: Option<Job>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
-fn response(state: AgentStatus, configured: bool, error: Option<String>) -> UpdateStatus {
+fn response(
+    state: AgentStatus,
+    configured: bool,
+    mode: &'static str,
+    auto_update: bool,
+    error: Option<String>,
+) -> UpdateStatus {
     let current = env!("CARGO_PKG_VERSION");
-    let available = state.latest.as_ref().is_some_and(|r| r.version != current);
+    let current_tag = format!("v{current}");
+    let available = state
+        .latest
+        .as_ref()
+        .is_some_and(|r| is_newer_tag(&r.tag, &current_tag));
     UpdateStatus {
         current_version: current,
         configured,
+        mode,
+        auto_update,
         latest: state.latest,
         update_available: available,
         job: state.job,
@@ -237,24 +272,45 @@ async fn helper(s: &Shared, path: &str, body: Option<Value>) -> Result<AgentStat
         )
     })
 }
+fn auto_update_setting(s: &Shared) -> bool {
+    s.store
+        .config()
+        .map(|c| c.settings.auto_update_enabled)
+        .unwrap_or(false)
+}
 pub async fn status(State(s): State<Shared>, h: HeaderMap) -> ApiResult<UpdateStatus> {
     api::auth(&s, &h)?;
+    let auto_update = auto_update_setting(&s);
     let latest = RELEASE_CACHE.lock().await.latest.clone();
     if helper_url()?.is_none() {
+        if is_desktop_updater_enabled() {
+            let job = DESKTOP_UPDATER_JOB.lock().await.clone();
+            return Ok(Json(response(
+                AgentStatus { latest, job },
+                true,
+                "desktop",
+                auto_update,
+                None,
+            )));
+        }
         return Ok(Json(response(
             AgentStatus { latest, job: None },
             false,
+            "disabled",
+            auto_update,
             None,
         )));
     }
     match helper(&s, "status", None).await {
         Ok(mut value) => {
             merge_release(&mut value, latest);
-            Ok(Json(response(value, true, None)))
+            Ok(Json(response(value, true, "docker", auto_update, None)))
         }
         Err(e) => Ok(Json(response(
             AgentStatus { latest, job: None },
             true,
+            "docker",
+            auto_update,
             Some(e.1),
         ))),
     }
@@ -265,8 +321,9 @@ pub async fn latest(State(s): State<Shared>, h: HeaderMap) -> ApiResult<UpdateSt
         .await
         .map_err(|error| ApiError(StatusCode::BAD_GATEWAY, error))?;
     let mut value = if helper_url()?.is_some() {
+        let auto_update = auto_update_setting(&s);
         match helper(&s, "latest", None).await {
-            Ok(value) => response(value, true, None),
+            Ok(value) => response(value, true, "docker", auto_update, None),
             Err(_error) => status(State(s.clone()), h.clone()).await?.0,
         }
     } else {
@@ -277,12 +334,42 @@ pub async fn latest(State(s): State<Shared>, h: HeaderMap) -> ApiResult<UpdateSt
         job: value.job.take(),
     };
     merge_release(&mut state, Some(latest));
-    Ok(Json(response(state, value.configured, value.error)))
+    Ok(Json(response(
+        state,
+        value.configured,
+        value.mode,
+        value.auto_update,
+        value.error,
+    )))
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateConfigInput {
+    pub auto_update: bool,
+}
+pub async fn update_config(
+    State(s): State<Shared>,
+    h: HeaderMap,
+    Json(input): Json<UpdateConfigInput>,
+) -> ApiResult<UpdateStatus> {
+    api::auth(&s, &h)?;
+    let desktop = helper_url()?.is_none() && is_desktop_updater_enabled();
+    if input.auto_update && !desktop {
+        return Err(bad(
+            "Background auto-update is only supported on Windows desktop",
+        ));
+    }
+    s.store.update(|c| {
+        c.settings.auto_update_enabled = input.auto_update;
+        Ok(())
+    })?;
+    status(State(s), h).await
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StartUpdate {
     tag: String,
+    #[serde(default)]
     current_password: String,
 }
 pub async fn start(
@@ -293,6 +380,13 @@ pub async fn start(
     api::auth(&s, &h)?;
     if parse_tag(&input.tag).is_none() {
         return Err(bad("Invalid release tag"));
+    }
+    if helper_url()?.is_none() && is_desktop_updater_enabled() {
+        let current_tag = format!("v{}", env!("CARGO_PKG_VERSION"));
+        if !is_newer_tag(&input.tag, &current_tag) {
+            return Err(bad("Target version must be newer than the current version"));
+        }
+        return start_desktop_update(s, input.tag).await.map(Json);
     }
     if input.current_password.is_empty() || input.current_password.len() > 1024 {
         return Err(bad("Invalid password length"));
@@ -322,8 +416,9 @@ pub async fn start(
         ));
     }
     s.login_attempts.lock().unwrap().remove("update");
+    let auto_update = auto_update_setting(&s);
     let state = helper(&s, "start", Some(json!({"tag":input.tag}))).await?;
-    Ok(Json(response(state, true, None)))
+    Ok(Json(response(state, true, "docker", auto_update, None)))
 }
 
 /// Only canonical stable tags are accepted, never arbitrary refs or command options.
@@ -1401,6 +1496,438 @@ async fn agent_start(
     Ok(Json(reply))
 }
 
+fn desktop_updates_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var("DATA_DIR") {
+        let dir = dir.trim();
+        if !dir.is_empty() {
+            return PathBuf::from(dir).join("updates");
+        }
+    }
+    if let Ok(dir) = std::env::var("APP_DATA_DIR") {
+        let dir = dir.trim();
+        if !dir.is_empty() {
+            return PathBuf::from(dir).join("8046").join("updates");
+        }
+    }
+    PathBuf::from("data").join("updates")
+}
+
+fn select_desktop_release_assets(
+    release_json: &Value,
+    tag: &str,
+) -> Result<(String, String, String), String> {
+    let version = tag.strip_prefix('v').ok_or("Invalid release tag")?;
+    let expected_installer = format!("MultiAcpGateway-v{version}-win64-Setup.exe");
+    let expected_prefix = format!(
+        "https://github.com/{}/releases/download/{tag}/",
+        repository_slug()
+    );
+    let assets = release_json["assets"]
+        .as_array()
+        .ok_or("Release assets are missing")?;
+
+    let find_url = |target_name: &str| -> Result<String, String> {
+        let asset = assets
+            .iter()
+            .find(|item| item["name"].as_str() == Some(target_name))
+            .ok_or_else(|| format!("Release asset {target_name} is missing"))?;
+        let url = asset["browser_download_url"]
+            .as_str()
+            .map(str::trim)
+            .filter(|u| !u.is_empty())
+            .ok_or_else(|| format!("Download URL for {target_name} is missing"))?;
+        if !url.starts_with(&expected_prefix) || url.chars().any(char::is_whitespace) {
+            return Err(format!(
+                "Download URL for {target_name} does not match official release prefix"
+            ));
+        }
+        Ok(url.to_owned())
+    };
+
+    let installer_url = find_url(&expected_installer)?;
+    let sha_url = find_url("SHA256SUMS.txt")?;
+    Ok((expected_installer, installer_url, sha_url))
+}
+
+fn parse_sha256sums(contents: &str, asset_name: &str) -> Result<String, String> {
+    for raw_line in contents.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut parts = line.splitn(2, char::is_whitespace);
+        let Some(hash) = parts.next() else {
+            continue;
+        };
+        let Some(rest) = parts.next() else {
+            continue;
+        };
+        let name = rest.trim().trim_start_matches('*');
+        let file_only = name.rsplit('/').next().unwrap_or(name);
+        if name == asset_name || file_only == asset_name {
+            if hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return Err(format!("Invalid SHA256 digest format for {asset_name}"));
+            }
+            return Ok(hash.to_ascii_lowercase());
+        }
+    }
+    Err(format!("SHA256SUMS.txt does not contain {asset_name}"))
+}
+
+async fn update_desktop_job(
+    job_id: &str,
+    status: &str,
+    message: &str,
+    finished: bool,
+) {
+    let mut guard = DESKTOP_UPDATER_JOB.lock().await;
+    if let Some(job) = guard.as_mut()
+        && job.id == job_id
+    {
+        job.status = status.into();
+        job.message = message.into();
+        job.logs.push(format!("{} {message}", now()));
+        if job.logs.len() > MAX_LOGS {
+            job.logs.drain(..job.logs.len() - MAX_LOGS);
+        }
+        if finished {
+            job.finished_at = Some(now());
+        }
+    }
+}
+
+async fn start_desktop_update(s: Shared, tag: String) -> Result<UpdateStatus, ApiError> {
+    let id = uuid::Uuid::new_v4().simple().to_string();
+    let version = tag.strip_prefix('v').unwrap_or(&tag).to_owned();
+    let latest = RELEASE_CACHE.lock().await.latest.clone();
+    let auto_update = auto_update_setting(&s);
+
+    let job_snapshot = {
+        let mut guard = DESKTOP_UPDATER_JOB.lock().await;
+        if guard.as_ref().is_some_and(Job::active) {
+            return Err(ApiError(
+                StatusCode::CONFLICT,
+                "An update is already running".into(),
+            ));
+        }
+        let job = Job {
+            id: id.clone(),
+            status: "fetching".into(),
+            version,
+            started_at: now(),
+            finished_at: None,
+            message: format!("Fetching release assets for {tag}"),
+            logs: vec![format!("{} Starting desktop update to {tag}", now())],
+        };
+        *guard = Some(job.clone());
+        job
+    };
+
+    tokio::spawn(run_desktop_update(s, tag, id));
+
+    Ok(response(
+        AgentStatus {
+            latest,
+            job: Some(job_snapshot),
+        },
+        true,
+        "desktop",
+        auto_update,
+        None,
+    ))
+}
+
+async fn execute_desktop_update_pipeline(
+    s: &Shared,
+    tag: &str,
+    job_id: &str,
+) -> Result<(), String> {
+    let tag_api = release_tag_api_url(tag);
+    let mut req = s
+        .client
+        .get(&tag_api)
+        .header("User-Agent", "Multi-ACP-Updater")
+        .header("Accept", "application/vnd.github+json")
+        .timeout(Duration::from_secs(20));
+    if let Ok(token) = std::env::var("GITHUB_TOKEN") {
+        let token = token.trim();
+        if !token.is_empty() {
+            req = req.bearer_auth(token);
+        }
+    }
+    let reply = req
+        .send()
+        .await
+        .map_err(|e| format!("GitHub release tag lookup failed: {e}"))?;
+    if !reply.status().is_success() {
+        return Err(format!(
+            "GitHub release tag lookup returned {}",
+            reply.status()
+        ));
+    }
+    let bytes = reply
+        .bytes()
+        .await
+        .map_err(|e| format!("Invalid GitHub release tag response: {e}"))?;
+    if bytes.len() > 512 * 1024 {
+        return Err("GitHub release tag response is too large".into());
+    }
+    let release_json: Value =
+        serde_json::from_slice(&bytes).map_err(|_| "Invalid GitHub JSON response".to_owned())?;
+    let (asset_name, installer_url, sha_url) = select_desktop_release_assets(&release_json, tag)?;
+
+    let download_client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::limited(5))
+        .connect_timeout(Duration::from_secs(15))
+        .user_agent("Multi-ACP-Updater")
+        .build()
+        .map_err(|e| format!("Cannot build download client: {e}"))?;
+
+    update_desktop_job(
+        job_id,
+        "fetching",
+        &format!("Downloading SHA256SUMS.txt and {asset_name}"),
+        false,
+    )
+    .await;
+
+    let sha_reply = download_client
+        .get(&sha_url)
+        .timeout(Duration::from_secs(30))
+        .send()
+        .await
+        .map_err(|e| format!("Failed to download SHA256SUMS.txt: {e}"))?;
+    if !sha_reply.status().is_success() {
+        return Err(format!(
+            "SHA256SUMS.txt download returned {}",
+            sha_reply.status()
+        ));
+    }
+    let sha_bytes = sha_reply
+        .bytes()
+        .await
+        .map_err(|e| format!("Failed to read SHA256SUMS.txt: {e}"))?;
+    if sha_bytes.len() > 1024 * 1024 {
+        return Err("SHA256SUMS.txt is too large".into());
+    }
+    let sha_text = std::str::from_utf8(&sha_bytes)
+        .map_err(|_| "SHA256SUMS.txt is not valid UTF-8".to_owned())?;
+    let expected_sha = parse_sha256sums(sha_text, &asset_name)?;
+
+    let updates_dir = desktop_updates_dir();
+    tokio::fs::create_dir_all(&updates_dir)
+        .await
+        .map_err(|e| format!("Cannot create updates directory: {e}"))?;
+    let part_path = updates_dir.join(format!("{asset_name}.part"));
+    let exe_path = updates_dir.join(&asset_name);
+
+    let _ = tokio::fs::remove_file(&part_path).await;
+
+    let installer_reply = download_client
+        .get(&installer_url)
+        .timeout(Duration::from_secs(600))
+        .send()
+        .await
+        .map_err(|e| format!("Failed to download {asset_name}: {e}"))?;
+    if !installer_reply.status().is_success() {
+        return Err(format!(
+            "Installer download returned {}",
+            installer_reply.status()
+        ));
+    }
+    if let Some(len) = installer_reply.content_length()
+        && len > MAX_INSTALLER_BYTES
+    {
+        return Err("Installer exceeds 256MB size limit".into());
+    }
+
+    let download_result: Result<(String, u64), String> = async {
+        let mut file = tokio::fs::File::create(&part_path)
+            .await
+            .map_err(|e| format!("Cannot create partial installer file: {e}"))?;
+        let mut hasher = Sha256::new();
+        let mut total: u64 = 0;
+        let mut stream = installer_reply.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| format!("Installer download stream error: {e}"))?;
+            total = total.saturating_add(chunk.len() as u64);
+            if total > MAX_INSTALLER_BYTES {
+                return Err("Installer exceeds 256MB size limit".into());
+            }
+            hasher.update(&chunk);
+            file.write_all(&chunk)
+                .await
+                .map_err(|e| format!("Failed to write installer chunk: {e}"))?;
+        }
+        file.flush()
+            .await
+            .map_err(|e| format!("Failed to flush installer file: {e}"))?;
+        Ok((hex::encode(hasher.finalize()), total))
+    }
+    .await;
+
+    let (actual_sha, total_bytes) = match download_result {
+        Ok(res) => res,
+        Err(err) => {
+            let _ = tokio::fs::remove_file(&part_path).await;
+            return Err(err);
+        }
+    };
+
+    update_desktop_job(
+        job_id,
+        "building",
+        &format!("Verifying SHA256 digest ({total_bytes} bytes)"),
+        false,
+    )
+    .await;
+
+    if !constant_eq(actual_sha.as_bytes(), expected_sha.as_bytes()) {
+        let _ = tokio::fs::remove_file(&part_path).await;
+        return Err(format!(
+            "SHA256 mismatch for {asset_name}: expected {expected_sha}, got {actual_sha}"
+        ));
+    }
+
+    let _ = tokio::fs::remove_file(&exe_path).await;
+    tokio::fs::rename(&part_path, &exe_path)
+        .await
+        .map_err(|e| format!("Failed to finalize installer file: {e}"))?;
+
+    update_desktop_job(
+        job_id,
+        "deploying",
+        "Launching detached silent installer; gateway will restart shortly",
+        false,
+    )
+    .await;
+
+    launch_detached_windows_installer(&exe_path)
+}
+
+#[cfg(windows)]
+fn launch_detached_windows_installer(exe_path: &Path) -> Result<(), String> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+    let escape_ps = |p: &Path| -> String { p.to_string_lossy().replace('\'', "''") };
+    let tray_exe = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|dir| dir.join("gateway-tray.exe")))
+        .filter(|p| p.exists())
+        .unwrap_or_else(|| {
+            let local_app_data =
+                std::env::var("LOCALAPPDATA").unwrap_or_else(|_| String::from("C:\\Users\\Default\\AppData\\Local"));
+            PathBuf::from(local_app_data)
+                .join("Programs")
+                .join("MultiAcpGateway")
+                .join("gateway-tray.exe")
+        });
+
+    let setup_escaped = escape_ps(exe_path);
+    let tray_escaped = escape_ps(&tray_exe);
+    let ps_script = format!(
+        "Start-Sleep -Milliseconds 1500; \
+         $p = Start-Process -FilePath '{setup_escaped}' -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/CLOSEAPPLICATIONS' -Wait -PassThru; \
+         Start-Sleep -Seconds 2; \
+         if (-not (Get-Process -Name 'gateway-tray' -ErrorAction SilentlyContinue)) {{ \
+           if (Test-Path '{tray_escaped}') {{ Start-Process -FilePath '{tray_escaped}' -ArgumentList '--minimized' }} \
+         }}; \
+         Remove-Item -LiteralPath '{setup_escaped}' -Force -ErrorAction SilentlyContinue"
+    );
+
+    let mut cmd = std::process::Command::new("powershell.exe");
+    cmd.args([
+        "-NoProfile",
+        "-NonInteractive",
+        "-WindowStyle",
+        "Hidden",
+        "-Command",
+        &ps_script,
+    ])
+    .creation_flags(CREATE_BREAKAWAY_FROM_JOB | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW)
+    .stdin(std::process::Stdio::null())
+    .stdout(std::process::Stdio::null())
+    .stderr(std::process::Stdio::null());
+
+    cmd.spawn().map(|_| ()).map_err(|err| {
+        if err.raw_os_error() == Some(5) {
+            format!(
+                "当前托盘版本过旧不支持热更新，请手动运行安装包完成本次升级，后续版本即可支持一键更新 ({err})"
+            )
+        } else {
+            format!("Failed to launch detached installer: {err}")
+        }
+    })
+}
+
+#[cfg(not(windows))]
+fn launch_detached_windows_installer(_exe_path: &Path) -> Result<(), String> {
+    Err("Desktop silent installer is only supported on Windows".into())
+}
+
+async fn run_desktop_update(s: Shared, tag: String, job_id: String) {
+    if let Err(err) = execute_desktop_update_pipeline(&s, &tag, &job_id).await {
+        tracing::error!(tag = %tag, error = %err, "Desktop update failed");
+        update_desktop_job(&job_id, "failed", &err, true).await;
+    }
+}
+
+pub fn spawn_background_auto_updater(s: Shared) {
+    if helper_url().ok().flatten().is_some() || !is_desktop_updater_enabled() {
+        return;
+    }
+    tokio::spawn(async move {
+        let mut failed_tags: HashSet<String> = HashSet::new();
+        tokio::time::sleep(Duration::from_secs(90)).await;
+        loop {
+            if auto_update_setting(&s) {
+                let active_or_failed = {
+                    let guard = DESKTOP_UPDATER_JOB.lock().await;
+                    if let Some(job) = guard.as_ref() {
+                        if job.status == "failed" {
+                            failed_tags.insert(format!("v{}", job.version));
+                        }
+                        job.active()
+                    } else {
+                        false
+                    }
+                };
+                if !active_or_failed {
+                    match cached_release(&RELEASE_CACHE, &s.client, &release_api_url()).await {
+                        Ok(latest) => {
+                            let current_tag = format!("v{}", env!("CARGO_PKG_VERSION"));
+                            if is_newer_tag(&latest.tag, &current_tag)
+                                && !failed_tags.contains(&latest.tag)
+                            {
+                                tracing::info!(
+                                    tag = %latest.tag,
+                                    current = %current_tag,
+                                    "Background auto-updater detected newer release; starting update"
+                                );
+                                if let Err(err) = start_desktop_update(s.clone(), latest.tag.clone()).await {
+                                    tracing::warn!(
+                                        tag = %latest.tag,
+                                        error = %err.1,
+                                        "Background auto-updater failed to start update"
+                                    );
+                                    failed_tags.insert(latest.tag);
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            tracing::debug!(error = %err, "Background auto-updater release check failed");
+                        }
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(1800)).await;
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1449,6 +1976,8 @@ mod tests {
                 latest: cache.lock().await.latest.clone(),
                 job: None,
             },
+            false,
+            "disabled",
             false,
             None,
         );
@@ -2088,5 +2617,187 @@ mod tests {
             .docker(reqwest::Method::DELETE, &format!("/volumes/{volume}"), None)
             .await;
         outcome.unwrap();
+    }
+
+    #[test]
+    fn parse_sha256sums_matches_expected_asset_and_rejects_mismatch() {
+        let asset = "MultiAcpGateway-v0.16.2-win64-Setup.exe";
+        let upper_hex = "A".repeat(64);
+        let lower_hex = "a".repeat(64);
+        let sums = format!(
+            "\n# comment line\n{}  other-file.zip\n{} *{}\n\n",
+            "b".repeat(64),
+            upper_hex,
+            asset
+        );
+        assert_eq!(parse_sha256sums(&sums, asset).unwrap(), lower_hex);
+        assert!(parse_sha256sums(&sums, "missing.exe").is_err());
+        let bad_hex = format!("{}  {}", "z".repeat(64), asset);
+        assert!(parse_sha256sums(&bad_hex, asset).is_err());
+        let short_hex = format!("{}  {}", "a".repeat(63), asset);
+        assert!(parse_sha256sums(&short_hex, asset).is_err());
+    }
+
+    #[test]
+    fn is_newer_tag_strictly_compares_semver() {
+        assert!(is_newer_tag("v0.16.2", "v0.16.1"));
+        assert!(is_newer_tag("v1.0.0", "v0.16.9"));
+        assert!(!is_newer_tag("v0.16.1", "v0.16.1"));
+        assert!(!is_newer_tag("v0.16.0", "v0.16.1"));
+        assert!(!is_newer_tag("0.16.2", "v0.16.1"));
+        assert!(!is_newer_tag("v0.16.2-beta", "v0.16.1"));
+        assert!(!is_newer_tag("v0.16.2", "invalid"));
+    }
+
+    #[tokio::test]
+    async fn desktop_update_config_endpoint_persists_and_rejects_non_desktop() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = crate::new_app(dir.path(), dir.path().join("web")).unwrap();
+        let app = crate::app(state.clone());
+
+        let unauth = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/updates/config")
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({"auto_update": true}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauth.status(), StatusCode::UNAUTHORIZED);
+
+        let setup_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/setup")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({"username":"admin","password":"sufficient-password-123"}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let cookie = setup_res.headers()["set-cookie"]
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_owned();
+
+        let prev_env = std::env::var("GATEWAY_MANAGED_BY_TRAY").ok();
+        unsafe { std::env::remove_var("GATEWAY_MANAGED_BY_TRAY") };
+
+        let non_desktop = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/updates/config")
+                    .header("cookie", &cookie)
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({"auto_update": true}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(non_desktop.status(), StatusCode::BAD_REQUEST);
+
+        let disable_ok = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/updates/config")
+                    .header("cookie", &cookie)
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({"auto_update": false}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(disable_ok.status(), StatusCode::OK);
+
+        if cfg!(windows) {
+            unsafe { std::env::set_var("GATEWAY_MANAGED_BY_TRAY", "1") };
+            let desktop_ok = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("PUT")
+                        .uri("/api/updates/config")
+                        .header("cookie", &cookie)
+                        .header("content-type", "application/json")
+                        .body(Body::from(json!({"auto_update": true}).to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(desktop_ok.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(desktop_ok.into_body(), 65536)
+                .await
+                .unwrap();
+            let parsed: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(parsed["mode"], "desktop");
+            assert_eq!(parsed["auto_update"], true);
+            assert!(state.store.config().unwrap().settings.auto_update_enabled);
+        }
+
+        match prev_env {
+            Some(v) => unsafe { std::env::set_var("GATEWAY_MANAGED_BY_TRAY", v) },
+            None => unsafe { std::env::remove_var("GATEWAY_MANAGED_BY_TRAY") },
+        }
+    }
+
+    #[test]
+    fn select_desktop_release_assets_validates_urls_and_names() {
+        let tag = "v0.16.2";
+        let prefix = format!("https://github.com/{DEFAULT_REPO}/releases/download/{tag}");
+        let valid = json!({
+            "assets": [
+                {
+                    "name": "MultiAcpGateway-v0.16.2-win64-Setup.exe",
+                    "browser_download_url": format!("{prefix}/MultiAcpGateway-v0.16.2-win64-Setup.exe")
+                },
+                {
+                    "name": "SHA256SUMS.txt",
+                    "browser_download_url": format!("{prefix}/SHA256SUMS.txt")
+                }
+            ]
+        });
+        let (name, exe_url, sha_url) = select_desktop_release_assets(&valid, tag).unwrap();
+        assert_eq!(name, "MultiAcpGateway-v0.16.2-win64-Setup.exe");
+        assert!(exe_url.starts_with(&prefix));
+        assert!(sha_url.starts_with(&prefix));
+
+        let bad_host = json!({
+            "assets": [
+                {
+                    "name": "MultiAcpGateway-v0.16.2-win64-Setup.exe",
+                    "browser_download_url": "https://evil.invalid/MultiAcpGateway-v0.16.2-win64-Setup.exe"
+                },
+                {
+                    "name": "SHA256SUMS.txt",
+                    "browser_download_url": format!("{prefix}/SHA256SUMS.txt")
+                }
+            ]
+        });
+        assert!(select_desktop_release_assets(&bad_host, tag).is_err());
+
+        let missing_sha = json!({
+            "assets": [
+                {
+                    "name": "MultiAcpGateway-v0.16.2-win64-Setup.exe",
+                    "browser_download_url": format!("{prefix}/MultiAcpGateway-v0.16.2-win64-Setup.exe")
+                }
+            ]
+        });
+        assert!(select_desktop_release_assets(&missing_sha, tag).is_err());
     }
 }

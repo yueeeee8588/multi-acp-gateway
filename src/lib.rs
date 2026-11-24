@@ -228,6 +228,7 @@ pub fn app(state: Shared) -> Router {
         .route("/api/password", post(api::password))
         .route("/api/updates", get(update::status).post(update::start))
         .route("/api/updates/latest", get(update::latest))
+        .route("/api/updates/config", put(update::update_config))
         .route("/api/stats", get(api::stats))
         .route("/api/logs", get(api::logs).delete(api::delete_logs))
         .route("/api/logs/export", get(api::export_logs))

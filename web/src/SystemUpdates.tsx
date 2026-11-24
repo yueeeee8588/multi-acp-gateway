@@ -15,24 +15,35 @@ import {
 } from "lucide-react";
 import { api, ApiError, errorMessage } from "./api";
 import type { Release, UpdateJob, UpdateStatus } from "./api";
-import { Badge, Button, ErrorBox, Field, Modal } from "./components";
+import { Badge, Button, ErrorBox, Field, Modal, Toggle } from "./components";
 import type { Notice } from "./components";
 import type { UpdateCheck } from "./useUpdateCheck";
 import { useMinSpin } from "./useMinSpin";
 
-const stages = [
+const dockerStages = [
   { id: "fetching", label: "获取源码" },
   { id: "building", label: "构建镜像" },
   { id: "deploying", label: "部署版本" },
   { id: "verifying", label: "健康验证" },
 ] as const;
+
+const desktopStages = [
+  { id: "fetching", label: "下载安装包" },
+  { id: "building", label: "校验 SHA256" },
+  { id: "deploying", label: "静默覆盖安装" },
+  { id: "verifying", label: "等待重启重连" },
+] as const;
+
 const terminalStatuses = new Set(["succeeded", "failed", "rolled_back"]);
 
 function isRunning(job: UpdateJob | null | undefined) {
   return !!job && !terminalStatuses.has(job.status);
 }
 
-function jobLabel(status: string) {
+function jobLabel(
+  status: string,
+  stages: readonly { id: string; label: string }[],
+) {
   if (status === "succeeded") return "更新成功";
   if (status === "failed") return "更新失败";
   if (status === "rolled_back") return "已回退至原版本";
@@ -67,6 +78,7 @@ export function SystemUpdates({
   const [password, setPassword] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState("");
+  const [savingAutoUpdate, setSavingAutoUpdate] = useState(false);
   const [pollRevision, setPollRevision] = useState(0);
   const latestStatus = useRef<UpdateStatus | null>(null);
   const logs = useRef<HTMLPreElement>(null);
@@ -185,13 +197,15 @@ export function SystemUpdates({
 
   async function startUpdate(event: FormEvent) {
     event.preventDefault();
-    if (!confirmation || !password || submitting) return;
+    const isDesktopMode = status?.mode === "desktop";
+    if (!confirmation || submitting) return;
+    if (!isDesktopMode && !password) return;
     setSubmitting(true);
     setSubmitError("");
     try {
       const value = await api<UpdateStatus>("/updates", "POST", {
         tag: confirmation.tag,
-        current_password: password,
+        current_password: isDesktopMode ? "" : password,
       });
       acceptStatus(value);
       publishStatus(value);
@@ -199,7 +213,7 @@ export function SystemUpdates({
       setPassword("");
       followLogs.current = true;
       setPollRevision((value) => value + 1);
-      notify("源码构建任务已启动");
+      notify(isDesktopMode ? "桌面端更新任务已启动" : "源码构建任务已启动");
     } catch (failure) {
       setSubmitError(errorMessage(failure));
     } finally {
@@ -207,6 +221,34 @@ export function SystemUpdates({
     }
   }
 
+  async function toggleAutoUpdate(enabled: boolean) {
+    if (savingAutoUpdate || !status) return;
+    const previous = latestStatus.current || status;
+    const optimistic: UpdateStatus = { ...status, auto_update: enabled };
+    latestStatus.current = optimistic;
+    setStatus(optimistic);
+    setSavingAutoUpdate(true);
+    setError("");
+    try {
+      const next = await api<UpdateStatus>("/updates/config", "PUT", {
+        auto_update: enabled,
+      });
+      acceptStatus(next);
+      publishStatus(next);
+      notify(enabled ? "已开启后台自动更新" : "已关闭后台自动更新");
+    } catch (failure) {
+      latestStatus.current = previous;
+      setStatus(previous);
+      const message = errorMessage(failure);
+      setError(message);
+      notify(message, true);
+    } finally {
+      setSavingAutoUpdate(false);
+    }
+  }
+
+  const isDesktop = status?.mode === "desktop";
+  const stages = isDesktop ? desktopStages : dockerStages;
   const job = status?.job;
   const running = isRunning(job);
   const stageIndex = stages.findIndex((stage) => stage.id === job?.status);
@@ -232,12 +274,22 @@ export function SystemUpdates({
           <GitPullRequestArrow size={20} />
         </span>
         <div>
-          <h2 id="updates-title">GitHub 源码更新</h2>
-          <p>最新正式版</p>
+          <h2 id="updates-title">
+            {isDesktop ? "桌面端自动更新" : "GitHub 源码更新"}
+          </h2>
+          <p>
+            {isDesktop
+              ? "从 GitHub Release 下载安装包并校验 SHA256 后静默覆盖更新"
+              : "最新正式版"}
+          </p>
         </div>
         {status && (
           <Badge variant={status.configured ? "green" : "neutral"} dot>
-            {status.configured ? "已启用" : "未配置"}
+            {status.configured
+              ? isDesktop
+                ? "桌面端已启用"
+                : "已启用"
+              : "未配置"}
           </Badge>
         )}
       </div>
@@ -290,10 +342,38 @@ export function SystemUpdates({
               }}
             >
               <ArrowUpToLine size={15} />
-              {"同步到最新发行版"}
+              {isDesktop ? "一键更新到最新正式版" : "同步到最新发行版"}
             </Button>
           </div>
         </div>
+        {isDesktop && (
+          <div
+            className={`setting-toggle-row ${savingAutoUpdate ? "busy" : ""}`}
+            aria-busy={savingAutoUpdate}
+          >
+            <span>
+              <strong>后台自动更新</strong>
+              <small>
+                每 30 分钟检查 GitHub 最新正式版，发现新版后自动下载、校验
+                SHA256 并静默覆盖重启（保留全部数据）
+              </small>
+            </span>
+            <div className="setting-toggle-control">
+              {savingAutoUpdate && (
+                <LoaderCircle
+                  size={15}
+                  className="spin"
+                  aria-label="正在保存自动更新设置"
+                />
+              )}
+              <Toggle
+                label=""
+                checked={!!status?.auto_update}
+                onChange={(enabled) => void toggleAutoUpdate(enabled)}
+              />
+            </div>
+          </div>
+        )}
         {latest && (
           <div className="update-release-meta">
             {latest.published_at && (
@@ -343,7 +423,7 @@ export function SystemUpdates({
                 role="status"
                 aria-live="polite"
               >
-                <strong>{jobLabel(job.status)}</strong>
+                <strong>{jobLabel(job.status, stages)}</strong>
                 <span>{job.message}</span>
               </div>
               <code className="update-job-version">{job.version}</code>
@@ -416,7 +496,7 @@ export function SystemUpdates({
       </div>
       {confirmation && (
         <Modal
-          title="确认源码构建更新"
+          title={isDesktop ? "确认桌面端覆盖更新" : "确认源码构建更新"}
           onClose={closeConfirmation}
           busy={submitting}
         >
@@ -431,22 +511,26 @@ export function SystemUpdates({
               <div className="update-notice">
                 <AlertTriangle size={17} />
                 <span>
-                  部署时站点将短暂重启；健康验证失败后自动恢复上一版本。
+                  {isDesktop
+                    ? `将下载 ${confirmation.tag} 的 Windows 安装包、校验 SHA256SUMS.txt 后静默覆盖安装并自动重启托盘（保留全部本地数据）。`
+                    : "部署时站点将短暂重启；健康验证失败后自动恢复上一版本。"}
                 </span>
               </div>
-              <Field label="管理员密码">
-                <input
-                  type="password"
-                  autoComplete="current-password"
-                  autoFocus
-                  required
-                  maxLength={1024}
-                  value={password}
-                  onChange={(event) => setPassword(event.target.value)}
-                  placeholder="验证当前管理员密码"
-                  disabled={submitting}
-                />
-              </Field>
+              {!isDesktop && (
+                <Field label="管理员密码">
+                  <input
+                    type="password"
+                    autoComplete="current-password"
+                    autoFocus
+                    required
+                    maxLength={1024}
+                    value={password}
+                    onChange={(event) => setPassword(event.target.value)}
+                    placeholder="验证当前管理员密码"
+                    disabled={submitting}
+                  />
+                </Field>
+              )}
               <ErrorBox message={submitError} />
             </div>
             <div className="modal-footer">
@@ -461,9 +545,10 @@ export function SystemUpdates({
                 type="submit"
                 className="primary"
                 busy={submitting}
-                disabled={!password}
+                disabled={!isDesktop && !password}
               >
-                {!submitting && <ArrowUpToLine size={15} />}确认构建并更新
+                {!submitting && <ArrowUpToLine size={15} />}
+                {isDesktop ? "立即更新" : "确认构建并更新"}
               </Button>
             </div>
           </form>

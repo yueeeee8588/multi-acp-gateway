@@ -268,6 +268,8 @@ pub struct Settings {
     pub sensitive_filter_enabled: bool,
     #[serde(default)]
     pub sensitive_words: Vec<SensitiveWordRule>,
+    #[serde(default)]
+    pub auto_update_enabled: bool,
 }
 impl Default for Settings {
     fn default() -> Self {
@@ -285,6 +287,7 @@ impl Default for Settings {
             custom_template_prompts: BTreeMap::new(),
             sensitive_filter_enabled: false,
             sensitive_words: Vec::new(),
+            auto_update_enabled: false,
         }
     }
 }

@@ -63,6 +63,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             tracing::warn!(error = %error, "Failed to read config for autostart sync on startup");
         }
     }
+    multi_acp_gateway::update::spawn_background_auto_updater(state.clone());
     let listener = tokio::net::TcpListener::bind(&bind).await?;
     tracing::info!(address=%bind,"Multi-ACP Gateway is listening");
     axum::serve(listener, multi_acp_gateway::app(state))

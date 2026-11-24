@@ -226,9 +226,12 @@ export type UpdateJob = {
   message: string;
   logs: string[];
 };
+export type UpdateMode = "desktop" | "docker" | "disabled";
 export type UpdateStatus = {
   current_version: string;
   configured: boolean;
+  mode?: UpdateMode;
+  auto_update?: boolean;
   latest: Release | null;
   update_available: boolean;
   job: UpdateJob | null;
