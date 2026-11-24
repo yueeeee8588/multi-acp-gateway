@@ -53,7 +53,7 @@ pub struct Group {
     pub suppress_thinking: bool,
     #[serde(default = "default_routing_strategy")]
     pub routing_strategy: String,
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub staged_timeout_enabled: bool,
     #[serde(default)]
     pub sse_keepalive_enabled: bool,
@@ -86,7 +86,7 @@ struct GroupInput {
     suppress_thinking: bool,
     #[serde(default = "default_routing_strategy")]
     routing_strategy: String,
-    #[serde(default)]
+    #[serde(default = "default_true")]
     staged_timeout_enabled: bool,
     #[serde(default)]
     sse_keepalive_enabled: bool,

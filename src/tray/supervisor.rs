@@ -326,6 +326,9 @@ fn build_service_command(id: ServiceId, paths: &TrayPaths) -> Result<Command, Se
             cmd.env("PORT", id.port().to_string());
             cmd.env("GATEWAY_HOST", "127.0.0.1");
             cmd.env("GATEWAY_DATA_DIR", paths.data_root.join("8049"));
+            cmd.env("GATEWAY_QUOTA_FAILOVER", "1");
+            cmd.env("GATEWAY_EMPTY_RESPONSE_FAILOVER", "1");
+            cmd.env("GATEWAY_AUTOMATIC_RECOVERY", "1");
             Ok(cmd)
         }
         ServiceId::AiStudio2048 => {
@@ -717,17 +720,48 @@ where
                             let owns_8048 = services
                                 .iter()
                                 .any(|s| s.id == ServiceId::Acp8048 && s.child.is_some());
-                            if owns_8048 {
-                                tray_logger.info("Graceful shutdown requested; draining 8048");
+                            let owns_8049 = services
+                                .iter()
+                                .any(|s| s.id == ServiceId::App2Api8049 && s.child.is_some());
+                            if owns_8048 || owns_8049 {
+                                let url_8048 =
+                                    format!("http://127.0.0.1:{}/api/drain", ServiceId::Acp8048.port());
+                                let url_8049 = format!(
+                                    "http://127.0.0.1:{}/api/drain",
+                                    ServiceId::App2Api8049.port()
+                                );
+                                if owns_8048 {
+                                    tray_logger.info("Graceful shutdown requested; draining 8048");
+                                }
+                                if owns_8049 {
+                                    tray_logger.info("Graceful shutdown requested; draining 8049");
+                                }
                                 rt.block_on(async {
-                                    let _ = client
-                                        .post("http://127.0.0.1:8048/api/drain")
-                                        .timeout(Duration::from_millis(1500))
-                                        .send()
-                                        .await;
+                                    let drain_8048 = async {
+                                        if owns_8048 {
+                                            let _ = client
+                                                .post(&url_8048)
+                                                .timeout(Duration::from_millis(1500))
+                                                .send()
+                                                .await;
+                                        }
+                                    };
+                                    let drain_8049 = async {
+                                        if owns_8049 {
+                                            let _ = client
+                                                .post(&url_8049)
+                                                .timeout(Duration::from_millis(1500))
+                                                .send()
+                                                .await;
+                                        }
+                                    };
+                                    tokio::join!(drain_8048, drain_8049);
+                                    if owns_8049 {
+                                        tokio::time::sleep(Duration::from_millis(300)).await;
+                                    }
                                 });
                             } else {
-                                tray_logger.info("Graceful shutdown requested; 8048 not owned by tray, skipping drain");
+                                tray_logger.info("Graceful shutdown requested; 8048/8049 not owned by tray, skipping drain");
                             }
                             for svc in &mut services {
                                 svc.desired_running = false;
@@ -946,5 +980,18 @@ mod tests {
             envs.contains(&(std::ffi::OsStr::new("NODE_OPTIONS"), None)),
             "expected NODE_OPTIONS to be removed, got {envs:?}"
         );
+        for key in [
+            "GATEWAY_QUOTA_FAILOVER",
+            "GATEWAY_EMPTY_RESPONSE_FAILOVER",
+            "GATEWAY_AUTOMATIC_RECOVERY",
+        ] {
+            assert!(
+                envs.contains(&(
+                    std::ffi::OsStr::new(key),
+                    Some(std::ffi::OsStr::new("1"))
+                )),
+                "expected {key}=1, got: {envs:?}"
+            );
+        }
     }
 }

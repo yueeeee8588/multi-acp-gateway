@@ -5,7 +5,8 @@ import net from "node:net";
 import { TextDecoder } from "node:util";
 import * as protocol from "../native-provider.mjs";
 import { Security } from "./security.mjs";
-import { openDirectTurn } from "./native-transport.mjs";
+import { openDirectTurn, closeNativeHttp2Pool } from "./native-transport.mjs";
+import { destroyOutboundProxyAgents } from "./outbound-proxy.mjs";
 import { Accounts } from "./accounts.mjs";
 import { scanChromeProfiles, runChromeOAuthBatch } from "./chrome-oauth.mjs";
 import { AccountPool } from "./pool.mjs";
@@ -335,6 +336,12 @@ export function createGateway({
   publicOrigin = null,
   callbackPort = 18765,
   callbackHost = "127.0.0.1",
+  keepaliveHeadersDelayMs = (() => {
+    const raw = process.env.GATEWAY_KEEPALIVE_HEADERS_DELAY_MS;
+    if (raw === undefined || raw === "") return 12000;
+    const parsed = Number(raw);
+    return Number.isFinite(parsed) && parsed >= 0 ? parsed : 12000;
+  })(),
   chromeOAuthOpts = {},
 } = {}) {
   if (!store) throw new TypeError("store required");
@@ -512,7 +519,8 @@ export function createGateway({
       includeUsage: body.stream_options?.include_usage === true, parallelToolCalls: canonical.parallel_tool_calls ?? true,
       promptChars: Math.max(0, (body.__promptChars ?? 0) - imageUrlChars), imageCount,
       deferEmptyStart: !playground && !accountTestId && !canonical.native_search,
-      signal: controller.signal, writeTimeoutMs: Math.min(settings.timeoutMs, 30000) });
+      signal: controller.signal, writeTimeoutMs: Math.min(settings.timeoutMs, 30000),
+      keepaliveHeadersDelayMs });
     let resolveInFlight;
     const inFlightPromise = new Promise((r) => { resolveInFlight = r; });
     inFlightTasks.add(inFlightPromise);
@@ -866,6 +874,25 @@ export function createGateway({
           ...(nativeEvidence ? { nativeEvidence } : {}),
         };
         requestHub.finish(id, finalRecord);
+        try {
+          const failoverReason = attempts.map((a) => a.failoverReason).filter(Boolean).at(-1) ?? null;
+          process.stdout.write(
+            JSON.stringify({
+              time: new Date().toISOString(),
+              event: "request.finished",
+              reqId: id,
+              route: route ?? protocolName ?? null,
+              model: finalRecord.model ?? null,
+              accountId: accountId ?? null,
+              status,
+              attempts: providerAttempts,
+              ttftMs: firstEventMs ?? null,
+              durationMs: finalRecord.durationMs,
+              failoverReason,
+              errorCode: errorCode ?? null,
+            }) + "\n",
+          );
+        } catch {}
         break requests_cleanup;
       }
       inFlightTasks.delete(inFlightPromise);
@@ -1486,6 +1513,8 @@ export function createGateway({
         timer.unref();
       });
       await Promise.allSettled([accountsDrain, ...inFlightTasks]);
+      await closeNativeHttp2Pool();
+      destroyOutboundProxyAgents();
     },
   };
 }

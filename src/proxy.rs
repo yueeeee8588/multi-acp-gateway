@@ -1447,21 +1447,30 @@ fn resolve_cache_settling_delay_ms(
 
 fn is_local_acp_8048_upstream(url: &str) -> bool {
     matches_acp_upstream(url, || std::env::var("ZAKO_ACP_UPSTREAM").ok())
+        || is_local_2048_upstream(url)
 }
 
-fn matches_acp_upstream(url: &str, configured_base: impl FnOnce() -> Option<String>) -> bool {
-    let Ok(target) = url::Url::parse(url) else {
-        return false;
-    };
-    let loopback = match target.host() {
+fn is_local_2048_upstream(url: &str) -> bool {
+    matches_2048_upstream(url, || {
+        std::env::var("AISTUDIO_UPSTREAM_BASE")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+    })
+}
+
+fn is_loopback_host(target: &url::Url) -> bool {
+    match target.host() {
         Some(url::Host::Domain(host)) => host.trim_end_matches('.') == "localhost",
         Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
         Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
         None => false,
-    };
-    if loopback && target.port() == Some(8048) {
-        return true;
     }
+}
+
+fn matches_configured_upstream(
+    target: &url::Url,
+    configured_base: impl FnOnce() -> Option<String>,
+) -> bool {
     configured_base().is_some_and(|base| {
         let base = base.trim();
         let base = if base.contains("://") {
@@ -1475,6 +1484,26 @@ fn matches_acp_upstream(url: &str, configured_base: impl FnOnce() -> Option<Stri
                 && base.port_or_known_default() == target.port_or_known_default()
         })
     })
+}
+
+fn matches_2048_upstream(url: &str, configured_base: impl FnOnce() -> Option<String>) -> bool {
+    let Ok(target) = url::Url::parse(url) else {
+        return false;
+    };
+    if is_loopback_host(&target) && matches!(target.port(), Some(2048)) {
+        return true;
+    }
+    is_loopback_host(&target) && matches_configured_upstream(&target, configured_base)
+}
+
+fn matches_acp_upstream(url: &str, configured_base: impl FnOnce() -> Option<String>) -> bool {
+    let Ok(target) = url::Url::parse(url) else {
+        return false;
+    };
+    if is_loopback_host(&target) && matches!(target.port(), Some(8048 | 8049 | 2048)) {
+        return true;
+    }
+    matches_configured_upstream(&target, configured_base)
 }
 
 fn record_cache_settling_completion(
@@ -1605,6 +1634,7 @@ async fn forward_inner(
     let sticky_key = build_sticky_key(&group.id, &key.id, &model, &headers, &body);
     let mut tried = HashSet::new();
     let mut reserved = None;
+    let mut single_2048_retried = false;
     let attempts = config.settings.max_retries.saturating_add(1);
     let cache_settling_delay_ms = effective_cache_settling_delay_ms(&config.settings);
     for _ in 0..attempts {
@@ -1853,6 +1883,15 @@ async fn forward_inner(
                     None,
                     None,
                 );
+                if accounts.len() == 1
+                    && is_local_2048_upstream(url.as_str())
+                    && !single_2048_retried
+                    && log.entry.attempts < attempts
+                    && (is_timeout || !is_connect)
+                {
+                    single_2048_retried = true;
+                    tried.remove(&account.id);
+                }
                 continue;
             }
         };
@@ -1884,6 +1923,14 @@ async fn forward_inner(
                 retry_after_header.as_deref(),
             );
             if log.entry.attempts < attempts {
+                if accounts.len() == 1
+                    && is_local_2048_upstream(url.as_str())
+                    && !single_2048_retried
+                    && status == StatusCode::SERVICE_UNAVAILABLE
+                {
+                    single_2048_retried = true;
+                    tried.remove(&account.id);
+                }
                 reserved =
                     select_account_for_group(&state, &group, &sticky_key, &accounts, &tried)
                         .await
@@ -3059,11 +3106,26 @@ mod tests {
             ("account", "session", "http://127.0.0.1:8048/v1/responses", 5000),
             ("account", "session", "http://localhost:8048/v1/responses", 5000),
             ("account", "session", "http://[::1]:8048/v1/responses", 5000),
+            ("account", "session", "http://127.0.0.1:8049/v1/responses", 5000),
+            ("account", "session", "http://localhost:8049/v1/responses", 5000),
+            ("account", "session", "http://[::1]:8049/v1/responses", 5000),
+            ("account", "session", "http://127.0.0.1:2048/v1/responses", 5000),
+            ("account", "session", "http://localhost:2048/v1/responses", 5000),
+            ("account", "session", "http://[::1]:2048/v1/responses", 5000),
         ] {
             assert!(await_cache_settling(&state, account, key, target, delay).now_or_never().is_some());
         }
-        assert!(!matches_acp_upstream("http://localhost:8049/v1/responses", || None));
+        assert!(!matches_acp_upstream("http://localhost:8050/v1/responses", || None));
         assert!(!matches_acp_upstream("http://localhost.example:8048/v1/responses", || None));
+        assert!(matches_2048_upstream("http://127.0.0.1:2048/v1/responses", || None));
+        assert!(matches_2048_upstream(
+            "http://127.0.0.1:12048/v1/responses",
+            || Some("http://127.0.0.1:12048".into())
+        ));
+        assert!(!matches_2048_upstream(
+            "http://remote.example:12048/v1/responses",
+            || Some("http://remote.example:12048".into())
+        ));
         for base in ["acp.internal:9010", "http://acp.internal:9010/prefix"] {
             let configured = || Some(base.to_owned());
             assert!(matches_acp_upstream("http://acp.internal:9010/v1/responses", configured));
@@ -3921,14 +3983,14 @@ mod tests {
     }
 
     #[test]
-    fn group_legacy_json_defaults_optional_policy_flags_false() {
+    fn group_legacy_json_defaults_staged_timeout_true_and_other_flags_false() {
         let legacy = json!({
             "id": "g-legacy",
             "name": "Legacy Group",
             "routing_strategy": "priority"
         });
         let parsed: Group = serde_json::from_value(legacy).unwrap();
-        assert!(!parsed.staged_timeout_enabled);
+        assert!(parsed.staged_timeout_enabled);
         assert!(!parsed.sse_keepalive_enabled);
         assert!(!parsed.smart_cooldown_enabled);
     }
@@ -4237,5 +4299,213 @@ mod tests {
         assert!(a2.first_byte_ms.is_some());
         assert!(a2.error.is_none());
         assert!(a2.total_ms >= 1200, "expected slow stream total >= 1200ms, got {}", a2.total_ms);
+    }
+
+    static AISTUDIO_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    struct AistudioBaseEnvGuard(Option<String>);
+
+    impl AistudioBaseEnvGuard {
+        fn set(value: &str) -> Self {
+            let prev = std::env::var("AISTUDIO_UPSTREAM_BASE").ok();
+            unsafe {
+                std::env::set_var("AISTUDIO_UPSTREAM_BASE", value);
+            }
+            Self(prev)
+        }
+    }
+
+    impl Drop for AistudioBaseEnvGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.0 {
+                    Some(prev) => std::env::set_var("AISTUDIO_UPSTREAM_BASE", prev),
+                    None => std::env::remove_var("AISTUDIO_UPSTREAM_BASE"),
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn single_2048_endpoint_retries_once_on_503_and_recovers() {
+        use axum::routing::post;
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let _env_lock = AISTUDIO_ENV_LOCK.lock().await;
+
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_clone = hits.clone();
+        let (ep, _srv) = serve(axum::Router::new().route(
+            "/v1/responses",
+            post(move || {
+                let hits = hits_clone.clone();
+                async move {
+                    if hits.fetch_add(1, Ordering::SeqCst) == 0 {
+                        (StatusCode::SERVICE_UNAVAILABLE, "account 1 busy").into_response()
+                    } else {
+                        axum::Json(json!({"id": "ok-2048"})).into_response()
+                    }
+                }
+            }),
+        ))
+        .await;
+        let _env_guard = AistudioBaseEnvGuard::set(&ep);
+
+        let (_dir, state) = fixture(&[ep]);
+        let response = call(state.clone(), "/v1/responses", json!({"model": "chosen"})).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+
+        let logs = state.store.logs(0, store::now() + 10).unwrap();
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0].attempts, 2);
+        assert_eq!(logs[0].status, 200);
+    }
+
+    #[tokio::test]
+    async fn single_2048_endpoint_stops_after_one_retry_on_repeated_503() {
+        use axum::routing::post;
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let _env_lock = AISTUDIO_ENV_LOCK.lock().await;
+
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_clone = hits.clone();
+        let (ep, _srv) = serve(axum::Router::new().route(
+            "/v1/responses",
+            post(move || {
+                let hits = hits_clone.clone();
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    (StatusCode::SERVICE_UNAVAILABLE, "still busy")
+                }
+            }),
+        ))
+        .await;
+        let _env_guard = AistudioBaseEnvGuard::set(&ep);
+
+        let (_dir, state) = fixture(&[ep]);
+        let response = call(state.clone(), "/v1/responses", json!({"model": "chosen"})).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let _ = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+
+        let logs = state.store.logs(0, store::now() + 10).unwrap();
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0].attempts, 2);
+    }
+
+    #[tokio::test]
+    async fn single_2048_endpoint_retries_once_on_header_timeout_and_disconnect() {
+        use axum::routing::post;
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let _env_lock = AISTUDIO_ENV_LOCK.lock().await;
+
+        // Case 1: header timeout on first attempt, 200 on second.
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_clone = hits.clone();
+        let (ep_timeout, _srv_timeout) = serve(axum::Router::new().route(
+            "/v1/responses",
+            post(move || {
+                let hits = hits_clone.clone();
+                async move {
+                    if hits.fetch_add(1, Ordering::SeqCst) == 0 {
+                        tokio::time::sleep(Duration::from_millis(1500)).await;
+                    }
+                    axum::Json(json!({"id": "after-timeout"}))
+                }
+            }),
+        ))
+        .await;
+        {
+            let _env_guard = AistudioBaseEnvGuard::set(&ep_timeout);
+            let (_dir, state) = fixture(&[ep_timeout]);
+            state
+                .store
+                .update(|c| {
+                    c.settings.request_timeout_seconds = 1;
+                    Ok(())
+                })
+                .unwrap();
+            let response = call(state.clone(), "/v1/responses", json!({"model": "chosen"})).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(hits.load(Ordering::SeqCst), 2);
+        }
+
+        // Case 2: raw TCP drop before response headers on first attempt, 200 on second.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let tcp_hits = Arc::new(AtomicUsize::new(0));
+        let tcp_hits_clone = tcp_hits.clone();
+        let server_task = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            for idx in 0..2 {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                tcp_hits_clone.fetch_add(1, Ordering::SeqCst);
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                if idx == 0 {
+                    drop(sock);
+                } else {
+                    let body = r#"{"id":"after-drop"}"#;
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                }
+            }
+        });
+        let ep_drop = format!("http://{addr}");
+        {
+            let _env_guard = AistudioBaseEnvGuard::set(&ep_drop);
+            let (_dir, state) = fixture(&[ep_drop]);
+            let response = call(state.clone(), "/v1/responses", json!({"model": "chosen"})).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(tcp_hits.load(Ordering::SeqCst), 2);
+        }
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn single_non_2048_endpoint_does_not_retry_503() {
+        use axum::routing::post;
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let _env_lock = AISTUDIO_ENV_LOCK.lock().await;
+
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_clone = hits.clone();
+        let (ep, _srv) = serve(axum::Router::new().route(
+            "/v1/responses",
+            post(move || {
+                let hits = hits_clone.clone();
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    (StatusCode::SERVICE_UNAVAILABLE, "upstream down")
+                }
+            }),
+        ))
+        .await;
+
+        let (_dir, state) = fixture(&[ep]);
+        let response = call(state.clone(), "/v1/responses", json!({"model": "chosen"})).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
     }
 }

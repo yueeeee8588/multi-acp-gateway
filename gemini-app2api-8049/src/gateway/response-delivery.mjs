@@ -63,24 +63,32 @@ async function write(res, chunk, signal = null, writeTimeoutMs = 30000) {
     else if (signal?.aborted) onAbort();
   });
 }
-export function createResponseDelivery(res, { route = 'chat', stream = false, geminiSse = true, includeUsage = false, model, thinkingLevel, reasoningEffort, parallelToolCalls = true, promptChars, imageCount = 0, deferEmptyStart = false, signal = null, writeTimeoutMs = 30000, keepaliveMs = 15000 } = {}) {
+export function createResponseDelivery(res, { route = 'chat', stream = false, geminiSse = true, includeUsage = false, model, thinkingLevel, reasoningEffort, parallelToolCalls = true, promptChars, imageCount = 0, deferEmptyStart = false, signal = null, writeTimeoutMs = 30000, keepaliveMs = 15000, keepaliveHeadersDelayMs = 12000 } = {}) {
   let meta = { id: 'chatcmpl-' + crypto.randomBytes(16).toString('hex'), created: Math.floor(Date.now() / 1000), model,
     requestedThinkingLevel: thinkingLevel, ...(reasoningEffort === undefined ? {} : { requestedReasoningEffort: reasoningEffort }) };
-  let started = false, settled = false, content = '', calls = [], bytes = 0, sequence = 0, message = null;
+  let started = false, keepaliveHeadersSent = false, settled = false, content = '', calls = [], bytes = 0, sequence = 0, message = null;
   let publishedLength = 0, publishedBytes = 0;
   let googleBlockIndex = 0, googleTextOpen = false;
   let geminiArrayFirst = true;
-  let keepaliveTimer = null;
+  let keepaliveTimer = null, deferredHeaderTimer = null;
+  const stopDeferredHeaderTimer = () => {
+    if (deferredHeaderTimer !== null) {
+      clearTimeout(deferredHeaderTimer);
+      deferredHeaderTimer = null;
+    }
+  };
   const stopKeepalive = () => {
+    stopDeferredHeaderTimer();
     if (keepaliveTimer !== null) {
       clearTimeout(keepaliveTimer);
       keepaliveTimer = null;
     }
     res.off?.('close', stopKeepalive);
     res.off?.('error', stopKeepalive);
+    signal?.removeEventListener?.('abort', stopKeepalive);
   };
   const armKeepalive = () => {
-    if (!stream || (route === 'gemini' && !geminiSse) || settled || !started || !Number.isFinite(keepaliveMs) || keepaliveMs <= 0) return;
+    if (!stream || (route === 'gemini' && !geminiSse) || settled || (!started && !keepaliveHeadersSent) || !Number.isFinite(keepaliveMs) || keepaliveMs <= 0) return;
     if (keepaliveTimer !== null) clearTimeout(keepaliveTimer);
     keepaliveTimer = setTimeout(() => {
       keepaliveTimer = null;
@@ -95,6 +103,50 @@ export function createResponseDelivery(res, { route = 'chat', stream = false, ge
     }, keepaliveMs);
     keepaliveTimer.unref?.();
   };
+  const writeSseHeaders = (extraHeaders = {}) => {
+    if (!res.headersSent) {
+      const isGeminiJsonArray = route === 'gemini' && !geminiSse;
+      res.writeHead(200, {
+        'Content-Type': isGeminiJsonArray ? 'application/json; charset=utf-8' : 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        ...(isGeminiJsonArray ? {} : { Connection: 'keep-alive', 'X-Accel-Buffering': 'no' }),
+        'X-Gemini-Usage': 'estimated',
+        'X-Requested-Thinking-Level': String(meta.requestedThinkingLevel ?? ''),
+        ...(Number.isSafeInteger(meta.thinkingLevel) ? { 'X-Thinking-Level': String(meta.thinkingLevel) } : {}),
+        ...(Number.isSafeInteger(meta.resolvedModeCategory) ? { 'X-Native-Mode': String(meta.resolvedModeCategory) } : {}),
+        ...(meta.requestedReasoningEffort === undefined ? {} : { 'X-Reasoning-Effort': meta.requestedReasoningEffort }),
+        ...(meta.ignoredTokenParameters?.length ? { 'X-Gemini-Token-Limit': 'not-enforced', 'X-Gemini-Ignored-Parameters': meta.ignoredTokenParameters.join(', ') } : {}),
+        ...extraHeaders,
+      });
+      res.flushHeaders?.();
+    }
+  };
+  const flushKeepaliveHeaders = () => {
+    deferredHeaderTimer = null;
+    if (!stream || (route === 'gemini' && !geminiSse) || !deferEmptyStart || settled || started || keepaliveHeadersSent || res.headersSent || res.destroyed || res.writableEnded || signal?.aborted) return;
+    try {
+      res.removeHeader?.('X-Gemini-Provider-Attempts');
+      res.removeHeader?.('X-Gemini-Failover-Count');
+      res.removeHeader?.('X-Gemini-Failover-Reason');
+      res.removeHeader?.('X-Gemini-Recovery-Errors');
+      writeSseHeaders({ 'X-Gemini-Keepalive-Headers': '1' });
+      keepaliveHeadersSent = true;
+      if (!res.writableNeedDrain) {
+        if (typeof res.writeKeepalive === 'function') res.writeKeepalive(': keepalive\n\n');
+        else res.write(': keepalive\n\n');
+      }
+      armKeepalive();
+    } catch {
+      stopKeepalive();
+    }
+  };
+  if (stream && !(route === 'gemini' && !geminiSse) && deferEmptyStart && Number.isFinite(keepaliveHeadersDelayMs) && keepaliveHeadersDelayMs > 0) {
+    res.once?.('close', stopKeepalive);
+    res.once?.('error', stopKeepalive);
+    signal?.addEventListener?.('abort', stopKeepalive, { once: true });
+    deferredHeaderTimer = setTimeout(flushKeepaliveHeaders, keepaliveHeadersDelayMs);
+    deferredHeaderTimer.unref?.();
+  }
   // Ordinary upstream responses carry no token accounting. Usage is therefore a
   // labelled estimate over the caller request and the delivered output, never a
   // value read from Google.
@@ -192,23 +244,12 @@ export function createResponseDelivery(res, { route = 'chat', stream = false, ge
     if (settled) return;
     if (!started && identity) meta = { ...meta, ...identity };
     if (!stream || started) return;
+    stopDeferredHeaderTimer();
     started = true;
-    if (!res.headersSent) {
-      const isGeminiJsonArray = route === 'gemini' && !geminiSse;
-      res.writeHead(200, {
-        'Content-Type': isGeminiJsonArray ? 'application/json; charset=utf-8' : 'text/event-stream',
-        'Cache-Control': 'no-cache',
-        ...(isGeminiJsonArray ? {} : { Connection: 'keep-alive', 'X-Accel-Buffering': 'no' }),
-        'X-Gemini-Usage': 'estimated',
-        'X-Requested-Thinking-Level': String(meta.requestedThinkingLevel ?? ''),
-        ...(Number.isSafeInteger(meta.thinkingLevel) ? { 'X-Thinking-Level': String(meta.thinkingLevel) } : {}),
-        ...(Number.isSafeInteger(meta.resolvedModeCategory) ? { 'X-Native-Mode': String(meta.resolvedModeCategory) } : {}),
-        ...(meta.requestedReasoningEffort === undefined ? {} : { 'X-Reasoning-Effort': meta.requestedReasoningEffort }),
-        ...(meta.ignoredTokenParameters?.length ? { 'X-Gemini-Token-Limit': 'not-enforced', 'X-Gemini-Ignored-Parameters': meta.ignoredTokenParameters.join(', ') } : {}) });
-      res.flushHeaders?.();
-    }
+    writeSseHeaders();
     res.once?.('close', stopKeepalive);
     res.once?.('error', stopKeepalive);
+    signal?.addEventListener?.('abort', stopKeepalive, { once: true });
     if (!(route === 'gemini' && !geminiSse)) armKeepalive();
     if (route === 'chat') await sendChat({ role: 'assistant' });
     else if (route === 'google') {
@@ -346,9 +387,10 @@ export function createResponseDelivery(res, { route = 'chat', stream = false, ge
     settled = true; stopKeepalive(); res.end();
   }
   async function interrupt(error) {
+    stopDeferredHeaderTimer();
     if (settled || res.destroyed || res.writableEnded) { stopKeepalive(); return false; }
     if (error?.unverifiedOutput === true) {
-      if (!started) { discard(); return false; }
+      if (!started) { discard(); if (!keepaliveHeadersSent) { stopKeepalive(); return false; } }
       content = content.slice(0, publishedLength);
       bytes = Buffer.byteLength(content) + calls.reduce((total, call) => total + Buffer.byteLength(JSON.stringify(call)), 0);
     }
@@ -358,10 +400,11 @@ export function createResponseDelivery(res, { route = 'chat', stream = false, ge
       partialCalls.reduce((total, call) => total + Buffer.byteLength(JSON.stringify(call)), 0);
     if (partialCalls.length > 32 || partialBytes > MAX) {
       if (!started) discard();
+      stopKeepalive();
       throw fault('RESPONSE_TOO_LARGE', 502);
     }
-    if (!started && error?.code === 'RESPONSE_TOO_LARGE') { discard(); return false; }
-    if (!started && !partial.content?.length && !partialCalls.length) return false;
+    if (!started && !keepaliveHeadersSent && error?.code === 'RESPONSE_TOO_LARGE') { discard(); stopKeepalive(); return false; }
+    if (!started && !keepaliveHeadersSent && !partial.content?.length && !partialCalls.length) { stopKeepalive(); return false; }
     const detailStatus = Number.isInteger(error?.status) && error.status >= 400 && error.status <= 599 ? error.status : 502;
     const detail = {
       code: safeCode(error),
@@ -450,9 +493,10 @@ export function createResponseDelivery(res, { route = 'chat', stream = false, ge
     content = ''; calls = []; bytes = 0; publishedLength = 0; publishedBytes = 0; message = null; output.length = 0;
     googleBlockIndex = 0; googleTextOpen = false; geminiArrayFirst = true;
   }
-  return { accept, complete, interrupt, discard,
+  return { accept, complete, interrupt, discard, close: stopKeepalive,
     outputCommitState: () => ({ publishedBytes, toolCallCount: stream ? calls.length : 0 }),
     get started() { return started; },
+    get keepaliveOnlyHeaders() { return keepaliveHeadersSent && !started; },
     get hasContent() { return content.length > 0 || calls.length > 0; },
     get callCount() { return calls.length; },
     get publishedBytes() { return publishedBytes; },

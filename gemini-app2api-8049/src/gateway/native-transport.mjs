@@ -18,8 +18,10 @@ import { fault } from "./oauth-client-defaults.mjs";
 import { PROMPT_MAX_BYTES } from "../openai-contract.mjs";
 import { NATIVE_RESPONSE_LIMITS as RESPONSE_LIMITS } from './native-response-limits.mjs';
 import { observeNative } from './native-diagnostic.mjs';
-import { connectHttp2 } from './outbound-proxy.mjs';
+import { connectHttp2, resolveOutboundProxy } from './outbound-proxy.mjs';
 export const DEFAULT_HTTP2_PING_INTERVAL_MS = 15_000;
+export const DEFAULT_HTTP2_PING_TIMEOUT_MS = 30_000;
+export const DEFAULT_HTTP2_IDLE_TIMEOUT_MS = 60_000;
 export const MIN_CONNECT_ATTEMPT_TIMEOUT_MS = 5000;
 // Node v22 defaults Happy Eyeballs per-family attempt timeout to 250ms, which aborts
 // IPv4 connects over high-RTT VPN tunnels when IPv6 returns immediate EHOSTUNREACH.
@@ -39,6 +41,167 @@ export const NATIVE_RPC =
 // ProcessQuery compatibility snapshot checked against native 1.135.1.1291.
 // A protocol constant, not a runtime App dependency or copied device identity.
 export const NATIVE_COMPATIBILITY_VERSION = "1.135.1.1291";
+
+// Shared HTTP/2 ClientHttp2Session pool, isolated per connect factory and keyed by origin + proxyUrl.
+const pooledSessionsByConnect = new WeakMap();
+const allPooledEntries = new Set();
+
+function getSessionPool(connectFn) {
+  let pool = pooledSessionsByConnect.get(connectFn);
+  if (!pool) {
+    pool = new Map();
+    pooledSessionsByConnect.set(connectFn, pool);
+  }
+  return pool;
+}
+
+export function buildNativeHttp2PoolKey(origin, env = process.env) {
+  const proxyUrl = resolveOutboundProxy(origin, env);
+  return `${origin}|${proxyUrl ? proxyUrl.href : 'direct'}`;
+}
+
+function closeSessionGracefully(session, { force = false } = {}) {
+  if (!session) return Promise.resolve();
+  if (force || typeof session.close !== 'function') {
+    try { session.destroy?.(); } catch {}
+    return Promise.resolve();
+  }
+  if (session.destroyed || session.closed) return Promise.resolve();
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(cleanup);
+      resolve();
+    };
+    const cleanup = setTimeout(() => {
+      try { session.destroy?.(); } catch {}
+      finish();
+    }, 250);
+    cleanup.unref?.();
+    session.once?.('close', finish);
+    try {
+      session.close();
+    } catch {
+      try { session.destroy?.(); } catch {}
+      finish();
+    }
+  });
+}
+
+function evictPoolEntry(entry, { closeWhenIdle = false, force = false } = {}) {
+  if (!entry) return;
+  if (entry.idleTimer) {
+    clearTimeout(entry.idleTimer);
+    entry.idleTimer = null;
+  }
+  if (entry.pool.get(entry.key) === entry) {
+    entry.pool.delete(entry.key);
+  }
+  entry.evicted = true;
+  if (entry.activeStreams === 0) {
+    allPooledEntries.delete(entry);
+    if (closeWhenIdle) {
+      void closeSessionGracefully(entry.session, { force });
+    }
+  }
+}
+
+export function acquirePooledHttp2Session({
+  origin = NATIVE_ORIGIN,
+  connect = connectHttp2,
+  env = process.env,
+} = {}) {
+  const pool = getSessionPool(connect);
+  const key = buildNativeHttp2PoolKey(origin, env);
+  const existing = pool.get(key);
+  if (
+    existing &&
+    !existing.evicted &&
+    !existing.session.closed &&
+    !existing.session.destroyed
+  ) {
+    if (existing.idleTimer) {
+      clearTimeout(existing.idleTimer);
+      existing.idleTimer = null;
+    }
+    existing.session.ref?.();
+    existing.activeStreams++;
+    return existing;
+  }
+  if (existing) {
+    evictPoolEntry(existing, { closeWhenIdle: false });
+  }
+  // http2.connect returns ClientHttp2Session synchronously; inserting into `pool`
+  // immediately deduplicates concurrent callers while the handshake is in flight.
+  const session = connect(origin);
+  const entry = {
+    key,
+    pool,
+    session,
+    activeStreams: 1,
+    evicted: false,
+    idleTimer: null,
+  };
+  const onGoaway = () => evictPoolEntry(entry, { closeWhenIdle: true });
+  const onClose = () => evictPoolEntry(entry, { closeWhenIdle: false });
+  const onError = () => evictPoolEntry(entry, { closeWhenIdle: false });
+  session.on?.('goaway', onGoaway);
+  session.on?.('close', onClose);
+  session.on?.('error', onError);
+  pool.set(key, entry);
+  allPooledEntries.add(entry);
+  return entry;
+}
+
+export function releasePooledHttp2Session(
+  entry,
+  { idleTimeoutMs = DEFAULT_HTTP2_IDLE_TIMEOUT_MS } = {},
+) {
+  if (!entry) return;
+  entry.activeStreams = Math.max(0, entry.activeStreams - 1);
+  if (entry.activeStreams > 0) return;
+  if (entry.evicted || entry.session.closed || entry.session.destroyed) {
+    evictPoolEntry(entry, { closeWhenIdle: true });
+    return;
+  }
+  entry.session.unref?.();
+  if (Number.isFinite(idleTimeoutMs) && idleTimeoutMs > 0) {
+    entry.idleTimer = setTimeout(() => {
+      entry.idleTimer = null;
+      if (entry.activeStreams === 0) {
+        evictPoolEntry(entry, { closeWhenIdle: true });
+      }
+    }, idleTimeoutMs);
+    entry.idleTimer.unref?.();
+  }
+}
+
+export async function closeNativeHttp2Pool({ force = false } = {}) {
+  const entries = [...allPooledEntries];
+  const closes = [];
+  for (const entry of entries) {
+    if (entry.idleTimer) {
+      clearTimeout(entry.idleTimer);
+      entry.idleTimer = null;
+    }
+    if (entry.pool.get(entry.key) === entry) {
+      entry.pool.delete(entry.key);
+    }
+    entry.evicted = true;
+    allPooledEntries.delete(entry);
+    closes.push(closeSessionGracefully(entry.session, { force }));
+  }
+  await Promise.allSettled(closes);
+}
+
+export function getNativeHttp2PoolStats() {
+  let activeStreams = 0;
+  for (const entry of allPooledEntries) activeStreams += entry.activeStreams;
+  return { sessions: allPooledEntries.size, activeStreams };
+}
+
 export function openDirectTurn(
   token,
   {
@@ -56,7 +219,13 @@ export function openDirectTurn(
     emitHeaders = false,
     diagnostic,
   } = {},
-  { connect = connectHttp2 } = {},
+  {
+    connect = connectHttp2,
+    pool = (connect === connectHttp2),
+    idleTimeoutMs = DEFAULT_HTTP2_IDLE_TIMEOUT_MS,
+    origin = NATIVE_ORIGIN,
+    env = process.env,
+  } = {},
 ) {
   if (
     typeof token !== "string" ||
@@ -108,6 +277,10 @@ export function openDirectTurn(
   const note = (name, values) => observeNative(diagnostic, 'event', name, values);
   note('transport_open', { mode: modeCategory, thinking: thinkingLevel, timeoutMs, bytes: wire.length });
   let client,
+    pooledEntry = null,
+    pooledReleased = false,
+    onClientError = null,
+    onClientGoaway = null,
     socket,
     connectionEnd = null,
     streamCloseCode = null,
@@ -157,10 +330,25 @@ export function openDirectTurn(
     stopPing();
     signal?.removeEventListener("abort", abort);
     detachSocketListeners();
+    if (pooledEntry && client && onClientError) {
+      client.off?.("error", onClientError);
+      onClientError = null;
+    }
+    if (pooledEntry && client && onClientGoaway) {
+      client.off?.("goaway", onClientGoaway);
+      onClientGoaway = null;
+    }
     note('local_stream_close', { requestedCode: ended ? 0 : 8, rstCode: request?.rstCode });
     try {
       request?.close(ended ? http2.constants.NGHTTP2_NO_ERROR : http2.constants.NGHTTP2_CANCEL);
     } catch {}
+    if (pooledEntry) {
+      if (!pooledReleased) {
+        pooledReleased = true;
+        releasePooledHttp2Session(pooledEntry, { idleTimeoutMs });
+      }
+      return;
+    }
     const session = client;
     const destroy = () => { note('local_session_destroy'); try { session?.destroy(); } catch {} };
     if (typeof session?.close !== "function") { destroy(); return; }
@@ -274,7 +462,12 @@ export function openDirectTurn(
   timer.unref();
   signal?.addEventListener("abort", abort, { once: true });
   try {
-    client = connect(NATIVE_ORIGIN);
+    if (pool) {
+      pooledEntry = acquirePooledHttp2Session({ origin, connect, env });
+      client = pooledEntry.session;
+    } else {
+      client = connect(origin);
+    }
     try {
       socket = client.socket;
       socket?.setKeepAlive?.(true, 15_000);
@@ -283,8 +476,12 @@ export function openDirectTurn(
     } catch {
       detachSocketListeners();
     }
-    client.on("error", () => fail("NATIVE_CONNECTION_FAILED"));
-    if (diagnostic) client.on('goaway', code => note('peer_goaway', { goawayCode: code }));
+    onClientError = () => fail("NATIVE_CONNECTION_FAILED");
+    client.on("error", onClientError);
+    if (diagnostic) {
+      onClientGoaway = code => note('peer_goaway', { goawayCode: code });
+      client.on('goaway', onClientGoaway);
+    }
     if (Number.isInteger(pingIntervalMs) && pingIntervalMs > 0 && typeof client.ping === "function") {
       pingTimer = setInterval(() => {
         if (closed || ended || client.closed || client.destroyed || pingInFlight) return;
@@ -346,6 +543,20 @@ export function openDirectTurn(
         ended = true;
         clearTimeout(timer);
         stopPing();
+        if (pooledEntry && !pooledReleased) {
+          pooledReleased = true;
+          signal?.removeEventListener("abort", abort);
+          detachSocketListeners();
+          if (client && onClientError) {
+            client.off?.("error", onClientError);
+            onClientError = null;
+          }
+          if (client && onClientGoaway) {
+            client.off?.("goaway", onClientGoaway);
+            onClientGoaway = null;
+          }
+          releasePooledHttp2Session(pooledEntry, { idleTimeoutMs });
+        }
       } catch {
         fail("NATIVE_FRAME_REJECTED");
       }

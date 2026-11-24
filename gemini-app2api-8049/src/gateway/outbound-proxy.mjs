@@ -245,6 +245,74 @@ function normalizeHeaders(headers) {
   return out;
 }
 
+// Cached keep-alive HTTPS agents: one for direct HTTPS and one per proxy + TLS config.
+// Note: when no proxy is configured, fetchWithProxy delegates to `fetchImpl` (Node's
+// built-in fetch/undici already pools keep-alive connections); `directHttpsAgent` is
+// cached alongside per-proxy agents for callers or direct https.request paths.
+let directHttpsAgent = null;
+const proxyHttpsAgents = new Map();
+
+function buildProxyAgentKey(proxyUrl, tlsOptions = {}) {
+  const rejectUnauthorized = tlsOptions.rejectUnauthorized ?? true;
+  const proxyRejectUnauthorized = tlsOptions.proxyRejectUnauthorized ?? true;
+  return `${proxyUrl.href}|ru=${rejectUnauthorized}|pru=${proxyRejectUnauthorized}`;
+}
+
+export function getOutboundHttpsAgent({ proxyUrl = null, tlsOptions = {} } = {}) {
+  if (!proxyUrl) {
+    if (!directHttpsAgent) {
+      directHttpsAgent = new https.Agent({ keepAlive: true, maxSockets: 16 });
+    }
+    return directHttpsAgent;
+  }
+  const key = buildProxyAgentKey(proxyUrl, tlsOptions);
+  const existing = proxyHttpsAgents.get(key);
+  if (
+    existing &&
+    existing.ca === tlsOptions.ca &&
+    existing.proxyCa === tlsOptions.proxyCa
+  ) {
+    return existing.agent;
+  }
+  const agent = new https.Agent({ keepAlive: true, maxSockets: 16 });
+  // Pool TLS sockets established over HTTP CONNECT tunnels so consecutive
+  // requests to the same target host:port reuse the tunneled connection.
+  agent.createConnection = (options) => {
+    const targetHost = stripBrackets(options.host || options.hostname || '');
+    const targetPort = Number(options.port) || 443;
+    const tunnel = createConnectTunnel(proxyUrl, targetHost, targetPort, {
+      rejectUnauthorized: tlsOptions.proxyRejectUnauthorized ?? true,
+      ...(tlsOptions.proxyCa ? { ca: tlsOptions.proxyCa } : {}),
+    });
+    const socket = tls.connect({
+      socket: tunnel,
+      servername: net.isIP(targetHost) ? undefined : targetHost,
+      ALPNProtocols: ['http/1.1'],
+      rejectUnauthorized: tlsOptions.rejectUnauthorized ?? true,
+      ...(tlsOptions.ca ? { ca: tlsOptions.ca } : {}),
+    });
+    socket.once('close', () => {
+      if (!tunnel.destroyed) tunnel.destroy();
+    });
+    return socket;
+  };
+  if (!tlsOptions.ca && !tlsOptions.proxyCa) {
+    proxyHttpsAgents.set(key, { agent, ca: undefined, proxyCa: undefined });
+  }
+  return agent;
+}
+
+export function destroyOutboundProxyAgents() {
+  if (directHttpsAgent) {
+    directHttpsAgent.destroy();
+    directHttpsAgent = null;
+  }
+  for (const { agent } of proxyHttpsAgents.values()) {
+    agent.destroy();
+  }
+  proxyHttpsAgents.clear();
+}
+
 export async function fetchWithProxy(url, init = {}, { env = process.env, fetchImpl = fetch, tlsOptions = {} } = {}) {
   const proxyUrl = fetchImpl === fetch ? resolveOutboundProxy(url, env) : null;
   if (!proxyUrl) return fetchImpl(url, init);
@@ -258,6 +326,7 @@ export async function fetchWithProxy(url, init = {}, { env = process.env, fetchI
     headers['Content-Length'] = String(body.length);
   }
   if (init.signal?.aborted) throw init.signal.reason || new DOMException('Aborted', 'AbortError');
+  const agent = getOutboundHttpsAgent({ proxyUrl, tlsOptions });
   return new Promise((resolve, reject) => {
     let settled = false;
     const done = (err, value) => {
@@ -266,26 +335,13 @@ export async function fetchWithProxy(url, init = {}, { env = process.env, fetchI
       init.signal?.removeEventListener('abort', onAbort);
       if (err) reject(err); else resolve(value);
     };
-    const tunnel = createConnectTunnel(proxyUrl, targetHost, targetPort, {
-      signal: init.signal,
-      rejectUnauthorized: tlsOptions.proxyRejectUnauthorized ?? true,
-      ...(tlsOptions.proxyCa ? { ca: tlsOptions.proxyCa } : {}),
-    });
-    const socket = tls.connect({
-      socket: tunnel,
-      servername: net.isIP(targetHost) ? undefined : targetHost,
-      ALPNProtocols: ['http/1.1'],
-      rejectUnauthorized: tlsOptions.rejectUnauthorized ?? true,
-      ...(tlsOptions.ca ? { ca: tlsOptions.ca } : {}),
-    });
     const req = https.request({
       host: targetHost,
       port: targetPort,
       path: target.pathname + target.search,
       method: init.method || 'GET',
       headers,
-      agent: false,
-      createConnection: () => socket,
+      agent,
     }, (res) => {
       const status = res.statusCode || 502;
       if (init.redirect === 'error' && status >= 300 && status < 400 && res.headers.location) {
@@ -304,14 +360,10 @@ export async function fetchWithProxy(url, init = {}, { env = process.env, fetchI
     });
     const onAbort = () => {
       req.destroy();
-      socket.destroy();
-      tunnel.destroy();
       done(init.signal?.reason || new DOMException('Aborted', 'AbortError'));
     };
     init.signal?.addEventListener('abort', onAbort, { once: true });
     req.on('error', (err) => {
-      socket.destroy();
-      tunnel.destroy();
       done(err);
     });
     if (body) req.write(body);
