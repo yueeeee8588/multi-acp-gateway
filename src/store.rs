@@ -244,6 +244,10 @@ fn default_autostart_enabled() -> bool {
     true
 }
 
+fn default_update_mirror_mode() -> String {
+    "auto".into()
+}
+
 pub(crate) const MAX_CACHE_SETTLING_DELAY_MS: u32 = 5000;
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -270,6 +274,10 @@ pub struct Settings {
     pub sensitive_words: Vec<SensitiveWordRule>,
     #[serde(default)]
     pub auto_update_enabled: bool,
+    #[serde(default = "default_update_mirror_mode")]
+    pub update_mirror_mode: String,
+    #[serde(default)]
+    pub update_mirror_url: String,
 }
 impl Default for Settings {
     fn default() -> Self {
@@ -288,6 +296,8 @@ impl Default for Settings {
             sensitive_filter_enabled: false,
             sensitive_words: Vec::new(),
             auto_update_enabled: false,
+            update_mirror_mode: default_update_mirror_mode(),
+            update_mirror_url: String::new(),
         }
     }
 }

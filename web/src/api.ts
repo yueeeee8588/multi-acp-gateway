@@ -232,6 +232,15 @@ export type UpdateStatus = {
   configured: boolean;
   mode?: UpdateMode;
   auto_update?: boolean;
+  mirror_mode?:
+    | "auto"
+    | "direct"
+    | "gh_proxy"
+    | "ghfast"
+    | "ghproxy_net"
+    | "custom"
+    | string;
+  mirror_url?: string;
   latest: Release | null;
   update_available: boolean;
   job: UpdateJob | null;

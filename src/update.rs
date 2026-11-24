@@ -53,6 +53,10 @@ const MAX_LOGS: usize = 150;
 const MAX_INSTALLER_BYTES: u64 = 256 * 1024 * 1024;
 const RELEASE_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
 const RELEASE_RETRY_DELAY: Duration = Duration::from_secs(60);
+const MIRROR_GH_PROXY_PREFIX: &str = "https://gh-proxy.com/";
+const MIRROR_GHFAST_PREFIX: &str = "https://ghfast.top/";
+const MIRROR_GHPROXY_NET_PREFIX: &str = "https://ghproxy.net/";
+const OFFICIAL_SOURCE_LABEL: &str = "GitHub Official";
 static RELEASE_CACHE: Mutex<ReleaseCache> = Mutex::const_new(ReleaseCache {
     attempted_at: None,
     result: None,
@@ -78,13 +82,168 @@ struct ReleaseCache {
     latest: Option<Release>,
 }
 
-async fn fetch_release(client: &reqwest::Client, url: &str) -> Result<Release, String> {
+fn validate_mirror_url(raw: &str) -> Result<String, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(String::new());
+    }
+    if trimmed.chars().any(char::is_whitespace) {
+        return Err("Mirror URL must not contain whitespace".into());
+    }
+    let parsed = reqwest::Url::parse(trimmed)
+        .map_err(|_| "Mirror URL must be a valid http or https URL".to_owned())?;
+    if !matches!(parsed.scheme(), "http" | "https")
+        || parsed.host_str().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+    {
+        return Err("Mirror URL must be a valid http or https URL without credentials".into());
+    }
+    Ok(trimmed.to_owned())
+}
+
+pub fn validate_mirror_config(mode: &str, url: &str) -> Result<(String, String), String> {
+    let mode = mode.trim();
+    if !matches!(
+        mode,
+        "auto" | "direct" | "gh_proxy" | "ghfast" | "ghproxy_net" | "custom"
+    ) {
+        return Err(format!("Unsupported update mirror mode: {mode}"));
+    }
+    let validated_url = validate_mirror_url(url)?;
+    if mode == "custom" && validated_url.is_empty() {
+        return Err("Custom mirror URL is required when mirror mode is custom".into());
+    }
+    Ok((mode.to_owned(), validated_url))
+}
+
+fn env_mirror_url() -> Option<String> {
+    let raw = std::env::var("UPDATER_MIRROR_URL").ok()?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    validate_mirror_url(trimmed).ok().filter(|v| !v.is_empty())
+}
+
+fn resolve_mirror_url(prefix: &str, target_url: &str) -> String {
+    format!("{}/{}", prefix.trim_end_matches('/'), target_url)
+}
+
+pub fn build_mirror_candidates(
+    target_url: &str,
+    mode: &str,
+    custom_url: &str,
+    env_mirror: Option<&str>,
+) -> Vec<(String, String)> {
+    let mut candidates = Vec::new();
+    let mut seen = HashSet::new();
+    let mut push_unique = |label: &str, url: String| {
+        if seen.insert(url.clone()) {
+            candidates.push((label.to_owned(), url));
+        }
+    };
+
+    match mode.trim() {
+        "direct" => {
+            push_unique(OFFICIAL_SOURCE_LABEL, target_url.to_owned());
+        }
+        "gh_proxy" => {
+            push_unique(
+                "gh-proxy.com",
+                resolve_mirror_url(MIRROR_GH_PROXY_PREFIX, target_url),
+            );
+            push_unique(
+                "ghfast.top",
+                resolve_mirror_url(MIRROR_GHFAST_PREFIX, target_url),
+            );
+            push_unique(
+                "ghproxy.net",
+                resolve_mirror_url(MIRROR_GHPROXY_NET_PREFIX, target_url),
+            );
+            push_unique(OFFICIAL_SOURCE_LABEL, target_url.to_owned());
+        }
+        "ghfast" => {
+            push_unique(
+                "ghfast.top",
+                resolve_mirror_url(MIRROR_GHFAST_PREFIX, target_url),
+            );
+            push_unique(
+                "gh-proxy.com",
+                resolve_mirror_url(MIRROR_GH_PROXY_PREFIX, target_url),
+            );
+            push_unique(
+                "ghproxy.net",
+                resolve_mirror_url(MIRROR_GHPROXY_NET_PREFIX, target_url),
+            );
+            push_unique(OFFICIAL_SOURCE_LABEL, target_url.to_owned());
+        }
+        "ghproxy_net" => {
+            push_unique(
+                "ghproxy.net",
+                resolve_mirror_url(MIRROR_GHPROXY_NET_PREFIX, target_url),
+            );
+            push_unique(
+                "gh-proxy.com",
+                resolve_mirror_url(MIRROR_GH_PROXY_PREFIX, target_url),
+            );
+            push_unique(
+                "ghfast.top",
+                resolve_mirror_url(MIRROR_GHFAST_PREFIX, target_url),
+            );
+            push_unique(OFFICIAL_SOURCE_LABEL, target_url.to_owned());
+        }
+        "custom" => {
+            let trimmed = custom_url.trim();
+            if !trimmed.is_empty() {
+                push_unique("Custom Mirror", resolve_mirror_url(trimmed, target_url));
+            }
+            push_unique(OFFICIAL_SOURCE_LABEL, target_url.to_owned());
+        }
+        _ => {
+            if let Some(env) = env_mirror
+                && let Ok(valid) = validate_mirror_url(env)
+                && !valid.is_empty()
+            {
+                push_unique("Env Mirror", resolve_mirror_url(&valid, target_url));
+            }
+            push_unique(
+                "gh-proxy.com",
+                resolve_mirror_url(MIRROR_GH_PROXY_PREFIX, target_url),
+            );
+            push_unique(
+                "ghfast.top",
+                resolve_mirror_url(MIRROR_GHFAST_PREFIX, target_url),
+            );
+            push_unique(
+                "ghproxy.net",
+                resolve_mirror_url(MIRROR_GHPROXY_NET_PREFIX, target_url),
+            );
+            push_unique(OFFICIAL_SOURCE_LABEL, target_url.to_owned());
+        }
+    }
+
+    candidates
+}
+
+async fn fetch_release_once(
+    client: &reqwest::Client,
+    label: &str,
+    url: &str,
+) -> Result<Release, String> {
+    let timeout = if label == OFFICIAL_SOURCE_LABEL {
+        Duration::from_secs(20)
+    } else {
+        Duration::from_secs(10)
+    };
     let mut request = client
         .get(url)
         .header("User-Agent", "Multi-ACP-Updater")
         .header("Accept", "application/vnd.github+json")
-        .timeout(Duration::from_secs(20));
-    if let Ok(token) = std::env::var("GITHUB_TOKEN") {
+        .timeout(timeout);
+    if label == OFFICIAL_SOURCE_LABEL
+        && let Ok(token) = std::env::var("GITHUB_TOKEN")
+    {
         let token = token.trim();
         if !token.is_empty() {
             request = request.bearer_auth(token);
@@ -93,26 +252,56 @@ async fn fetch_release(client: &reqwest::Client, url: &str) -> Result<Release, S
     let reply = request
         .send()
         .await
-        .map_err(|_| "GitHub release lookup failed".to_owned())?;
+        .map_err(|_| format!("{label}: GitHub release lookup failed"))?;
     if !reply.status().is_success() {
-        return Err(format!("GitHub release lookup returned {}", reply.status()));
+        return Err(format!(
+            "{label}: GitHub release lookup returned {}",
+            reply.status()
+        ));
     }
     let bytes = reply
         .bytes()
         .await
-        .map_err(|_| "Invalid GitHub response".to_owned())?;
+        .map_err(|_| format!("{label}: Invalid GitHub response"))?;
     if bytes.len() > 512 * 1024 {
-        return Err("GitHub release response is too large".into());
+        return Err(format!("{label}: GitHub release response is too large"));
     }
     parse_release(
-        &serde_json::from_slice(&bytes).map_err(|_| "Invalid GitHub response".to_owned())?,
+        &serde_json::from_slice(&bytes).map_err(|_| format!("{label}: Invalid GitHub response"))?,
     )
+    .map_err(|err| format!("{label}: {err}"))
+}
+
+async fn fetch_release(
+    client: &reqwest::Client,
+    url: &str,
+    mirror_mode: &str,
+    mirror_url: &str,
+) -> Result<Release, String> {
+    let env_mirror = env_mirror_url();
+    let candidates = build_mirror_candidates(url, mirror_mode, mirror_url, env_mirror.as_deref());
+    let mut last_err = "GitHub release lookup failed".to_owned();
+    for (label, candidate_url) in candidates {
+        match fetch_release_once(client, &label, &candidate_url).await {
+            Ok(release) => {
+                tracing::debug!(source = %label, tag = %release.tag, "Fetched release metadata");
+                return Ok(release);
+            }
+            Err(err) => {
+                tracing::debug!(source = %label, error = %err, "Release metadata lookup failed; trying next source");
+                last_err = err;
+            }
+        }
+    }
+    Err(last_err)
 }
 
 async fn cached_release(
     cache: &Mutex<ReleaseCache>,
     client: &reqwest::Client,
     url: &str,
+    mirror_mode: &str,
+    mirror_url: &str,
 ) -> Result<Release, String> {
     // Serialize lookups so multiple authenticated tabs share one GitHub request.
     let mut cache = cache.lock().await;
@@ -126,7 +315,7 @@ async fn cached_release(
             return result.clone();
         }
     }
-    let result = fetch_release(client, url).await;
+    let result = fetch_release(client, url, mirror_mode, mirror_url).await;
     cache.attempted_at = Some(Instant::now());
     if let Ok(release) = &result {
         cache.latest = Some(release.clone());
@@ -178,6 +367,8 @@ pub struct UpdateStatus {
     pub configured: bool,
     pub mode: &'static str,
     pub auto_update: bool,
+    pub mirror_mode: String,
+    pub mirror_url: String,
     pub latest: Option<Release>,
     pub update_available: bool,
     pub job: Option<Job>,
@@ -189,6 +380,8 @@ fn response(
     configured: bool,
     mode: &'static str,
     auto_update: bool,
+    mirror_mode: String,
+    mirror_url: String,
     error: Option<String>,
 ) -> UpdateStatus {
     let current = env!("CARGO_PKG_VERSION");
@@ -202,6 +395,8 @@ fn response(
         configured,
         mode,
         auto_update,
+        mirror_mode,
+        mirror_url,
         latest: state.latest,
         update_available: available,
         job: state.job,
@@ -278,9 +473,23 @@ fn auto_update_setting(s: &Shared) -> bool {
         .map(|c| c.settings.auto_update_enabled)
         .unwrap_or(false)
 }
+fn mirror_settings(s: &Shared) -> (String, String) {
+    s.store
+        .config()
+        .map(|c| {
+            let mode = if c.settings.update_mirror_mode.trim().is_empty() {
+                "auto".to_owned()
+            } else {
+                c.settings.update_mirror_mode
+            };
+            (mode, c.settings.update_mirror_url)
+        })
+        .unwrap_or_else(|_| ("auto".to_owned(), String::new()))
+}
 pub async fn status(State(s): State<Shared>, h: HeaderMap) -> ApiResult<UpdateStatus> {
     api::auth(&s, &h)?;
     let auto_update = auto_update_setting(&s);
+    let (mirror_mode, mirror_url) = mirror_settings(&s);
     let latest = RELEASE_CACHE.lock().await.latest.clone();
     if helper_url()?.is_none() {
         if is_desktop_updater_enabled() {
@@ -290,6 +499,8 @@ pub async fn status(State(s): State<Shared>, h: HeaderMap) -> ApiResult<UpdateSt
                 true,
                 "desktop",
                 auto_update,
+                mirror_mode,
+                mirror_url,
                 None,
             )));
         }
@@ -298,32 +509,59 @@ pub async fn status(State(s): State<Shared>, h: HeaderMap) -> ApiResult<UpdateSt
             false,
             "disabled",
             auto_update,
+            mirror_mode,
+            mirror_url,
             None,
         )));
     }
     match helper(&s, "status", None).await {
         Ok(mut value) => {
             merge_release(&mut value, latest);
-            Ok(Json(response(value, true, "docker", auto_update, None)))
+            Ok(Json(response(
+                value,
+                true,
+                "docker",
+                auto_update,
+                mirror_mode,
+                mirror_url,
+                None,
+            )))
         }
         Err(e) => Ok(Json(response(
             AgentStatus { latest, job: None },
             true,
             "docker",
             auto_update,
+            mirror_mode,
+            mirror_url,
             Some(e.1),
         ))),
     }
 }
 pub async fn latest(State(s): State<Shared>, h: HeaderMap) -> ApiResult<UpdateStatus> {
     api::auth(&s, &h)?;
-    let latest = cached_release(&RELEASE_CACHE, &s.client, &release_api_url())
-        .await
-        .map_err(|error| ApiError(StatusCode::BAD_GATEWAY, error))?;
+    let (mirror_mode, mirror_url) = mirror_settings(&s);
+    let latest = cached_release(
+        &RELEASE_CACHE,
+        &s.client,
+        &release_api_url(),
+        &mirror_mode,
+        &mirror_url,
+    )
+    .await
+    .map_err(|error| ApiError(StatusCode::BAD_GATEWAY, error))?;
     let mut value = if helper_url()?.is_some() {
         let auto_update = auto_update_setting(&s);
         match helper(&s, "latest", None).await {
-            Ok(value) => response(value, true, "docker", auto_update, None),
+            Ok(value) => response(
+                value,
+                true,
+                "docker",
+                auto_update,
+                mirror_mode.clone(),
+                mirror_url.clone(),
+                None,
+            ),
             Err(_error) => status(State(s.clone()), h.clone()).await?.0,
         }
     } else {
@@ -339,13 +577,20 @@ pub async fn latest(State(s): State<Shared>, h: HeaderMap) -> ApiResult<UpdateSt
         value.configured,
         value.mode,
         value.auto_update,
+        value.mirror_mode,
+        value.mirror_url,
         value.error,
     )))
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UpdateConfigInput {
-    pub auto_update: bool,
+    #[serde(default)]
+    pub auto_update: Option<bool>,
+    #[serde(default)]
+    pub mirror_mode: Option<String>,
+    #[serde(default)]
+    pub mirror_url: Option<String>,
 }
 pub async fn update_config(
     State(s): State<Shared>,
@@ -353,16 +598,36 @@ pub async fn update_config(
     Json(input): Json<UpdateConfigInput>,
 ) -> ApiResult<UpdateStatus> {
     api::auth(&s, &h)?;
+    let current = s.store.config()?.settings;
+    let next_auto_update = input.auto_update.unwrap_or(current.auto_update_enabled);
+    let raw_mode = input
+        .mirror_mode
+        .as_deref()
+        .unwrap_or(&current.update_mirror_mode);
+    let raw_url = input
+        .mirror_url
+        .as_deref()
+        .unwrap_or(&current.update_mirror_url);
     let desktop = helper_url()?.is_none() && is_desktop_updater_enabled();
-    if input.auto_update && !desktop {
+    if next_auto_update && !desktop {
         return Err(bad(
             "Background auto-update is only supported on Windows desktop",
         ));
     }
+    let (next_mode, next_url) = validate_mirror_config(raw_mode, raw_url).map_err(|e| bad(&e))?;
+    let mirror_changed =
+        next_mode != current.update_mirror_mode || next_url != current.update_mirror_url;
     s.store.update(|c| {
-        c.settings.auto_update_enabled = input.auto_update;
+        c.settings.auto_update_enabled = next_auto_update;
+        c.settings.update_mirror_mode = next_mode.clone();
+        c.settings.update_mirror_url = next_url.clone();
         Ok(())
     })?;
+    if mirror_changed {
+        let mut cache = RELEASE_CACHE.lock().await;
+        cache.attempted_at = None;
+        cache.result = None;
+    }
     status(State(s), h).await
 }
 #[derive(Deserialize)]
@@ -417,8 +682,17 @@ pub async fn start(
     }
     s.login_attempts.lock().unwrap().remove("update");
     let auto_update = auto_update_setting(&s);
+    let (mirror_mode, mirror_url) = mirror_settings(&s);
     let state = helper(&s, "start", Some(json!({"tag":input.tag}))).await?;
-    Ok(Json(response(state, true, "docker", auto_update, None)))
+    Ok(Json(response(
+        state,
+        true,
+        "docker",
+        auto_update,
+        mirror_mode,
+        mirror_url,
+        None,
+    )))
 }
 
 /// Only canonical stable tags are accepted, never arbitrary refs or command options.
@@ -639,7 +913,7 @@ impl Agent {
         }
     }
     async fn fetch_release(&self) -> Result<Release, String> {
-        fetch_release(&self.client, &release_api_url()).await
+        fetch_release(&self.client, &release_api_url(), "auto", "").await
     }
     async fn command(
         &self,
@@ -1601,6 +1875,7 @@ async fn start_desktop_update(s: Shared, tag: String) -> Result<UpdateStatus, Ap
     let version = tag.strip_prefix('v').unwrap_or(&tag).to_owned();
     let latest = RELEASE_CACHE.lock().await.latest.clone();
     let auto_update = auto_update_setting(&s);
+    let (mirror_mode, mirror_url) = mirror_settings(&s);
 
     let job_snapshot = {
         let mut guard = DESKTOP_UPDATER_JOB.lock().await;
@@ -1633,6 +1908,8 @@ async fn start_desktop_update(s: Shared, tag: String) -> Result<UpdateStatus, Ap
         true,
         "desktop",
         auto_update,
+        mirror_mode,
+        mirror_url,
         None,
     ))
 }
@@ -1642,39 +1919,77 @@ async fn execute_desktop_update_pipeline(
     tag: &str,
     job_id: &str,
 ) -> Result<(), String> {
+    let (mirror_mode, mirror_url) = mirror_settings(s);
+    let env_mirror = env_mirror_url();
     let tag_api = release_tag_api_url(tag);
-    let mut req = s
-        .client
-        .get(&tag_api)
-        .header("User-Agent", "Multi-ACP-Updater")
-        .header("Accept", "application/vnd.github+json")
-        .timeout(Duration::from_secs(20));
-    if let Ok(token) = std::env::var("GITHUB_TOKEN") {
-        let token = token.trim();
-        if !token.is_empty() {
-            req = req.bearer_auth(token);
+    let tag_candidates =
+        build_mirror_candidates(&tag_api, &mirror_mode, &mirror_url, env_mirror.as_deref());
+
+    let mut selected_assets = None;
+    let mut last_tag_err = "GitHub release tag lookup failed".to_owned();
+    for (label, candidate_url) in tag_candidates {
+        let timeout = if label == OFFICIAL_SOURCE_LABEL {
+            Duration::from_secs(20)
+        } else {
+            Duration::from_secs(10)
+        };
+        let attempt: Result<(String, String, String), String> = async {
+            let mut req = s
+                .client
+                .get(&candidate_url)
+                .header("User-Agent", "Multi-ACP-Updater")
+                .header("Accept", "application/vnd.github+json")
+                .timeout(timeout);
+            if label == OFFICIAL_SOURCE_LABEL
+                && let Ok(token) = std::env::var("GITHUB_TOKEN")
+            {
+                let token = token.trim();
+                if !token.is_empty() {
+                    req = req.bearer_auth(token);
+                }
+            }
+            let reply = req
+                .send()
+                .await
+                .map_err(|e| format!("GitHub release tag lookup failed: {e}"))?;
+            if !reply.status().is_success() {
+                return Err(format!(
+                    "GitHub release tag lookup returned {}",
+                    reply.status()
+                ));
+            }
+            let bytes = reply
+                .bytes()
+                .await
+                .map_err(|e| format!("Invalid GitHub release tag response: {e}"))?;
+            if bytes.len() > 512 * 1024 {
+                return Err("GitHub release tag response is too large".into());
+            }
+            let release_json: Value = serde_json::from_slice(&bytes)
+                .map_err(|_| "Invalid GitHub JSON response".to_owned())?;
+            select_desktop_release_assets(&release_json, tag)
+        }
+        .await;
+        match attempt {
+            Ok(assets) => {
+                update_desktop_job(
+                    job_id,
+                    "fetching",
+                    &format!("Release metadata fetched via {label}"),
+                    false,
+                )
+                .await;
+                selected_assets = Some(assets);
+                break;
+            }
+            Err(err) => {
+                let msg = format!("Metadata lookup via {label} failed: {err}; trying next source");
+                update_desktop_job(job_id, "fetching", &msg, false).await;
+                last_tag_err = format!("{label}: {err}");
+            }
         }
     }
-    let reply = req
-        .send()
-        .await
-        .map_err(|e| format!("GitHub release tag lookup failed: {e}"))?;
-    if !reply.status().is_success() {
-        return Err(format!(
-            "GitHub release tag lookup returned {}",
-            reply.status()
-        ));
-    }
-    let bytes = reply
-        .bytes()
-        .await
-        .map_err(|e| format!("Invalid GitHub release tag response: {e}"))?;
-    if bytes.len() > 512 * 1024 {
-        return Err("GitHub release tag response is too large".into());
-    }
-    let release_json: Value =
-        serde_json::from_slice(&bytes).map_err(|_| "Invalid GitHub JSON response".to_owned())?;
-    let (asset_name, installer_url, sha_url) = select_desktop_release_assets(&release_json, tag)?;
+    let (asset_name, installer_url, sha_url) = selected_assets.ok_or(last_tag_err)?;
 
     let download_client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::limited(5))
@@ -1691,28 +2006,56 @@ async fn execute_desktop_update_pipeline(
     )
     .await;
 
-    let sha_reply = download_client
-        .get(&sha_url)
-        .timeout(Duration::from_secs(30))
-        .send()
-        .await
-        .map_err(|e| format!("Failed to download SHA256SUMS.txt: {e}"))?;
-    if !sha_reply.status().is_success() {
-        return Err(format!(
-            "SHA256SUMS.txt download returned {}",
-            sha_reply.status()
-        ));
+    let sha_candidates =
+        build_mirror_candidates(&sha_url, &mirror_mode, &mirror_url, env_mirror.as_deref());
+    let mut expected_sha_opt = None;
+    let mut last_sha_err = "Failed to download SHA256SUMS.txt".to_owned();
+    for (label, candidate_url) in sha_candidates {
+        let attempt: Result<String, String> = async {
+            let sha_reply = download_client
+                .get(&candidate_url)
+                .timeout(Duration::from_secs(20))
+                .send()
+                .await
+                .map_err(|e| format!("Failed to download SHA256SUMS.txt: {e}"))?;
+            if !sha_reply.status().is_success() {
+                return Err(format!(
+                    "SHA256SUMS.txt download returned {}",
+                    sha_reply.status()
+                ));
+            }
+            let sha_bytes = sha_reply
+                .bytes()
+                .await
+                .map_err(|e| format!("Failed to read SHA256SUMS.txt: {e}"))?;
+            if sha_bytes.len() > 1024 * 1024 {
+                return Err("SHA256SUMS.txt is too large".into());
+            }
+            let sha_text = std::str::from_utf8(&sha_bytes)
+                .map_err(|_| "SHA256SUMS.txt is not valid UTF-8".to_owned())?;
+            parse_sha256sums(sha_text, &asset_name)
+        }
+        .await;
+        match attempt {
+            Ok(hash) => {
+                update_desktop_job(
+                    job_id,
+                    "fetching",
+                    &format!("SHA256SUMS.txt fetched via {label}"),
+                    false,
+                )
+                .await;
+                expected_sha_opt = Some(hash);
+                break;
+            }
+            Err(err) => {
+                let msg = format!("SHA256SUMS.txt via {label} failed: {err}; trying next source");
+                update_desktop_job(job_id, "fetching", &msg, false).await;
+                last_sha_err = format!("{label}: {err}");
+            }
+        }
     }
-    let sha_bytes = sha_reply
-        .bytes()
-        .await
-        .map_err(|e| format!("Failed to read SHA256SUMS.txt: {e}"))?;
-    if sha_bytes.len() > 1024 * 1024 {
-        return Err("SHA256SUMS.txt is too large".into());
-    }
-    let sha_text = std::str::from_utf8(&sha_bytes)
-        .map_err(|_| "SHA256SUMS.txt is not valid UTF-8".to_owned())?;
-    let expected_sha = parse_sha256sums(sha_text, &asset_name)?;
+    let expected_sha = expected_sha_opt.ok_or(last_sha_err)?;
 
     let updates_dir = desktop_updates_dir();
     tokio::fs::create_dir_all(&updates_dir)
@@ -1721,73 +2064,97 @@ async fn execute_desktop_update_pipeline(
     let part_path = updates_dir.join(format!("{asset_name}.part"));
     let exe_path = updates_dir.join(&asset_name);
 
-    let _ = tokio::fs::remove_file(&part_path).await;
+    let installer_candidates = build_mirror_candidates(
+        &installer_url,
+        &mirror_mode,
+        &mirror_url,
+        env_mirror.as_deref(),
+    );
+    let mut downloaded = None;
+    let mut last_dl_err = format!("Failed to download {asset_name}");
+    for (label, candidate_url) in installer_candidates {
+        let _ = tokio::fs::remove_file(&part_path).await;
+        update_desktop_job(
+            job_id,
+            "fetching",
+            &format!("Downloading {asset_name} via {label}"),
+            false,
+        )
+        .await;
 
-    let installer_reply = download_client
-        .get(&installer_url)
-        .timeout(Duration::from_secs(600))
-        .send()
-        .await
-        .map_err(|e| format!("Failed to download {asset_name}: {e}"))?;
-    if !installer_reply.status().is_success() {
-        return Err(format!(
-            "Installer download returned {}",
-            installer_reply.status()
-        ));
-    }
-    if let Some(len) = installer_reply.content_length()
-        && len > MAX_INSTALLER_BYTES
-    {
-        return Err("Installer exceeds 256MB size limit".into());
-    }
-
-    let download_result: Result<(String, u64), String> = async {
-        let mut file = tokio::fs::File::create(&part_path)
-            .await
-            .map_err(|e| format!("Cannot create partial installer file: {e}"))?;
-        let mut hasher = Sha256::new();
-        let mut total: u64 = 0;
-        let mut stream = installer_reply.bytes_stream();
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|e| format!("Installer download stream error: {e}"))?;
-            total = total.saturating_add(chunk.len() as u64);
-            if total > MAX_INSTALLER_BYTES {
+        let attempt: Result<u64, String> = async {
+            let installer_reply = download_client
+                .get(&candidate_url)
+                .timeout(Duration::from_secs(600))
+                .send()
+                .await
+                .map_err(|e| format!("Failed to download {asset_name}: {e}"))?;
+            if !installer_reply.status().is_success() {
+                return Err(format!(
+                    "Installer download returned {}",
+                    installer_reply.status()
+                ));
+            }
+            if let Some(len) = installer_reply.content_length()
+                && len > MAX_INSTALLER_BYTES
+            {
                 return Err("Installer exceeds 256MB size limit".into());
             }
-            hasher.update(&chunk);
-            file.write_all(&chunk)
-                .await
-                .map_err(|e| format!("Failed to write installer chunk: {e}"))?;
-        }
-        file.flush()
-            .await
-            .map_err(|e| format!("Failed to flush installer file: {e}"))?;
-        Ok((hex::encode(hasher.finalize()), total))
-    }
-    .await;
 
-    let (actual_sha, total_bytes) = match download_result {
-        Ok(res) => res,
-        Err(err) => {
-            let _ = tokio::fs::remove_file(&part_path).await;
-            return Err(err);
+            let mut file = tokio::fs::File::create(&part_path)
+                .await
+                .map_err(|e| format!("Cannot create partial installer file: {e}"))?;
+            let mut hasher = Sha256::new();
+            let mut total: u64 = 0;
+            let mut stream = installer_reply.bytes_stream();
+            while let Some(chunk) = stream.next().await {
+                let chunk =
+                    chunk.map_err(|e| format!("Installer download stream error: {e}"))?;
+                total = total.saturating_add(chunk.len() as u64);
+                if total > MAX_INSTALLER_BYTES {
+                    return Err("Installer exceeds 256MB size limit".into());
+                }
+                hasher.update(&chunk);
+                file.write_all(&chunk)
+                    .await
+                    .map_err(|e| format!("Failed to write installer chunk: {e}"))?;
+            }
+            file.flush()
+                .await
+                .map_err(|e| format!("Failed to flush installer file: {e}"))?;
+            let actual_sha = hex::encode(hasher.finalize());
+            if !constant_eq(actual_sha.as_bytes(), expected_sha.as_bytes()) {
+                return Err(format!(
+                    "SHA256 mismatch for {asset_name}: expected {expected_sha}, got {actual_sha}"
+                ));
+            }
+            Ok(total)
         }
-    };
+        .await;
+
+        match attempt {
+            Ok(total_bytes) => {
+                downloaded = Some((label, total_bytes));
+                break;
+            }
+            Err(err) => {
+                let _ = tokio::fs::remove_file(&part_path).await;
+                let msg = format!("Download via {label} failed: {err}; trying next source");
+                update_desktop_job(job_id, "fetching", &msg, false).await;
+                last_dl_err = format!("{label}: {err}");
+            }
+        }
+    }
+
+    let (source_label, total_bytes) = downloaded.ok_or(last_dl_err)?;
 
     update_desktop_job(
         job_id,
         "building",
-        &format!("Verifying SHA256 digest ({total_bytes} bytes)"),
+        &format!("Verified SHA256 digest ({total_bytes} bytes via {source_label})"),
         false,
     )
     .await;
-
-    if !constant_eq(actual_sha.as_bytes(), expected_sha.as_bytes()) {
-        let _ = tokio::fs::remove_file(&part_path).await;
-        return Err(format!(
-            "SHA256 mismatch for {asset_name}: expected {expected_sha}, got {actual_sha}"
-        ));
-    }
 
     let _ = tokio::fs::remove_file(&exe_path).await;
     tokio::fs::rename(&part_path, &exe_path)
@@ -1896,7 +2263,16 @@ pub fn spawn_background_auto_updater(s: Shared) {
                     }
                 };
                 if !active_or_failed {
-                    match cached_release(&RELEASE_CACHE, &s.client, &release_api_url()).await {
+                    let (mirror_mode, mirror_url) = mirror_settings(&s);
+                    match cached_release(
+                        &RELEASE_CACHE,
+                        &s.client,
+                        &release_api_url(),
+                        &mirror_mode,
+                        &mirror_url,
+                    )
+                    .await
+                    {
                         Ok(latest) => {
                             let current_tag = format!("v{}", env!("CARGO_PKG_VERSION"));
                             if is_newer_tag(&latest.tag, &current_tag)
@@ -1934,6 +2310,8 @@ mod tests {
     use axum::{body::Body, http::Request, response::IntoResponse};
     use tower::ServiceExt;
 
+    static TRAY_ENV_LOCK: Mutex<()> = Mutex::const_new(());
+
     #[tokio::test]
     async fn release_checks_share_cache_and_preserve_last_success_on_failure() {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1961,15 +2339,15 @@ mod tests {
         let cache = Mutex::new(ReleaseCache::default());
         let client = reqwest::Client::builder().no_proxy().build().unwrap();
         let (first, second) = tokio::join!(
-            cached_release(&cache, &client, &url),
-            cached_release(&cache, &client, &url)
+            cached_release(&cache, &client, &url, "direct", ""),
+            cached_release(&cache, &client, &url, "direct", "")
         );
         assert_eq!(first.unwrap().tag, "v999.0.0");
         assert_eq!(second.unwrap().tag, "v999.0.0");
         assert_eq!(requests.load(Ordering::Relaxed), 1);
         cache.lock().await.attempted_at = Some(Instant::now() - RELEASE_CACHE_TTL);
-        assert!(cached_release(&cache, &client, &url).await.is_err());
-        assert!(cached_release(&cache, &client, &url).await.is_err());
+        assert!(cached_release(&cache, &client, &url, "direct", "").await.is_err());
+        assert!(cached_release(&cache, &client, &url, "direct", "").await.is_err());
         assert_eq!(requests.load(Ordering::Relaxed), 2);
         let status = response(
             AgentStatus {
@@ -1979,6 +2357,8 @@ mod tests {
             false,
             "disabled",
             false,
+            "auto".into(),
+            String::new(),
             None,
         );
         assert!(!status.configured);
@@ -2651,6 +3031,7 @@ mod tests {
 
     #[tokio::test]
     async fn desktop_update_config_endpoint_persists_and_rejects_non_desktop() {
+        let _env_guard = TRAY_ENV_LOCK.lock().await;
         let dir = tempfile::tempdir().unwrap();
         let state = crate::new_app(dir.path(), dir.path().join("web")).unwrap();
         let app = crate::app(state.clone());
@@ -2799,5 +3180,218 @@ mod tests {
             ]
         });
         assert!(select_desktop_release_assets(&missing_sha, tag).is_err());
+    }
+
+    #[test]
+    fn build_mirror_candidates_orders_and_deduplicates() {
+        let target = "https://api.github.com/repos/yueeeee8588/multi-acp-gateway/releases/latest";
+
+        let direct = build_mirror_candidates(target, "direct", "https://mirror.example.com/", None);
+        assert_eq!(
+            direct,
+            vec![("GitHub Official".to_owned(), target.to_owned())]
+        );
+
+        let auto_no_env = build_mirror_candidates(target, "auto", "", None);
+        assert_eq!(
+            auto_no_env,
+            vec![
+                ("gh-proxy.com".to_owned(), format!("https://gh-proxy.com/{target}")),
+                ("ghfast.top".to_owned(), format!("https://ghfast.top/{target}")),
+                ("ghproxy.net".to_owned(), format!("https://ghproxy.net/{target}")),
+                ("GitHub Official".to_owned(), target.to_owned()),
+            ]
+        );
+
+        let auto_with_env =
+            build_mirror_candidates(target, "auto", "", Some("https://my-mirror.example.com/"));
+        assert_eq!(auto_with_env[0].0, "Env Mirror");
+        assert_eq!(
+            auto_with_env[0].1,
+            format!("https://my-mirror.example.com/{target}")
+        );
+        assert_eq!(auto_with_env.len(), 5);
+
+        let auto_dedup_env =
+            build_mirror_candidates(target, "auto", "", Some("https://ghfast.top/"));
+        assert_eq!(auto_dedup_env[0].0, "Env Mirror");
+        assert_eq!(auto_dedup_env[0].1, format!("https://ghfast.top/{target}"));
+        assert_eq!(auto_dedup_env.len(), 4);
+
+        let gh_proxy = build_mirror_candidates(target, "gh_proxy", "", None);
+        assert_eq!(gh_proxy[0].0, "gh-proxy.com");
+        assert_eq!(gh_proxy[1].0, "ghfast.top");
+        assert_eq!(gh_proxy[2].0, "ghproxy.net");
+        assert_eq!(gh_proxy[3].0, "GitHub Official");
+
+        let custom = build_mirror_candidates(target, "custom", "https://custom.proxy.dev///", None);
+        assert_eq!(
+            custom,
+            vec![
+                (
+                    "Custom Mirror".to_owned(),
+                    format!("https://custom.proxy.dev/{target}")
+                ),
+                ("GitHub Official".to_owned(), target.to_owned()),
+            ]
+        );
+
+        let empty_custom = build_mirror_candidates(target, "custom", "", None);
+        assert_eq!(
+            empty_custom,
+            vec![("GitHub Official".to_owned(), target.to_owned())]
+        );
+    }
+
+    #[test]
+    fn validate_mirror_config_enforces_mode_and_url_safety() {
+        assert_eq!(
+            validate_mirror_config("auto", "").unwrap(),
+            ("auto".into(), String::new())
+        );
+        assert_eq!(
+            validate_mirror_config("direct", "").unwrap(),
+            ("direct".into(), String::new())
+        );
+        assert_eq!(
+            validate_mirror_config("gh_proxy", "").unwrap(),
+            ("gh_proxy".into(), String::new())
+        );
+        assert_eq!(
+            validate_mirror_config("ghfast", "").unwrap(),
+            ("ghfast".into(), String::new())
+        );
+        assert_eq!(
+            validate_mirror_config("ghproxy_net", "").unwrap(),
+            ("ghproxy_net".into(), String::new())
+        );
+        assert_eq!(
+            validate_mirror_config("custom", " https://mirror.example.com/ ").unwrap(),
+            ("custom".into(), "https://mirror.example.com/".into())
+        );
+
+        assert!(validate_mirror_config("unknown", "").is_err());
+        assert!(validate_mirror_config("custom", "").is_err());
+        assert!(validate_mirror_config("custom", "   ").is_err());
+        assert!(validate_mirror_config("custom", "ftp://mirror.example.com/").is_err());
+        assert!(validate_mirror_config("custom", "javascript:alert(1)").is_err());
+        assert!(
+            validate_mirror_config(
+                "custom",
+                concat!("https://user:pass", "@", "mirror.example.com/")
+            )
+            .is_err()
+        );
+        assert!(
+            validate_mirror_config("custom", concat!("https://user", "@", "mirror.example.com/"))
+                .is_err()
+        );
+        assert!(validate_mirror_config("custom", "https://mirror.example.com/with space").is_err());
+        assert!(validate_mirror_config("auto", "not a url").is_err());
+    }
+
+    #[tokio::test]
+    async fn update_config_persists_mirror_and_preserves_auto_update_compat() {
+        let _env_guard = TRAY_ENV_LOCK.lock().await;
+        let prev_env = std::env::var("GATEWAY_MANAGED_BY_TRAY").ok();
+        unsafe {
+            std::env::remove_var("GATEWAY_MANAGED_BY_TRAY");
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let state = crate::new_app(dir.path(), dir.path().join("web")).unwrap();
+        let app = crate::app(state.clone());
+
+        let setup_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/setup")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({"username":"admin","password":"sufficient-password-123"})
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let cookie = setup_res.headers()["set-cookie"]
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_owned();
+
+        // Save mirror_mode and mirror_url without passing auto_update
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/updates/config")
+                    .header("cookie", &cookie)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "mirror_mode": "custom",
+                            "mirror_url": "https://mirror.example.com/"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(res.into_body(), 65536).await.unwrap();
+        let parsed: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["mirror_mode"], "custom");
+        assert_eq!(parsed["mirror_url"], "https://mirror.example.com/");
+        assert_eq!(parsed["auto_update"], false);
+
+        // Partial update with only auto_update preserves existing mirror settings
+        let compat_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/updates/config")
+                    .header("cookie", &cookie)
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({"auto_update": false}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(compat_res.status(), StatusCode::OK);
+        let compat_body = axum::body::to_bytes(compat_res.into_body(), 65536)
+            .await
+            .unwrap();
+        let compat_parsed: Value = serde_json::from_slice(&compat_body).unwrap();
+        assert_eq!(compat_parsed["mirror_mode"], "custom");
+        assert_eq!(compat_parsed["mirror_url"], "https://mirror.example.com/");
+
+        // Reject invalid mirror_mode
+        let bad_mode = app
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/updates/config")
+                    .header("cookie", &cookie)
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({"mirror_mode": "invalid"}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(bad_mode.status(), StatusCode::BAD_REQUEST);
+
+        match prev_env {
+            Some(v) => unsafe { std::env::set_var("GATEWAY_MANAGED_BY_TRAY", v) },
+            None => unsafe { std::env::remove_var("GATEWAY_MANAGED_BY_TRAY") },
+        }
     }
 }

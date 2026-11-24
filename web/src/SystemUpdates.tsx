@@ -15,7 +15,7 @@ import {
 } from "lucide-react";
 import { api, ApiError, errorMessage } from "./api";
 import type { Release, UpdateJob, UpdateStatus } from "./api";
-import { Badge, Button, ErrorBox, Field, Modal, Toggle } from "./components";
+import { Badge, Button, ErrorBox, Field, Modal, Select, Toggle } from "./components";
 import type { Notice } from "./components";
 import type { UpdateCheck } from "./useUpdateCheck";
 import { useMinSpin } from "./useMinSpin";
@@ -32,6 +32,15 @@ const desktopStages = [
   { id: "building", label: "校验 SHA256" },
   { id: "deploying", label: "静默覆盖安装" },
   { id: "verifying", label: "等待重启重连" },
+] as const;
+
+const mirrorOptions = [
+  { value: "auto", label: "自动（国内镜像优先，失败回退官方）" },
+  { value: "gh_proxy", label: "gh-proxy.com（国内加速）" },
+  { value: "ghfast", label: "ghfast.top（国内加速）" },
+  { value: "ghproxy_net", label: "ghproxy.net（国内加速）" },
+  { value: "direct", label: "GitHub 官方直连" },
+  { value: "custom", label: "自定义镜像前缀" },
 ] as const;
 
 const terminalStatuses = new Set(["succeeded", "failed", "rolled_back"]);
@@ -79,6 +88,16 @@ export function SystemUpdates({
   const [submitting, setSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState("");
   const [savingAutoUpdate, setSavingAutoUpdate] = useState(false);
+  const [savingMirror, setSavingMirror] = useState(false);
+  const [mirrorMode, setMirrorMode] = useState<string>(
+    updateCheck.status?.mirror_mode || "auto",
+  );
+  const [customMirrorUrl, setCustomMirrorUrl] = useState<string>(
+    updateCheck.status?.mirror_url || "",
+  );
+  const [mirrorError, setMirrorError] = useState("");
+  const pendingCustomMode = useRef(false);
+  const customMirrorDirty = useRef(false);
   const [pollRevision, setPollRevision] = useState(0);
   const latestStatus = useRef<UpdateStatus | null>(null);
   const logs = useRef<HTMLPreElement>(null);
@@ -116,6 +135,12 @@ export function SystemUpdates({
     }
     latestStatus.current = value;
     setStatus(value);
+    if (!pendingCustomMode.current) {
+      setMirrorMode(value.mirror_mode || "auto");
+    }
+    if (!customMirrorDirty.current) {
+      setCustomMirrorUrl(value.mirror_url || "");
+    }
     versionCallback.current(value.current_version);
     setReconnecting(false);
     setError("");
@@ -247,6 +272,89 @@ export function SystemUpdates({
     }
   }
 
+  async function saveMirrorPreset(nextMode: string) {
+    if (savingMirror || !status) return;
+    const previous = latestStatus.current || status;
+    const previousMode = mirrorMode;
+    pendingCustomMode.current = false;
+    setMirrorMode(nextMode);
+    setMirrorError("");
+    const optimistic: UpdateStatus = { ...status, mirror_mode: nextMode };
+    latestStatus.current = optimistic;
+    setStatus(optimistic);
+    setSavingMirror(true);
+    setError("");
+    try {
+      const next = await api<UpdateStatus>("/updates/config", "PUT", {
+        mirror_mode: nextMode,
+      });
+      acceptStatus(next);
+      publishStatus(next);
+      notify("已更新下载镜像源");
+    } catch (failure) {
+      latestStatus.current = previous;
+      setStatus(previous);
+      setMirrorMode(previous.mirror_mode || previousMode);
+      const message = errorMessage(failure);
+      setMirrorError(message);
+      setError(message);
+      notify(message, true);
+    } finally {
+      setSavingMirror(false);
+    }
+  }
+
+  function handleMirrorModeChange(nextMode: string) {
+    setMirrorError("");
+    if (nextMode === "custom") {
+      pendingCustomMode.current = true;
+      setMirrorMode("custom");
+      return;
+    }
+    void saveMirrorPreset(nextMode);
+  }
+
+  async function saveCustomMirror() {
+    if (savingMirror || !status) return;
+    const trimmed = customMirrorUrl.trim();
+    let valid = false;
+    if (trimmed) {
+      try {
+        const parsed = new URL(trimmed);
+        valid = parsed.protocol === "http:" || parsed.protocol === "https:";
+      } catch {
+        valid = false;
+      }
+    }
+    if (!valid) {
+      setMirrorError("请输入以 http:// 或 https:// 开头的有效镜像前缀地址");
+      return;
+    }
+    setMirrorError("");
+    setSavingMirror(true);
+    setError("");
+    try {
+      const next = await api<UpdateStatus>("/updates/config", "PUT", {
+        mirror_mode: "custom",
+        mirror_url: trimmed,
+      });
+      pendingCustomMode.current = false;
+      customMirrorDirty.current = false;
+      setMirrorMode(next.mirror_mode || "custom");
+      setCustomMirrorUrl(next.mirror_url ?? trimmed);
+      acceptStatus(next);
+      publishStatus(next);
+      notify("已保存自定义更新镜像源");
+    } catch (failure) {
+      const message = errorMessage(failure);
+      setMirrorError(message);
+      setError(message);
+      notify(message, true);
+    } finally {
+      setSavingMirror(false);
+    }
+  }
+
   const isDesktop = status?.mode === "desktop";
   const stages = isDesktop ? desktopStages : dockerStages;
   const job = status?.job;
@@ -347,32 +455,106 @@ export function SystemUpdates({
           </div>
         </div>
         {isDesktop && (
-          <div
-            className={`setting-toggle-row ${savingAutoUpdate ? "busy" : ""}`}
-            aria-busy={savingAutoUpdate}
-          >
-            <span>
-              <strong>后台自动更新</strong>
-              <small>
-                每 30 分钟检查 GitHub 最新正式版，发现新版后自动下载、校验
-                SHA256 并静默覆盖重启（保留全部数据）
-              </small>
-            </span>
-            <div className="setting-toggle-control">
-              {savingAutoUpdate && (
-                <LoaderCircle
-                  size={15}
-                  className="spin"
-                  aria-label="正在保存自动更新设置"
+          <>
+            <div
+              className={`setting-toggle-row ${savingAutoUpdate ? "busy" : ""}`}
+              aria-busy={savingAutoUpdate}
+            >
+              <span>
+                <strong>后台自动更新</strong>
+                <small>
+                  每 30 分钟检查 GitHub 最新正式版，发现新版后自动下载、校验
+                  SHA256 并静默覆盖重启（保留全部数据）
+                </small>
+              </span>
+              <div className="setting-toggle-control">
+                {savingAutoUpdate && (
+                  <LoaderCircle
+                    size={15}
+                    className="spin"
+                    aria-label="正在保存自动更新设置"
+                  />
+                )}
+                <Toggle
+                  label=""
+                  checked={!!status?.auto_update}
+                  onChange={(enabled) => void toggleAutoUpdate(enabled)}
                 />
-              )}
-              <Toggle
-                label=""
-                checked={!!status?.auto_update}
-                onChange={(enabled) => void toggleAutoUpdate(enabled)}
-              />
+              </div>
             </div>
-          </div>
+            <div
+              className={`setting-toggle-row setting-mirror-row ${savingMirror ? "busy" : ""}`}
+              aria-busy={savingMirror}
+            >
+              <div className="setting-mirror-header">
+                <span>
+                  <strong>更新镜像源</strong>
+                  <small>
+                    所有镜像下载都会强制校验 SHA256SUMS.txt，保障安装包安全。
+                  </small>
+                </span>
+                <div className="setting-toggle-control setting-mirror-control">
+                  {savingMirror && (
+                    <LoaderCircle
+                      size={15}
+                      className="spin"
+                      aria-label="正在保存更新镜像源设置"
+                    />
+                  )}
+                  <Select
+                    aria-label="更新镜像源"
+                    value={mirrorMode}
+                    disabled={savingMirror}
+                    onChange={(event) =>
+                      handleMirrorModeChange(event.target.value)
+                    }
+                  >
+                    {mirrorOptions.map((option) => (
+                      <option key={option.value} value={option.value}>
+                        {option.label}
+                      </option>
+                    ))}
+                  </Select>
+                </div>
+              </div>
+              {mirrorMode === "custom" && (
+                <div className="setting-mirror-custom">
+                  <input
+                    type="url"
+                    aria-label="自定义镜像前缀"
+                    placeholder="https://your-mirror.example.com/"
+                    value={customMirrorUrl}
+                    disabled={savingMirror}
+                    onChange={(event) => {
+                      customMirrorDirty.current = true;
+                      setCustomMirrorUrl(event.target.value);
+                      if (mirrorError) setMirrorError("");
+                    }}
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter") {
+                        event.preventDefault();
+                        void saveCustomMirror();
+                      }
+                    }}
+                  />
+                  <Button
+                    type="button"
+                    className="primary"
+                    busy={savingMirror}
+                    disabled={savingMirror || !customMirrorUrl.trim()}
+                    onClick={() => void saveCustomMirror()}
+                  >
+                    保存
+                  </Button>
+                </div>
+              )}
+              {mirrorError && (
+                <p className="setting-mirror-error" role="alert">
+                  {mirrorError}
+                </p>
+              )}
+            </div>
+          </>
         )}
         {latest && (
           <div className="update-release-meta">

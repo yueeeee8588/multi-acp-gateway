@@ -1969,7 +1969,7 @@ dependencies = [
 
 [[package]]
 name = "multi-acp-gateway"
-version = "0.16.5"
+version = "0.16.6"
 dependencies = [
  "aes-gcm",
  "argon2",
