@@ -13,6 +13,8 @@ param(
 
     [switch]$SkipBuild,
 
+    [switch]$RequireOAuthProfile,
+
     [string]$RuntimeCacheDir = ''
 )
 
@@ -440,6 +442,57 @@ foreach ($d in @('src', 'native-wire', 'bin')) {
     if (Test-Path -LiteralPath $srcSubDir -PathType Container) {
         Copy-DirectoryFiltered -SourceDir $srcSubDir -DestDir (Join-Path $service8049Dest $d)
     }
+}
+
+$oauthClientId = if ($null -ne $env:GEMINI_OAUTH_CLIENT_ID) { $env:GEMINI_OAUTH_CLIENT_ID.Trim() } else { '' }
+$oauthClientSecret = if ($null -ne $env:GEMINI_OAUTH_CLIENT_SECRET) { $env:GEMINI_OAUTH_CLIENT_SECRET.Trim() } else { '' }
+$hasOAuthClientId = -not [string]::IsNullOrWhiteSpace($oauthClientId)
+$hasOAuthClientSecret = -not [string]::IsNullOrWhiteSpace($oauthClientSecret)
+
+if ($hasOAuthClientId -xor $hasOAuthClientSecret) {
+    throw "GEMINI_OAUTH_CLIENT_ID and GEMINI_OAUTH_CLIENT_SECRET must both be set or both be empty."
+}
+if ($RequireOAuthProfile -and (-not $hasOAuthClientId -or -not $hasOAuthClientSecret)) {
+    throw "GEMINI_OAUTH_CLIENT_ID and GEMINI_OAUTH_CLIENT_SECRET are required when -RequireOAuthProfile is set."
+}
+if ($hasOAuthClientId -and $hasOAuthClientSecret) {
+    if ($oauthClientId -notmatch '^\d+-[a-z0-9]+\.apps\.googleusercontent\.com$') {
+        throw "GEMINI_OAUTH_CLIENT_ID has invalid format."
+    }
+
+    $stagedDefaultsPath = Join-Path $service8049Dest 'src\gateway\oauth-client-defaults.mjs'
+    $injectedClientIdJson = $oauthClientId | ConvertTo-Json -Compress
+    $injectedClientSecretJson = $oauthClientSecret | ConvertTo-Json -Compress
+    $injectedDefaultsContent = @"
+// Default public OAuth desktop client configuration and lightweight error helper.
+export function fault(code, status = 400) {
+  return Object.assign(new Error(code), { code, status });
+}
+
+const injectedClientId = $injectedClientIdJson;
+const injectedClientSecret = $injectedClientSecretJson;
+
+const envClientId =
+  typeof process.env.GEMINI_OAUTH_CLIENT_ID === "string"
+    ? process.env.GEMINI_OAUTH_CLIENT_ID.trim()
+    : "";
+const envClientSecret =
+  typeof process.env.GEMINI_OAUTH_CLIENT_SECRET === "string"
+    ? process.env.GEMINI_OAUTH_CLIENT_SECRET.trim()
+    : "";
+const hasEnvClient = Boolean(envClientId && envClientSecret);
+
+export const DEFAULT_OAUTH_PROFILE = Object.freeze({
+  context: 2,
+  enableFst: true,
+  clientId: hasEnvClient ? envClientId : injectedClientId,
+  clientSecret: hasEnvClient ? envClientSecret : injectedClientSecret,
+  scopes: Object.freeze(["openid","https://www.googleapis.com/auth/userinfo.email","https://www.googleapis.com/auth/userinfo.profile","https://www.googleapis.com/auth/assistant","https://www.googleapis.com/auth/client_channel","https://www.googleapis.com/auth/gemini","https://www.googleapis.com/auth/calendar","https://www.googleapis.com/auth/drive","https://www.googleapis.com/auth/photos.image.readonly","https://www.googleapis.com/auth/photospicker.mediaitems.readonly","https://www.googleapis.com/auth/oauth_integrations","https://www.googleapis.com/auth/experimentsandconfigs","https://www.googleapis.com/auth/cclog","https://www.googleapis.com/auth/supportcontent","https://www.googleapis.com/auth/mobile_user_preferences","https://www.googleapis.com/auth/notifications","https://www.googleapis.com/auth/cloud-platform","https://www.googleapis.com/auth/aicode"]),
+});
+"@
+    $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
+    [System.IO.File]::WriteAllText($stagedDefaultsPath, ($injectedDefaultsContent -replace "`r`n", "`n"), $utf8NoBom)
+    Write-Host "Injected default OAuth client profile into staged oauth-client-defaults.mjs (clientId: $oauthClientId)"
 }
 
 # 5c. magpie-aistudio-2048

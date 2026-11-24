@@ -129,7 +129,9 @@ jobs:
         shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: pwsh -File scripts/stage-windows-bundle.ps1 -Profile public -SkipBuild
+          GEMINI_OAUTH_CLIENT_ID: ${{ secrets.GEMINI_OAUTH_CLIENT_ID }}
+          GEMINI_OAUTH_CLIENT_SECRET: ${{ secrets.GEMINI_OAUTH_CLIENT_SECRET }}
+        run: pwsh -File scripts/stage-windows-bundle.ps1 -Profile public -SkipBuild -RequireOAuthProfile
 
       - name: Compile Inno Setup installer
         shell: pwsh
