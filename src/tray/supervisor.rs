@@ -322,6 +322,7 @@ fn build_service_command(id: ServiceId, paths: &TrayPaths) -> Result<Command, Se
             let mut cmd = Command::new(node);
             cmd.current_dir(cwd);
             cmd.arg("src/gateway-server.mjs");
+            cmd.env_remove("NODE_OPTIONS");
             cmd.env("PORT", id.port().to_string());
             cmd.env("GATEWAY_HOST", "127.0.0.1");
             cmd.env("GATEWAY_DATA_DIR", paths.data_root.join("8049"));
@@ -921,5 +922,29 @@ mod tests {
             ]
         );
         assert!(load_dotenv_pairs(&dir.path().join("missing.env")).is_empty());
+    }
+
+    #[test]
+    fn app2api_8049_command_removes_node_options() {
+        let dir = tempfile::tempdir().unwrap();
+        let install_dir = dir.path();
+        fs::create_dir_all(install_dir.join("services").join("gemini-app2api-8049")).unwrap();
+        let node_dir = install_dir.join("runtime").join("node");
+        fs::create_dir_all(&node_dir).unwrap();
+        fs::write(node_dir.join("node.exe"), b"").unwrap();
+
+        let paths = TrayPaths {
+            install_dir: install_dir.to_path_buf(),
+            data_root: install_dir.join("data"),
+            tray_exe: install_dir.join("gateway-tray.exe"),
+            tray_config_path: install_dir.join("tray.json"),
+        };
+
+        let cmd = build_service_command(ServiceId::App2Api8049, &paths).unwrap();
+        let envs: Vec<_> = cmd.get_envs().collect();
+        assert!(
+            envs.contains(&(std::ffi::OsStr::new("NODE_OPTIONS"), None)),
+            "expected NODE_OPTIONS to be removed, got {envs:?}"
+        );
     }
 }
