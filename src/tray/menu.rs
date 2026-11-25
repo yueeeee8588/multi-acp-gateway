@@ -77,6 +77,23 @@ mod win_ui {
         window.set_focus();
     }
 
+    fn show_webview_fallback_dialog() {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{MB_ICONWARNING, MB_OK, MessageBoxW};
+
+        let title = format!("{APP_DISPLAY_NAME} - 浏览器模式");
+        let msg = "未检测到 Microsoft Edge WebView2 Runtime，已切换为浏览器模式打开控制台（建议安装 WebView2 Runtime 以获得桌面窗口体验）";
+        let title_w: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
+        let msg_w: Vec<u16> = msg.encode_utf16().chain(std::iter::once(0)).collect();
+        unsafe {
+            MessageBoxW(
+                std::ptr::null_mut(),
+                msg_w.as_ptr(),
+                title_w.as_ptr(),
+                MB_OK | MB_ICONWARNING,
+            );
+        }
+    }
+
     fn try_inject_desktop_session(
         webview: &WebView,
         db_path: &Path,
@@ -240,26 +257,42 @@ mod win_ui {
         let window_icon = WindowIcon::from_rgba(icon_rgba.clone(), 32, 32)
             .map_err(|e| format!("Failed to build window icon: {e}"))?;
 
-        let window = WindowBuilder::new()
+        let built_window = WindowBuilder::new()
             .with_title(APP_DISPLAY_NAME)
             .with_inner_size(LogicalSize::new(1360.0, 860.0))
             .with_min_inner_size(LogicalSize::new(960.0, 640.0))
             .with_window_icon(Some(window_icon))
-            .with_visible(!start_minimized)
+            .with_visible(false)
             .build(&event_loop)
             .map_err(|e| format!("Failed to create main window: {e}"))?;
 
         let webview_dir = paths.data_root.join("webview2");
         let mut web_context = WebContext::new(Some(webview_dir));
         let splash_html = build_splash_html(APP_DISPLAY_NAME, port_8046);
-        let webview = WebViewBuilder::new_with_web_context(&mut web_context)
-            .with_html(splash_html)
-            .build(&window)
-            .map_err(|e| format!("Failed to create WebView2: {e}"))?;
-
         let db_8046_path = paths.data_root.join("8046").join("zako.db");
         let session_injected = AtomicBool::new(false);
-        try_inject_desktop_session(&webview, &db_8046_path, &session_injected, &tray_logger);
+
+        let (window, webview) = match WebViewBuilder::new_with_web_context(&mut web_context)
+            .with_html(splash_html)
+            .build(&built_window)
+        {
+            Ok(wv) => {
+                if !start_minimized {
+                    show_main_window(&built_window);
+                }
+                try_inject_desktop_session(&wv, &db_8046_path, &session_injected, &tray_logger);
+                (Some(built_window), Some(wv))
+            }
+            Err(err) => {
+                drop(built_window);
+                tray_logger.error(&format!(
+                    "Failed to create WebView2, falling back to browser mode: {err}"
+                ));
+                show_webview_fallback_dialog();
+                open_shell_target(&console_url);
+                (None, None)
+            }
+        };
 
         let open_window_item = MenuItem::new("打开主窗口", true, None);
         let open_browser_item = MenuItem::new("在浏览器中打开", true, None);
@@ -336,27 +369,34 @@ mod win_ui {
                     event: WindowEvent::CloseRequested,
                     ..
                 } => {
-                    window.set_visible(false);
+                    if let Some(ref w) = window {
+                        w.set_visible(false);
+                    }
                 }
                 Event::UserEvent(UserEvent::Refresh) => {
                     let snaps = supervisor.snapshots();
                     update_menu_items(&snaps, &status_items, &toggle_2048_item);
-                    if !session_injected.load(Ordering::Relaxed)
+                    if let Some(ref wv) = webview
+                        && !session_injected.load(Ordering::Relaxed)
                         && snaps
                             .iter()
                             .any(|s| s.id == ServiceId::Proxy8046 && s.state == ServiceState::Running)
                         && try_inject_desktop_session(
-                            &webview,
+                            wv,
                             &db_8046_path,
                             &session_injected,
                             &tray_logger,
                         )
                     {
-                        let _ = webview.load_url(&console_url);
+                        let _ = wv.load_url(&console_url);
                     }
                 }
                 Event::UserEvent(UserEvent::ShowWindow) => {
-                    show_main_window(&window);
+                    if let Some(ref w) = window {
+                        show_main_window(w);
+                    } else {
+                        open_shell_target(&console_url);
+                    }
                 }
                 Event::UserEvent(UserEvent::OpenInBrowser) => {
                     open_shell_target(&console_url);
@@ -364,7 +404,9 @@ mod win_ui {
                 Event::UserEvent(UserEvent::Shutdown) => {
                     if !shutting_down {
                         shutting_down = true;
-                        window.set_visible(false);
+                        if let Some(ref w) = window {
+                            w.set_visible(false);
+                        }
                         tray_logger.info("Tray exiting; stopping supervisor");
                         supervisor.shutdown_blocking();
                         let _ = tray_icon.take();
@@ -373,17 +415,21 @@ mod win_ui {
                 }
                 Event::UserEvent(UserEvent::Menu(menu_ev)) => {
                     if menu_ev.id == open_window_item.id() {
-                        if !session_injected.load(Ordering::Relaxed)
-                            && try_inject_desktop_session(
-                                &webview,
-                                &db_8046_path,
-                                &session_injected,
-                                &tray_logger,
-                            )
-                        {
-                            let _ = webview.load_url(&console_url);
+                        if let (Some(w), Some(wv)) = (&window, &webview) {
+                            if !session_injected.load(Ordering::Relaxed)
+                                && try_inject_desktop_session(
+                                    wv,
+                                    &db_8046_path,
+                                    &session_injected,
+                                    &tray_logger,
+                                )
+                            {
+                                let _ = wv.load_url(&console_url);
+                            }
+                            show_main_window(w);
+                        } else {
+                            open_shell_target(&console_url);
                         }
-                        show_main_window(&window);
                     } else if menu_ev.id == open_browser_item.id() {
                         let _ = proxy.send_event(UserEvent::OpenInBrowser);
                     } else if menu_ev.id == restart_all_item.id() {
@@ -431,10 +477,14 @@ mod win_ui {
                         button: MouseButton::Left,
                         ..
                     } => {
-                        if !window.is_visible() || window.is_minimized() {
-                            show_main_window(&window);
+                        if let Some(ref w) = window {
+                            if !w.is_visible() || w.is_minimized() {
+                                show_main_window(w);
+                            } else {
+                                w.set_focus();
+                            }
                         } else {
-                            window.set_focus();
+                            open_shell_target(&console_url);
                         }
                     }
                     _ => {}

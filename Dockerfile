@@ -9,6 +9,7 @@ FROM rust:1.99-bookworm AS backend
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY src/ ./src/
+COPY --from=frontend /build/web/dist ./web/dist
 RUN cargo build --locked --release
 
 FROM docker:28-cli AS docker-cli
@@ -30,7 +31,7 @@ HEALTHCHECK --interval=10s --timeout=3s --start-period=10s --retries=6 \
 ENTRYPOINT ["/app/gateway-sync"]
 
 FROM debian:bookworm-slim AS runtime
-LABEL org.opencontainers.image.version="0.16.6"
+LABEL org.opencontainers.image.version="0.16.7"
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl \
     && rm -rf /var/lib/apt/lists/* \

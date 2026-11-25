@@ -1,5 +1,6 @@
 import net from "node:net";
 import type { AccountRecord, ExitGroup } from "../types";
+import { resolveEffectiveProxy } from "./system-proxy";
 
 export interface ExitProbeResult {
   exitIp: string;
@@ -224,8 +225,9 @@ export async function probeAccountExit(
         headers: { accept: "application/json", "user-agent": "agy-gemini-8048/1.0" },
         signal: AbortSignal.timeout(timeoutMs),
       };
-      if (proxyUrl && proxyUrl.trim()) {
-        fetchOpts.proxy = proxyUrl.trim();
+      const effectiveProxy = resolveEffectiveProxy(proxyUrl);
+      if (effectiveProxy) {
+        fetchOpts.proxy = effectiveProxy;
       }
 
       const res = await fetch(source.url, fetchOpts);

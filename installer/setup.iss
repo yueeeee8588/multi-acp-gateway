@@ -5,7 +5,7 @@
   #define AppName "Multi-ACP Gateway"
 #endif
 #ifndef AppVersion
-  #define AppVersion "0.16.3"
+  #define AppVersion "0.16.7"
 #endif
 #ifndef AppPublisher
   #define AppPublisher "Multi-ACP Gateway"
@@ -83,14 +83,75 @@ Filename: "{app}\gateway-tray.exe"; Parameters: "--minimized"; Flags: nowait run
 Filename: "{app}\gateway-tray.exe"; Parameters: "--stop"; Flags: runhidden waituntilterminated; RunOnceId: "StopGatewayTray"
 
 [Code]
-function PrepareToInstall(var NeedsRestart: Boolean): String;
+function CheckWebView2RegKey(const RootKey: Integer; const SubKey: String): Boolean;
+var
+  Version: String;
+begin
+  Result := False;
+  if RegQueryStringValue(RootKey, SubKey, 'pv', Version) then
+  begin
+    Version := Trim(Version);
+    Result := (Version <> '') and (Version <> '0.0.0.0');
+  end;
+end;
+
+function IsWebView2Installed(): Boolean;
+var
+  SubKey: String;
+  Wow64SubKey: String;
+begin
+  SubKey := 'SOFTWARE\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}';
+  Wow64SubKey := 'SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}';
+  Result :=
+    CheckWebView2RegKey(HKLM, SubKey) or
+    CheckWebView2RegKey(HKLM, Wow64SubKey) or
+    CheckWebView2RegKey(HKLM32, SubKey) or
+    CheckWebView2RegKey(HKCU, SubKey) or
+    CheckWebView2RegKey(HKCU, Wow64SubKey) or
+    CheckWebView2RegKey(HKCU32, SubKey);
+end;
+
+function InitializeSetup(): Boolean;
+begin
+  Result := True;
+  if (not WizardSilent) and (not IsWebView2Installed()) then
+  begin
+    MsgBox(
+      'Microsoft Edge WebView2 Runtime was not detected on this system.' + #13#10 + #13#10 +
+      'Installing Microsoft Edge WebView2 Runtime is recommended for the best desktop experience. ' +
+      'Without it, the desktop client will automatically fall back to system browser mode.' + #13#10 + #13#10 +
+      'Installation will continue normally.',
+      mbInformation,
+      MB_OK
+    );
+  end;
+end;
+
+procedure StopBundledRuntimes(const AppDir: String);
+var
+  NormalizedDir: String;
+  PsCmd: String;
+  ResultCode: Integer;
+begin
+  if AppDir = '' then
+    Exit;
+  NormalizedDir := AddBackslash(AppDir);
+  StringChangeEx(NormalizedDir, '''', '''''', True);
+  PsCmd := '-NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "' +
+    '$dir = ''' + NormalizedDir + '''; ' +
+    'Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | ' +
+    'Where-Object { ($_.Name -eq ''bun.exe'' -or $_.Name -eq ''node.exe'') -and $_.ExecutablePath -and $_.ExecutablePath.StartsWith($dir, [System.StringComparison]::OrdinalIgnoreCase) } | ' +
+    'ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"';
+  Exec('powershell.exe', PsCmd, '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+end;
+
+procedure StopGatewayProcesses(const AppDir: String);
 var
   TrayExe: String;
   ResultCode: Integer;
   WaitCount: Integer;
 begin
-  Result := '';
-  TrayExe := ExpandConstant('{app}\gateway-tray.exe');
+  TrayExe := AddBackslash(AppDir) + 'gateway-tray.exe';
   if FileExists(TrayExe) then
   begin
     Exec(TrayExe, '--stop', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
@@ -101,6 +162,23 @@ begin
       WaitCount := WaitCount + 1;
     end;
   end;
+
+  Exec('taskkill.exe', '/F /IM gateway-tray.exe', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Exec('taskkill.exe', '/F /IM multi-acp-gateway.exe', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Exec('taskkill.exe', '/F /IM aistudio2api.exe', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  StopBundledRuntimes(AppDir);
+end;
+
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+begin
+  Result := '';
+  StopGatewayProcesses(ExpandConstant('{app}'));
+end;
+
+function InitializeUninstall(): Boolean;
+begin
+  Result := True;
+  StopGatewayProcesses(ExpandConstant('{app}'));
 end;
 
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);

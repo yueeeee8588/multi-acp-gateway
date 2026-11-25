@@ -1,21 +1,33 @@
-/** Zero-dependency outbound HTTP(S) proxy helper for Node HTTP/2 and HTTPS fetch.
- * Respects HTTPS_PROXY / HTTP_PROXY / ALL_PROXY and NO_PROXY without logging proxy credentials.
+/** Zero-dependency outbound HTTP(S) & SOCKS5 proxy helper for Node HTTP/2 and HTTPS fetch.
+ * Respects HTTPS_PROXY / HTTP_PROXY / ALL_PROXY, NO_PROXY, and Windows system proxy without logging credentials.
  */
 import http from 'node:http';
 import https from 'node:https';
 import http2 from 'node:http2';
 import net from 'node:net';
 import tls from 'node:tls';
+import path from 'node:path';
+import { spawnSync } from 'node:child_process';
 import { Duplex, Readable } from 'node:stream';
 
 const DEFAULT_CONNECT_TIMEOUT_MS = 15_000;
+const WIN_PROXY_CACHE_TTL_MS = 5_000;
+const SUPPORTED_PROXY_PROTOCOLS = new Set(['http:', 'https:', 'socks5:', 'socks5h:']);
+
+let winProxyCache = null;
+
+export function clearWindowsSystemProxyCache() {
+  winProxyCache = null;
+}
 
 function stripBrackets(host) {
   return host.startsWith('[') && host.endsWith(']') ? host.slice(1, -1) : host;
 }
 
 function defaultPort(protocol) {
-  return protocol === 'https:' ? '443' : '80';
+  if (protocol === 'https:') return '443';
+  if (protocol === 'socks5:' || protocol === 'socks5h:') return '1080';
+  return '80';
 }
 
 function isBypassed(target, noProxyRaw) {
@@ -48,7 +60,122 @@ function isBypassed(target, noProxyRaw) {
   return false;
 }
 
-export function resolveOutboundProxy(targetUrl, env = process.env) {
+function isWindowsBypassed(target, proxyOverrideRaw) {
+  if (typeof proxyOverrideRaw !== 'string' || !proxyOverrideRaw.trim()) return false;
+  const entries = proxyOverrideRaw
+    .split(/[;,\s]+/)
+    .map((v) => v.trim())
+    .filter(Boolean);
+  const host = stripBrackets(target.hostname).toLowerCase();
+  const filtered = [];
+  for (const entry of entries) {
+    const lower = entry.toLowerCase();
+    if (lower === '<local>') {
+      if (!host.includes('.')) return true;
+      continue;
+    }
+    if (lower.includes('*')) {
+      const escaped = lower
+        .replace(/[.+?^${}()|[\]\\]/g, '\\$&')
+        .replace(/\*/g, '.*');
+      if (new RegExp(`^${escaped}$`, 'i').test(host)) return true;
+      continue;
+    }
+    filtered.push(entry);
+  }
+  return filtered.length > 0 ? isBypassed(target, filtered.join(',')) : false;
+}
+
+export function parseWindowsProxyServer(proxyServerRaw, targetProtocol = 'https:') {
+  if (typeof proxyServerRaw !== 'string') return null;
+  const trimmed = proxyServerRaw.trim();
+  if (!trimmed || /[\r\n\0]/.test(trimmed)) return null;
+
+  let candidate = '';
+  if (trimmed.includes('=')) {
+    const map = new Map();
+    for (const part of trimmed.split(/[;\s]+/)) {
+      const eq = part.indexOf('=');
+      if (eq <= 0) continue;
+      const scheme = part.slice(0, eq).trim().toLowerCase();
+      const addr = part.slice(eq + 1).trim();
+      if (scheme && addr && !map.has(scheme)) {
+        map.set(scheme, addr);
+      }
+    }
+    const order = targetProtocol === 'https:' ? ['https', 'http', 'socks'] : ['http', 'socks'];
+    for (const key of order) {
+      const val = map.get(key);
+      if (!val) continue;
+      if (val.includes('://')) {
+        candidate = val;
+      } else {
+        candidate = key === 'socks' ? `socks5://${val}` : `http://${val}`;
+      }
+      break;
+    }
+  } else {
+    candidate = trimmed.includes('://') ? trimmed : `http://${trimmed}`;
+  }
+
+  if (!candidate || /[\r\n\0]/.test(candidate)) return null;
+  let proxy;
+  try {
+    proxy = new URL(candidate);
+  } catch {
+    return null;
+  }
+  if (!SUPPORTED_PROXY_PROTOCOLS.has(proxy.protocol) || !proxy.hostname) return null;
+  return proxy;
+}
+
+export function readWindowsSystemProxy(env = process.env, opts = {}) {
+  const useCache = !opts.spawnSync && !opts.now;
+  const now = opts.now ?? Date.now();
+  if (useCache && winProxyCache && now - winProxyCache.fetchedAt < WIN_PROXY_CACHE_TTL_MS) {
+    return winProxyCache.value;
+  }
+
+  const systemRoot =
+    (typeof env?.SystemRoot === 'string' && env.SystemRoot.trim()) ||
+    (typeof env?.WINDIR === 'string' && env.WINDIR.trim()) ||
+    'C:\\Windows';
+  const regPath = path.win32.join(systemRoot, 'System32', 'reg.exe');
+  const spawnSyncImpl = opts.spawnSync ?? spawnSync;
+  const res = spawnSyncImpl(
+    regPath,
+    ['query', 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings'],
+    {
+      encoding: 'utf8',
+      timeout: 2000,
+      windowsHide: true,
+      stdio: ['ignore', 'pipe', 'ignore'],
+    },
+  );
+
+  let value = { enabled: false, proxyServer: '', proxyOverride: '' };
+  if (!res?.error && !res?.signal && res?.status === 0) {
+    const out = res.stdout ?? '';
+    const enableMatch = out.match(/^\s*ProxyEnable\s+REG_DWORD\s+(0x[0-9a-f]+|\d+)/im);
+    const serverMatch = out.match(/^\s*ProxyServer\s+REG_(?:SZ|EXPAND_SZ)\s+(.+)$/im);
+    const overrideMatch = out.match(/^\s*ProxyOverride\s+REG_(?:SZ|EXPAND_SZ)\s+(.+)$/im);
+    const enabled = enableMatch
+      ? Number.parseInt(enableMatch[1], enableMatch[1].toLowerCase().startsWith('0x') ? 16 : 10) !== 0
+      : false;
+    value = {
+      enabled,
+      proxyServer: serverMatch ? serverMatch[1].trim() : '',
+      proxyOverride: overrideMatch ? overrideMatch[1].trim() : '',
+    };
+  }
+
+  if (useCache) {
+    winProxyCache = { fetchedAt: now, value };
+  }
+  return value;
+}
+
+export function resolveOutboundProxy(targetUrl, env = process.env, opts = {}) {
   if (!env || typeof env !== 'object') return null;
   let target;
   try { target = targetUrl instanceof URL ? targetUrl : new URL(targetUrl); } catch { return null; }
@@ -58,16 +185,329 @@ export function resolveOutboundProxy(targetUrl, env = process.env) {
     ? (env.HTTPS_PROXY || env.https_proxy || env.ALL_PROXY || env.all_proxy || '')
     : (env.HTTP_PROXY || env.http_proxy || env.ALL_PROXY || env.all_proxy || '');
   const trimmed = typeof raw === 'string' ? raw.trim() : '';
-  if (!trimmed || /[\r\n\0]/.test(trimmed)) return null;
-  let proxy;
-  try { proxy = new URL(trimmed); } catch { return null; }
-  if ((proxy.protocol !== 'http:' && proxy.protocol !== 'https:') || !proxy.hostname) return null;
-  return proxy;
+  if (trimmed) {
+    if (/[\r\n\0]/.test(trimmed)) return null;
+    let proxy;
+    try { proxy = new URL(trimmed); } catch { return null; }
+    if (!SUPPORTED_PROXY_PROTOCOLS.has(proxy.protocol) || !proxy.hostname) return null;
+    return proxy;
+  }
+
+  const platform = opts.platform ?? process.platform;
+  const allowWinFallback = env === process.env || opts.readWindowsSystemProxy === true || opts.allowWindowsSystemProxy === true;
+  if (platform === 'win32' && allowWinFallback) {
+    const winProxy = readWindowsSystemProxy(env, opts);
+    if (winProxy.enabled && winProxy.proxyServer && !isWindowsBypassed(target, winProxy.proxyOverride)) {
+      return parseWindowsProxyServer(winProxy.proxyServer, target.protocol);
+    }
+  }
+  return null;
 }
 
 function formatAuthority(host, port) {
   const bare = stripBrackets(host);
   return bare.includes(':') ? `[${bare}]:${port}` : `${bare}:${port}`;
+}
+
+function parseIpv6Bytes(ip) {
+  let addr = stripBrackets(ip);
+  const zoneIdx = addr.indexOf('%');
+  if (zoneIdx >= 0) addr = addr.slice(0, zoneIdx);
+  const parts = addr.split('::');
+  if (parts.length > 2) return null;
+  const left = parts[0] ? parts[0].split(':').filter(Boolean) : [];
+  const rightRaw = parts.length === 2 && parts[1] ? parts[1].split(':').filter(Boolean) : [];
+  const expandHextets = (list) => {
+    const out = [];
+    for (let i = 0; i < list.length; i++) {
+      const seg = list[i];
+      if (seg.includes('.') && i === list.length - 1) {
+        const octets = seg.split('.').map(Number);
+        if (octets.length !== 4 || octets.some((n) => !Number.isInteger(n) || n < 0 || n > 255)) return null;
+        out.push((octets[0] << 8) | octets[1], (octets[2] << 8) | octets[3]);
+      } else {
+        const val = Number.parseInt(seg, 16);
+        if (!Number.isInteger(val) || val < 0 || val > 0xffff) return null;
+        out.push(val);
+      }
+    }
+    return out;
+  };
+  const leftNums = expandHextets(left);
+  const rightNums = expandHextets(rightRaw);
+  if (!leftNums || !rightNums) return null;
+  const missing = 8 - (leftNums.length + rightNums.length);
+  if (parts.length === 1 && missing !== 0) return null;
+  if (parts.length === 2 && missing < 0) return null;
+  const all = parts.length === 2 ? [...leftNums, ...new Array(missing).fill(0), ...rightNums] : leftNums;
+  if (all.length !== 8) return null;
+  const buf = Buffer.allocUnsafe(16);
+  for (let i = 0; i < 8; i++) buf.writeUInt16BE(all[i], i * 2);
+  return buf;
+}
+
+function buildSocks5ConnectPacket(targetHost, targetPort) {
+  const bare = stripBrackets(targetHost);
+  const ipType = net.isIP(bare);
+  const port = Number(targetPort);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    throw new Error('SOCKS5_INVALID_PORT');
+  }
+  let addrPart;
+  let atyp;
+  if (ipType === 4) {
+    atyp = 0x01;
+    addrPart = Buffer.from(bare.split('.').map(Number));
+  } else if (ipType === 6) {
+    const v6 = parseIpv6Bytes(bare);
+    if (!v6) throw new Error('SOCKS5_INVALID_IPV6');
+    atyp = 0x04;
+    addrPart = v6;
+  } else {
+    atyp = 0x03;
+    const hostBuf = Buffer.from(bare, 'utf8');
+    if (hostBuf.length === 0 || hostBuf.length > 255) {
+      throw new Error('SOCKS5_INVALID_DOMAIN');
+    }
+    addrPart = Buffer.concat([Buffer.from([hostBuf.length]), hostBuf]);
+  }
+  const packet = Buffer.allocUnsafe(4 + addrPart.length + 2);
+  packet[0] = 0x05;
+  packet[1] = 0x01; // CONNECT
+  packet[2] = 0x00; // RSV
+  packet[3] = atyp;
+  addrPart.copy(packet, 4);
+  packet.writeUInt16BE(port, 4 + addrPart.length);
+  return packet;
+}
+
+function createSocks5Tunnel(
+  proxyUrl,
+  targetHost,
+  targetPort,
+  { timeoutMs = DEFAULT_CONNECT_TIMEOUT_MS, signal } = {},
+) {
+  let rawSocket = null;
+  let connected = false;
+  let finished = false;
+  let finalCallback = null;
+  const pendingWrites = [];
+
+  const failPending = (err) => {
+    while (pendingWrites.length) {
+      const item = pendingWrites.shift();
+      try { item.callback(err); } catch {}
+    }
+    if (finalCallback) {
+      const cb = finalCallback;
+      finalCallback = null;
+      try { cb(err); } catch {}
+    }
+  };
+
+  const tunnel = new Duplex({
+    read() {
+      rawSocket?.resume();
+    },
+    write(chunk, encoding, callback) {
+      if (connected && rawSocket) {
+        if (rawSocket.destroyed) { callback(new Error('PROXY_TUNNEL_CLOSED')); return; }
+        rawSocket.write(chunk, encoding, callback);
+        return;
+      }
+      pendingWrites.push({ chunk, encoding, callback });
+    },
+    final(callback) {
+      finished = true;
+      if (connected && rawSocket) {
+        rawSocket.end(callback);
+        return;
+      }
+      finalCallback = callback;
+    },
+    destroy(err, callback) {
+      signal?.removeEventListener('abort', onAbort);
+      try { rawSocket?.destroy(); } catch {}
+      failPending(err || new Error('PROXY_TUNNEL_DESTROYED'));
+      callback(err);
+    },
+  });
+
+  const onAbort = () => tunnel.destroy(new Error('PROXY_CONNECT_ABORTED'));
+  signal?.addEventListener('abort', onAbort, { once: true });
+
+  const hasAuth = Boolean(proxyUrl.username || proxyUrl.password);
+  const username = hasAuth ? decodeURIComponent(proxyUrl.username || '') : '';
+  const password = hasAuth ? decodeURIComponent(proxyUrl.password || '') : '';
+  const userBuf = hasAuth ? Buffer.from(username, 'utf8') : null;
+  const passBuf = hasAuth ? Buffer.from(password, 'utf8') : null;
+  if (hasAuth && (userBuf.length > 255 || passBuf.length > 255)) {
+    queueMicrotask(() => {
+      if (!tunnel.destroyed) tunnel.destroy(new Error('SOCKS5_CREDENTIALS_TOO_LONG'));
+    });
+    return tunnel;
+  }
+
+  let connectPacket;
+  try {
+    connectPacket = buildSocks5ConnectPacket(targetHost, targetPort);
+  } catch (err) {
+    queueMicrotask(() => {
+      if (!tunnel.destroyed) tunnel.destroy(err);
+    });
+    return tunnel;
+  }
+
+  const proxyHost = stripBrackets(proxyUrl.hostname);
+  const proxyPort = Number(proxyUrl.port) || 1080;
+  const socket = net.connect({ host: proxyHost, port: proxyPort });
+  rawSocket = socket;
+  socket.setTimeout(timeoutMs);
+
+  let phase = 'greeting';
+  let handshakeBuf = Buffer.alloc(0);
+
+  const failHandshake = (err) => {
+    signal?.removeEventListener('abort', onAbort);
+    socket.removeAllListeners('data');
+    if (!tunnel.destroyed) tunnel.destroy(err);
+  };
+
+  const enterStreaming = (head) => {
+    phase = 'streaming';
+    signal?.removeEventListener('abort', onAbort);
+    socket.setTimeout(0);
+    socket.removeListener('data', onHandshakeData);
+    socket.removeListener('end', onHandshakeEnd);
+    if (tunnel.destroyed) {
+      try { socket.destroy(); } catch {}
+      return;
+    }
+    connected = true;
+    try { socket.setKeepAlive?.(true, 15_000); } catch {}
+    try { socket.setNoDelay?.(true); } catch {}
+    socket.on('data', (chunk) => {
+      if (!tunnel.destroyed && !tunnel.push(chunk)) socket.pause();
+    });
+    socket.on('end', () => {
+      if (!tunnel.destroyed) tunnel.push(null);
+    });
+    if (head && head.length > 0 && !tunnel.push(head)) socket.pause();
+    while (pendingWrites.length) {
+      const item = pendingWrites.shift();
+      socket.write(item.chunk, item.encoding, item.callback);
+    }
+    if (finished) {
+      const cb = finalCallback;
+      finalCallback = null;
+      socket.end(cb || undefined);
+    }
+  };
+
+  const onHandshakeEnd = () => {
+    failHandshake(new Error('SOCKS5_PREMATURE_EOF'));
+  };
+
+  const onHandshakeData = (chunk) => {
+    handshakeBuf = handshakeBuf.length > 0 ? Buffer.concat([handshakeBuf, chunk]) : chunk;
+    if (phase === 'greeting') {
+      if (handshakeBuf.length < 2) return;
+      const ver = handshakeBuf[0];
+      const method = handshakeBuf[1];
+      handshakeBuf = handshakeBuf.subarray(2);
+      if (ver !== 0x05) {
+        failHandshake(new Error('SOCKS5_INVALID_VERSION'));
+        return;
+      }
+      if (method === 0xff) {
+        failHandshake(new Error('SOCKS5_NO_ACCEPTABLE_AUTH'));
+        return;
+      }
+      if (method === 0x00) {
+        phase = 'connect';
+        socket.write(connectPacket);
+      } else if (method === 0x02) {
+        if (!hasAuth) {
+          failHandshake(new Error('SOCKS5_AUTH_REQUIRED'));
+          return;
+        }
+        phase = 'auth';
+        const authPacket = Buffer.concat([
+          Buffer.from([0x01, userBuf.length]),
+          userBuf,
+          Buffer.from([passBuf.length]),
+          passBuf,
+        ]);
+        socket.write(authPacket);
+      } else {
+        failHandshake(new Error('SOCKS5_UNSUPPORTED_AUTH'));
+        return;
+      }
+    }
+
+    if (phase === 'auth') {
+      if (handshakeBuf.length < 2) return;
+      const ver = handshakeBuf[0];
+      const status = handshakeBuf[1];
+      handshakeBuf = handshakeBuf.subarray(2);
+      if (ver !== 0x01 || status !== 0x00) {
+        failHandshake(new Error('SOCKS5_AUTH_FAILED'));
+        return;
+      }
+      phase = 'connect';
+      socket.write(connectPacket);
+    }
+
+    if (phase === 'connect') {
+      if (handshakeBuf.length < 4) return;
+      const ver = handshakeBuf[0];
+      const rep = handshakeBuf[1];
+      const atyp = handshakeBuf[3];
+      if (ver !== 0x05) {
+        failHandshake(new Error('SOCKS5_INVALID_VERSION'));
+        return;
+      }
+      let totalLen;
+      if (atyp === 0x01) {
+        totalLen = 10;
+      } else if (atyp === 0x04) {
+        totalLen = 22;
+      } else if (atyp === 0x03) {
+        if (handshakeBuf.length < 5) return;
+        totalLen = 4 + 1 + handshakeBuf[4] + 2;
+      } else {
+        failHandshake(new Error('SOCKS5_INVALID_ATYP'));
+        return;
+      }
+      if (handshakeBuf.length < totalLen) return;
+      const head = handshakeBuf.subarray(totalLen);
+      handshakeBuf = Buffer.alloc(0);
+      if (rep !== 0x00) {
+        failHandshake(new Error(`SOCKS5_CONNECT_FAILED_${rep}`));
+        return;
+      }
+      enterStreaming(head);
+    }
+  };
+
+  socket.once('connect', () => {
+    if (tunnel.destroyed) return;
+    const methods = hasAuth ? [0x05, 0x02, 0x00, 0x02] : [0x05, 0x01, 0x00];
+    socket.write(Buffer.from(methods));
+  });
+  socket.on('data', onHandshakeData);
+  socket.once('end', onHandshakeEnd);
+  socket.on('timeout', () => {
+    if (!connected) failHandshake(new Error('PROXY_CONNECT_TIMEOUT'));
+  });
+  socket.on('error', (err) => {
+    if (!tunnel.destroyed) tunnel.destroy(err);
+  });
+  socket.on('close', () => {
+    if (!tunnel.destroyed) tunnel.destroy();
+  });
+
+  return tunnel;
 }
 
 export function createConnectTunnel(
@@ -76,6 +516,9 @@ export function createConnectTunnel(
   targetPort,
   { timeoutMs = DEFAULT_CONNECT_TIMEOUT_MS, signal, rejectUnauthorized = true, ca } = {},
 ) {
+  if (proxyUrl?.protocol === 'socks5:' || proxyUrl?.protocol === 'socks5h:') {
+    return createSocks5Tunnel(proxyUrl, targetHost, targetPort, { timeoutMs, signal });
+  }
   const authority = formatAuthority(targetHost, targetPort);
   const headers = { Host: authority };
   if (proxyUrl.username || proxyUrl.password) {

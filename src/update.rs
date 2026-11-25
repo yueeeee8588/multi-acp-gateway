@@ -2172,6 +2172,43 @@ async fn execute_desktop_update_pipeline(
     launch_detached_windows_installer(&exe_path)
 }
 
+fn resolve_powershell_exe_from_system_root(system_root: Option<&str>) -> PathBuf {
+    let root = system_root
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(r"C:\Windows");
+    PathBuf::from(root)
+        .join("System32")
+        .join("WindowsPowerShell")
+        .join("v1.0")
+        .join("powershell.exe")
+}
+
+#[cfg(windows)]
+fn resolve_powershell_exe() -> PathBuf {
+    let system_root = std::env::var("SystemRoot").ok();
+    resolve_powershell_exe_from_system_root(system_root.as_deref())
+}
+
+fn build_windows_installer_ps_script(exe_path: &Path, tray_exe: &Path) -> String {
+    let escape_ps = |p: &Path| -> String { p.to_string_lossy().replace('\'', "''") };
+    let setup_escaped = escape_ps(exe_path);
+    let tray_escaped = escape_ps(tray_exe);
+    format!(
+        "Start-Sleep -Milliseconds 1500; \
+         if (Test-Path '{tray_escaped}') {{ & '{tray_escaped}' --stop | Out-Null }}; \
+         $deadline = (Get-Date).AddSeconds(10); \
+         while ((Get-Process -Name 'gateway-tray' -ErrorAction SilentlyContinue) -and ((Get-Date) -lt $deadline)) {{ Start-Sleep -Milliseconds 250 }}; \
+         if (Get-Process -Name 'gateway-tray' -ErrorAction SilentlyContinue) {{ Stop-Process -Name 'gateway-tray' -Force -ErrorAction SilentlyContinue; Start-Sleep -Milliseconds 500 }}; \
+         $p = Start-Process -FilePath '{setup_escaped}' -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/CLOSEAPPLICATIONS' -Wait -PassThru; \
+         Start-Sleep -Seconds 2; \
+         if (-not (Get-Process -Name 'gateway-tray' -ErrorAction SilentlyContinue)) {{ \
+           if (Test-Path '{tray_escaped}') {{ Start-Process -FilePath '{tray_escaped}' -ArgumentList '--minimized' }} \
+         }}; \
+         Remove-Item -LiteralPath '{setup_escaped}' -Force -ErrorAction SilentlyContinue"
+    )
+}
+
 #[cfg(windows)]
 fn launch_detached_windows_installer(exe_path: &Path) -> Result<(), String> {
     use std::os::windows::process::CommandExt;
@@ -2179,7 +2216,6 @@ fn launch_detached_windows_installer(exe_path: &Path) -> Result<(), String> {
     const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
-    let escape_ps = |p: &Path| -> String { p.to_string_lossy().replace('\'', "''") };
     let tray_exe = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|dir| dir.join("gateway-tray.exe")))
@@ -2193,19 +2229,9 @@ fn launch_detached_windows_installer(exe_path: &Path) -> Result<(), String> {
                 .join("gateway-tray.exe")
         });
 
-    let setup_escaped = escape_ps(exe_path);
-    let tray_escaped = escape_ps(&tray_exe);
-    let ps_script = format!(
-        "Start-Sleep -Milliseconds 1500; \
-         $p = Start-Process -FilePath '{setup_escaped}' -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/CLOSEAPPLICATIONS' -Wait -PassThru; \
-         Start-Sleep -Seconds 2; \
-         if (-not (Get-Process -Name 'gateway-tray' -ErrorAction SilentlyContinue)) {{ \
-           if (Test-Path '{tray_escaped}') {{ Start-Process -FilePath '{tray_escaped}' -ArgumentList '--minimized' }} \
-         }}; \
-         Remove-Item -LiteralPath '{setup_escaped}' -Force -ErrorAction SilentlyContinue"
-    );
+    let ps_script = build_windows_installer_ps_script(exe_path, &tray_exe);
 
-    let mut cmd = std::process::Command::new("powershell.exe");
+    let mut cmd = std::process::Command::new(resolve_powershell_exe());
     cmd.args([
         "-NoProfile",
         "-NonInteractive",
@@ -3393,5 +3419,40 @@ mod tests {
             Some(v) => unsafe { std::env::set_var("GATEWAY_MANAGED_BY_TRAY", v) },
             None => unsafe { std::env::remove_var("GATEWAY_MANAGED_BY_TRAY") },
         }
+    }
+
+    #[test]
+    fn windows_installer_script_stops_tray_before_running_setup() {
+        let setup = Path::new(r"C:\Temp\MultiAcpGateway-Setup.exe");
+        let tray = Path::new(r"C:\Program Files\O'Hara\gateway-tray.exe");
+        let script = build_windows_installer_ps_script(setup, tray);
+
+        let stop_pos = script.find("O''Hara\\gateway-tray.exe' --stop").unwrap();
+        let force_pos = script
+            .find("Stop-Process -Name 'gateway-tray' -Force")
+            .unwrap();
+        let install_pos = script
+            .find("Start-Process -FilePath 'C:\\Temp\\MultiAcpGateway-Setup.exe'")
+            .unwrap();
+
+        assert!(stop_pos < force_pos);
+        assert!(force_pos < install_pos);
+        assert!(script.contains("AddSeconds(10)"));
+    }
+
+    #[test]
+    fn resolve_powershell_exe_uses_system_root_or_windows_fallback() {
+        assert_eq!(
+            resolve_powershell_exe_from_system_root(Some(r"D:\Win")),
+            PathBuf::from(r"D:\Win\System32\WindowsPowerShell\v1.0\powershell.exe")
+        );
+        assert_eq!(
+            resolve_powershell_exe_from_system_root(None),
+            PathBuf::from(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe")
+        );
+        assert_eq!(
+            resolve_powershell_exe_from_system_root(Some("   ")),
+            PathBuf::from(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe")
+        );
     }
 }

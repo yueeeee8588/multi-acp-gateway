@@ -1,8 +1,9 @@
+import { execFileSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { getConfig } from "../config/settings";
 import { store } from "../db/store";
+import { resolveEffectiveProxy } from "./system-proxy";
 import {
   AccountManager,
   accountManager as defaultAccountManager,
@@ -53,14 +54,98 @@ export interface ChromeOAuthResult {
   errors: ChromeOAuthErrorItem[];
 }
 
+function isReadableFile(filePath: string): boolean {
+  try {
+    if (!fs.existsSync(filePath) || !fs.statSync(filePath).isFile()) {
+      return false;
+    }
+    fs.accessSync(filePath, fs.constants.R_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function expandEnvPlaceholders(raw: string, env: NodeJS.ProcessEnv): string {
+  return raw.replace(/%([^%]+)%/g, (full, name: string) => {
+    const val = env[name];
+    return typeof val === "string" && val.length > 0 ? val : full;
+  });
+}
+
+export function parseWindowsAppPathRegistryOutput(
+  output: string,
+  env: NodeJS.ProcessEnv = process.env
+): string | null {
+  const match = output.match(/REG_(?:SZ|EXPAND_SZ)\s+([^\r\n]+)/i);
+  if (!match?.[1]) return null;
+  const cleaned = match[1].trim().replace(/^"(.*)"$/, "$1").trim();
+  if (!cleaned) return null;
+  return expandEnvPlaceholders(cleaned, env);
+}
+
+function readWindowsAppPathFromRegistry(
+  exeName: string,
+  env: NodeJS.ProcessEnv,
+  existsSync: (p: string) => boolean
+): string | null {
+  const systemRoot = (env.SystemRoot ?? "C:\\Windows").trim() || "C:\\Windows";
+  const regExe = path.join(systemRoot, "System32", "reg.exe");
+  const keys = [
+    `HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\App Paths\\${exeName}`,
+    `HKCU\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\App Paths\\${exeName}`,
+  ];
+
+  for (const key of keys) {
+    try {
+      const output = execFileSync(regExe, ["query", key, "/ve"], {
+        encoding: "utf8",
+        timeout: 2000,
+        windowsHide: true,
+      });
+      const candidate = parseWindowsAppPathRegistryOutput(output, env);
+      if (candidate && existsSync(candidate)) {
+        return candidate;
+      }
+    } catch {
+      // 注册表查询失败时静默跳过
+    }
+  }
+  return null;
+}
+
+export interface DetectChromePathDeps {
+  platform?: NodeJS.Platform;
+  readAppPath?: (exeName: string) => string | null;
+}
+
 /**
- * 探测本机 Chrome 可执行文件路径。
+ * 探测本机 Chrome / Edge 可执行文件路径。
+ * 优先级：CHROME_PATH -> 标准 Chrome 路径 -> Windows App Paths(chrome.exe) -> Edge 标准路径/App Paths(msedge.exe)。
  */
 export function detectChromePath(
   env: NodeJS.ProcessEnv = process.env,
-  existsSync: (p: string) => boolean = fs.existsSync
+  existsSync: (p: string) => boolean = isReadableFile,
+  deps?: DetectChromePathDeps
 ): string | null {
-  const roots = [
+  const seen = new Set<string>();
+  const tryCandidate = (rawPath: string | null | undefined): string | null => {
+    const cleaned = rawPath?.trim().replace(/^"(.*)"$/, "$1").trim();
+    if (!cleaned) return null;
+    const key = cleaned.toLowerCase();
+    if (seen.has(key)) return null;
+    seen.add(key);
+    return existsSync(cleaned) ? cleaned : null;
+  };
+
+  // 1) 环境变量 CHROME_PATH
+  const envChromePath = tryCandidate(env.CHROME_PATH);
+  if (envChromePath) {
+    return envChromePath;
+  }
+
+  // 2) 标准 Chrome 路径
+  const chromeRoots = [
     env.ProgramFiles,
     env["ProgramFiles(x86)"],
     env.LOCALAPPDATA,
@@ -68,28 +153,90 @@ export function detectChromePath(
     .map((v) => v?.trim())
     .filter((v): v is string => Boolean(v));
 
-  const seen = new Set<string>();
-  for (const root of roots) {
-    const candidate = path.join(root, "Google", "Chrome", "Application", "chrome.exe");
-    const key = candidate.toLowerCase();
-    if (seen.has(key)) continue;
-    seen.add(key);
-    if (existsSync(candidate)) {
-      return candidate;
-    }
+  for (const root of chromeRoots) {
+    const found = tryCandidate(
+      path.join(root, "Google", "Chrome", "Application", "chrome.exe")
+    );
+    if (found) return found;
   }
+
+  // 3) Windows 注册表 App Paths\chrome.exe
+  const platform = deps?.platform ?? process.platform;
+  const readAppPath =
+    deps?.readAppPath ??
+    ((exeName: string) => readWindowsAppPathFromRegistry(exeName, env, existsSync));
+
+  if (platform === "win32") {
+    const regChrome = tryCandidate(readAppPath("chrome.exe"));
+    if (regChrome) return regChrome;
+  }
+
+  // 4) Microsoft Edge 回退：先查标准路径，再查注册表 App Paths\msedge.exe
+  const edgeRoots = [
+    env["ProgramFiles(x86)"],
+    env.ProgramFiles,
+    env.LOCALAPPDATA,
+  ]
+    .map((v) => v?.trim())
+    .filter((v): v is string => Boolean(v));
+
+  for (const root of edgeRoots) {
+    const found = tryCandidate(
+      path.join(root, "Microsoft", "Edge", "Application", "msedge.exe")
+    );
+    if (found) return found;
+  }
+
+  if (platform === "win32") {
+    const regEdge = tryCandidate(readAppPath("msedge.exe"));
+    if (regEdge) return regEdge;
+  }
+
   return null;
 }
 
 /**
- * 获取本机 Chrome Local State 文件路径。
+ * 获取本机 Chrome / Edge Local State 文件路径。
+ * 当探测到 Edge 或 Chrome Local State 不存在时，自动回退到 Edge User Data\Local State。
  */
 export function getChromeLocalStatePath(
-  env: NodeJS.ProcessEnv = process.env
+  env: NodeJS.ProcessEnv = process.env,
+  opts?: {
+    browserPath?: string | null;
+    existsSync?: (p: string) => boolean;
+  }
 ): string | null {
   const localAppData = env.LOCALAPPDATA?.trim();
   if (!localAppData) return null;
-  return path.join(localAppData, "Google", "Chrome", "User Data", "Local State");
+
+  const chromeLocalState = path.join(
+    localAppData,
+    "Google",
+    "Chrome",
+    "User Data",
+    "Local State"
+  );
+  const edgeLocalState = path.join(
+    localAppData,
+    "Microsoft",
+    "Edge",
+    "User Data",
+    "Local State"
+  );
+
+  const browserPath = opts?.browserPath?.trim();
+  if (browserPath && /msedge(?:\.exe)?$/i.test(browserPath)) {
+    return edgeLocalState;
+  }
+
+  const checkExists = opts?.existsSync ?? fs.existsSync;
+  if (checkExists(chromeLocalState)) {
+    return chromeLocalState;
+  }
+  if (checkExists(edgeLocalState)) {
+    return edgeLocalState;
+  }
+  return chromeLocalState;
 }
 
 /**
@@ -152,7 +299,9 @@ export function parseChromeLocalState(
 export function scanChromeProfiles(): ChromeScanResult {
   const chromePath = detectChromePath();
   const chromeAvailable = chromePath !== null;
-  const localStatePath = getChromeLocalStatePath();
+  const localStatePath = getChromeLocalStatePath(process.env, {
+    browserPath: chromePath,
+  });
 
   if (!localStatePath || !fs.existsSync(localStatePath)) {
     return { chromeAvailable, chromePath, profiles: [] };
@@ -175,16 +324,7 @@ export function scanChromeProfiles(): ChromeScanResult {
 }
 
 function resolveProxyUrl(explicitProxy?: string): string | undefined {
-  const cfg = getConfig();
-  return (
-    explicitProxy?.trim() ||
-    cfg.defaultProxy?.trim() ||
-    process.env.HTTPS_PROXY ||
-    process.env.HTTP_PROXY ||
-    process.env.https_proxy ||
-    process.env.http_proxy ||
-    undefined
-  );
+  return resolveEffectiveProxy(explicitProxy);
 }
 
 function renderCallbackHtml(title: string, message: string): Response {
@@ -214,7 +354,7 @@ function renderCallbackHtml(title: string, message: string): Response {
 
 async function waitForProfileAuthCode(
   chromePath: string,
-  profile: ChromeOAuthProfileRequest,
+  profile: { profileDir?: string; email?: string },
   timeoutMs: number
 ): Promise<{ code: string; redirectUri: string }> {
   const state = randomBytes(16).toString("hex");
@@ -297,7 +437,10 @@ async function waitForProfileAuthCode(
       }
     }, timeoutMs);
 
-    Bun.spawn([chromePath, `--profile-directory=${profile.profileDir}`, authUrl], {
+    const spawnArgs = profile.profileDir
+      ? [chromePath, `--profile-directory=${profile.profileDir}`, authUrl]
+      : [chromePath, authUrl];
+    Bun.spawn(spawnArgs, {
       stdout: "ignore",
       stderr: "ignore",
     });
@@ -420,6 +563,50 @@ export async function authorizeChromeProfiles(
   }
 
   return { ok: true, imported, skipped, errors };
+}
+
+/**
+ * 为单个已有账号拉起 Chrome 完成 OAuth 授权并直接返回 refreshToken（不入库）。
+ */
+export async function authorizeSingleAccountOAuth(opts: {
+  email?: string;
+  proxyUrl?: string;
+  timeoutMs?: number;
+}): Promise<{ refreshToken: string; profileDir?: string }> {
+  const chromePath = detectChromePath();
+  if (!chromePath) {
+    throw new Error("Chrome executable not found");
+  }
+
+  const normalizedEmail = opts.email?.trim().toLowerCase() || "";
+  let matchedProfileDir: string | undefined;
+  if (normalizedEmail) {
+    const { profiles } = scanChromeProfiles();
+    const matched = profiles.find(
+      (p) => typeof p.email === "string" && p.email.trim().toLowerCase() === normalizedEmail
+    );
+    if (matched?.profileDir) {
+      matchedProfileDir = matched.profileDir;
+    }
+  }
+
+  const timeoutMs = opts.timeoutMs ?? DEFAULT_OAUTH_TIMEOUT_MS;
+  const proxyUrl = resolveProxyUrl(opts.proxyUrl);
+  const { code, redirectUri } = await waitForProfileAuthCode(
+    chromePath,
+    { profileDir: matchedProfileDir, email: opts.email?.trim() || undefined },
+    timeoutMs
+  );
+  const refreshToken = await exchangeCodeForRefreshToken(
+    code,
+    redirectUri,
+    proxyUrl
+  );
+
+  return {
+    refreshToken,
+    ...(matchedProfileDir ? { profileDir: matchedProfileDir } : {}),
+  };
 }
 
 export type OpenUrlInAccountChromeResult =

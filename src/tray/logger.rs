@@ -152,22 +152,27 @@ impl RollingFileLogger {
     }
 }
 
+fn drain_stream_lines<R: std::io::Read>(reader: R, stream: &str, logger: &RollingFileLogger) {
+    let mut reader = BufReader::new(reader);
+    let mut buf = Vec::new();
+    loop {
+        buf.clear();
+        match reader.read_until(b'\n', &mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {
+                let line = String::from_utf8_lossy(&buf);
+                logger.write_stream_line(stream, &line);
+            }
+        }
+    }
+}
+
 pub fn pipe_child_output(child: &mut Child, logger: RollingFileLogger) {
     if let Some(stdout) = child.stdout.take() {
         let log = logger.clone();
         std::thread::Builder::new()
             .name("tray-log-stdout".into())
-            .spawn(move || {
-                let mut reader = BufReader::new(stdout);
-                let mut line = String::new();
-                loop {
-                    line.clear();
-                    match reader.read_line(&mut line) {
-                        Ok(0) | Err(_) => break,
-                        Ok(_) => log.write_stream_line("stdout", &line),
-                    }
-                }
-            })
+            .spawn(move || drain_stream_lines(stdout, "stdout", &log))
             .ok();
     }
 
@@ -175,17 +180,7 @@ pub fn pipe_child_output(child: &mut Child, logger: RollingFileLogger) {
         let log = logger;
         std::thread::Builder::new()
             .name("tray-log-stderr".into())
-            .spawn(move || {
-                let mut reader = BufReader::new(stderr);
-                let mut line = String::new();
-                loop {
-                    line.clear();
-                    match reader.read_line(&mut line) {
-                        Ok(0) | Err(_) => break,
-                        Ok(_) => log.write_stream_line("stderr", &line),
-                    }
-                }
-            })
+            .spawn(move || drain_stream_lines(stderr, "stderr", &log))
             .ok();
     }
 }
@@ -212,5 +207,24 @@ mod tests {
 
         let active_len = fs::metadata(&log_path).unwrap().len();
         assert!(active_len <= 64);
+    }
+
+    #[test]
+    fn drain_stream_lines_continues_through_gbk_and_invalid_utf8_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("child.log");
+        let logger = RollingFileLogger::open(&log_path).unwrap();
+
+        // Mix valid UTF-8 lines with GBK ("中文") and invalid UTF-8 bytes
+        let input: Vec<u8> = b"first-utf8-line\n\xd6\xd0\xce\xc4-gbk-line\n\xff\xfe-raw-bytes\nfinal-line-after-invalid\n".to_vec();
+        drain_stream_lines(std::io::Cursor::new(input), "stdout", &logger);
+
+        let content = fs::read_to_string(&log_path).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), 4);
+        assert!(lines[0].contains("first-utf8-line"));
+        assert!(lines[1].contains("-gbk-line"));
+        assert!(lines[2].contains("-raw-bytes"));
+        assert!(lines[3].contains("final-line-after-invalid"));
     }
 }

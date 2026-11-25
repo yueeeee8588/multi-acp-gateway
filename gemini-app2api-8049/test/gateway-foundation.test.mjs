@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
-import { StateStore, DEFAULT_OAUTH_PROFILE, defaults } from "../src/gateway/state.mjs";
+import { StateStore, DEFAULT_OAUTH_PROFILE, defaults, isLiveLegacyPidOwner } from "../src/gateway/state.mjs";
 import { Security } from "../src/gateway/security.mjs";
 import { Accounts } from "../src/gateway/accounts.mjs";
 import { AccountPool } from "../src/gateway/pool.mjs";
@@ -1025,4 +1025,85 @@ test("runtime lock uses kernel directory locking across threads/processes, races
   }
   const afterFds = countFds();
   if (beforeFds !== null) assert.equal(afterFds, beforeFds);
+});
+
+test("isLiveLegacyPidOwner win32 branch handles dead PIDs, reused PIDs, live gateway PIDs, and PowerShell errors", () => {
+  const baseDeps = {
+    platform: "win32",
+    env: { SystemRoot: "C:\\Windows" },
+    kill: () => {},
+  };
+
+  // Dead PID (process.kill throws ESRCH) -> false
+  assert.equal(
+    isLiveLegacyPidOwner(12345, null, "runtime.lock", {
+      ...baseDeps,
+      kill: () => {
+        const err = new Error("ESRCH");
+        err.code = "ESRCH";
+        throw err;
+      },
+    }),
+    false,
+  );
+
+  // Process vanished before CIM query (__MISSING__) -> false
+  assert.equal(
+    isLiveLegacyPidOwner(12345, null, "runtime.lock", {
+      ...baseDeps,
+      spawnSync: () => ({ status: 0, stdout: "__MISSING__\r\n" }),
+    }),
+    false,
+  );
+
+  // Reused PID belonging to unrelated process -> false
+  assert.equal(
+    isLiveLegacyPidOwner(12345, null, "runtime.lock", {
+      ...baseDeps,
+      spawnSync: () => ({
+        status: 0,
+        stdout: JSON.stringify({ Name: "notepad.exe", CommandLine: "C:\\Windows\\notepad.exe" }),
+      }),
+    }),
+    false,
+  );
+
+  // Live node.exe running gateway-server.mjs -> true
+  assert.equal(
+    isLiveLegacyPidOwner(12345, null, "runtime.lock", {
+      ...baseDeps,
+      spawnSync: () => ({
+        status: 0,
+        stdout: JSON.stringify({
+          Name: "node.exe",
+          CommandLine: "\"C:\\Program Files\\nodejs\\node.exe\" D:\\app\\src\\gateway-server.mjs",
+        }),
+      }),
+    }),
+    true,
+  );
+
+  // Live gemini-gateway binary -> true
+  assert.equal(
+    isLiveLegacyPidOwner(12345, null, "runtime.lock", {
+      ...baseDeps,
+      spawnSync: () => ({
+        status: 0,
+        stdout: JSON.stringify({
+          Name: "gemini-gateway.exe",
+          CommandLine: "C:\\bin\\gemini-gateway.exe --port 8049",
+        }),
+      }),
+    }),
+    true,
+  );
+
+  // PowerShell query failure -> conservative true
+  assert.equal(
+    isLiveLegacyPidOwner(12345, null, "runtime.lock", {
+      ...baseDeps,
+      spawnSync: () => ({ status: 1, error: new Error("policy blocked") }),
+    }),
+    true,
+  );
 });

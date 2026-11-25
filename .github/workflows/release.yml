@@ -6,9 +6,6 @@ on:
       - main
     tags:
       - 'v*'
-    paths:
-      - 'Cargo.toml'
-      - 'Dockerfile'
   workflow_dispatch: {}
 
 permissions:
@@ -23,6 +20,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.version.outputs.version }}
+      should_build: ${{ steps.create_release.outputs.should_build }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -58,17 +56,20 @@ jobs:
             }
           ' Cargo.lock)
 
+          ISS_VER=$(sed -n 's/^[[:space:]]*#define[[:space:]]\+AppVersion[[:space:]]\+"\([^"]*\)".*/\1/p' installer/setup.iss | head -n 1)
+
           echo "CARGO_VER=$CARGO_VER"
           echo "DOCKER_VER=$DOCKER_VER"
           echo "LOCK_VER=$LOCK_VER"
+          echo "ISS_VER=$ISS_VER"
 
-          if [ -z "$CARGO_VER" ] || [ -z "$DOCKER_VER" ] || [ -z "$LOCK_VER" ]; then
-            echo "::error::Failed to parse version from Cargo.toml, Dockerfile, or Cargo.lock"
+          if [ -z "$CARGO_VER" ] || [ -z "$DOCKER_VER" ] || [ -z "$LOCK_VER" ] || [ -z "$ISS_VER" ]; then
+            echo "::error::Failed to parse version from Cargo.toml, Dockerfile, Cargo.lock, or installer/setup.iss"
             exit 1
           fi
 
-          if [ "$CARGO_VER" != "$DOCKER_VER" ] || [ "$CARGO_VER" != "$LOCK_VER" ]; then
-            echo "::error::Version mismatch: Cargo.toml=$CARGO_VER, Dockerfile=$DOCKER_VER, Cargo.lock=$LOCK_VER"
+          if [ "$CARGO_VER" != "$DOCKER_VER" ] || [ "$CARGO_VER" != "$LOCK_VER" ] || [ "$CARGO_VER" != "$ISS_VER" ]; then
+            echo "::error::Version mismatch: Cargo.toml=$CARGO_VER, Dockerfile=$DOCKER_VER, Cargo.lock=$LOCK_VER, installer/setup.iss=$ISS_VER"
             exit 1
           fi
 
@@ -80,20 +81,29 @@ jobs:
           echo "version=$CARGO_VER" >> "$GITHUB_OUTPUT"
 
       - name: Create GitHub Release
+        id: create_release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           TAG="v${{ steps.version.outputs.version }}"
           if gh release view "$TAG" >/dev/null 2>&1; then
-            echo "Release $TAG already exists, skipping."
+            echo "Release $TAG already exists."
+            if [ "${{ github.event_name }}" = "workflow_dispatch" ] || [ "${{ github.ref_type }}" = "tag" ]; then
+              echo "should_build=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "Release already exists for branch push; skipping installer build."
+              echo "should_build=false" >> "$GITHUB_OUTPUT"
+            fi
             exit 0
           fi
           gh release create "$TAG" --title "$TAG" --target "$GITHUB_SHA" --generate-notes
+          echo "should_build=true" >> "$GITHUB_OUTPUT"
 
   build-windows-installer:
     runs-on: windows-latest
     needs: release
+    if: ${{ needs.release.outputs.should_build == 'true' }}
     permissions:
       contents: write
     steps:

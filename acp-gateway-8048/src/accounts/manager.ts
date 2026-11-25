@@ -5,9 +5,11 @@ import path from "node:path";
 import { AcpConnection } from "../acp/connection";
 import { buildAgyWorkerArgs, buildIsolatedAgyEnv, ensureIsolatedHomeStructure, getDataRoot, resolveAgyBinary } from "../acp/env";
 import { getConfig, resolveEffectiveProxy } from "../config/settings";
+import { resolveEffectiveProxy as resolveOutboundProxy } from "./system-proxy";
 import { store } from "../db/store";
 import { eventBus } from "../logs/events";
 import { checkProxyReachable, detectExitIpDrift, probeAccountExit } from "./exit-probe";
+import { authorizeSingleAccountOAuth } from "./chrome-scan";
 import { fetchAccountQuota } from "./quota";
 import type { AccountQuotaSnapshot, AccountRecord, AccountStatus, AccountTier } from "../types";
 
@@ -129,7 +131,7 @@ export async function detectAccountTier(
   const token = accessToken?.trim();
   if (!token) return null;
 
-  const effectiveProxy = proxyUrl?.trim() || getConfig().defaultProxy?.trim() || "";
+  const effectiveProxy = resolveOutboundProxy(proxyUrl) ?? "";
   const init: RequestInit & { proxy?: string } = {
     method: "POST",
     headers: {
@@ -453,7 +455,7 @@ async function readEmailFromOAuthToken(dirPath: string, proxyUrl?: string): Prom
 
   if (!accessToken && !refreshToken) return "";
 
-  const effectiveProxy = proxyUrl?.trim() || getConfig().defaultProxy?.trim() || "";
+  const effectiveProxy = resolveOutboundProxy(proxyUrl) ?? "";
   const fetchUserInfo = async (token: string): Promise<string> => {
     const init: RequestInit & { proxy?: string } = {
       headers: { Authorization: `Bearer ${token}` },
@@ -748,15 +750,7 @@ export class AccountManager {
       return { imported: 0, updated: 0, failed: 0, results: [] };
     }
 
-    const cfg = getConfig();
-    const proxy =
-      opts?.proxyUrl?.trim() ||
-      cfg.defaultProxy?.trim() ||
-      process.env.HTTPS_PROXY ||
-      process.env.HTTP_PROXY ||
-      process.env.https_proxy ||
-      process.env.http_proxy ||
-      undefined;
+    const proxy = resolveOutboundProxy(opts?.proxyUrl);
 
     let imported = 0;
     let updated = 0;
@@ -904,7 +898,7 @@ export class AccountManager {
   }
 
   /**
-   * 启动隔离环境的 agy auth login，捕获结果更新状态为 ready
+   * 拉起 Chrome 完成单账号 OAuth 授权，换取并写入 Token 后更新状态为 ready
    */
   async triggerCliLogin(accountId: string): Promise<{ ok: boolean; message: string }> {
     const acc = store.getAccount(accountId);
@@ -913,41 +907,35 @@ export class AccountManager {
     }
 
     const cfg = getConfig();
-    const binaryPath = resolveAgyBinary(cfg.agyPath);
-    const env = buildIsolatedAgyEnv({
-      homeDir: acc.homeDir,
-      proxyUrl: resolveEffectiveProxy(acc.proxyUrl, cfg),
-      agyPath: binaryPath,
-    });
+    const proxyUrl = resolveEffectiveProxy(acc.proxyUrl, cfg);
 
-    const proc = Bun.spawn([binaryPath, "auth", "login"], {
-      cwd: acc.homeDir,
-      env,
-      stdout: "pipe",
-      stderr: "pipe",
-    });
+    try {
+      const { refreshToken } = await authorizeSingleAccountOAuth({
+        email: acc.email,
+        proxyUrl,
+      });
+      const tokens = await exchangeOAuthRefreshToken(refreshToken, proxyUrl);
+      writeIsolatedAgyOAuthToken(acc.homeDir, tokens);
 
-    const exitCode = await proc.exited;
-    const stdout = await new Response(proc.stdout).text();
-    const stderr = await new Response(proc.stderr).text();
-
-    if (exitCode === 0) {
-      const email = readEmailFromAgyDir(acc.homeDir) || acc.email;
+      const now = Date.now();
       store.upsertAccount({
         ...acc,
-        email,
         status: "ready",
         statusReason: "",
-        lastVerifiedAt: Date.now(),
-        updatedAt: Date.now(),
+        lastVerifiedAt: now,
+        updatedAt: now,
       });
+      const deleted = store.deleteCooldown(acc.id, "*", "global");
+      if (deleted) {
+        eventBus.emit("cooldowns", store.listCooldowns(now));
+      }
       this.emitAccounts();
-      return { ok: true, message: stdout.trim() || "Login succeeded" };
+      return { ok: true, message: "Chrome OAuth login succeeded" };
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      this.setAccountStatus(accountId, "auth_required", reason);
+      return { ok: false, message: reason };
     }
-
-    const reason = stderr.trim() || stdout.trim() || `agy auth login exited with code ${exitCode}`;
-    this.setAccountStatus(accountId, "auth_required", reason);
-    return { ok: false, message: reason };
   }
 
   /**
@@ -958,7 +946,7 @@ export class AccountManager {
     if (!acc) return null;
 
     const cfg = getConfig();
-    const proxy = resolveEffectiveProxy(acc.proxyUrl, cfg);
+    const proxy = resolveEffectiveProxy(acc.proxyUrl, cfg) ?? resolveOutboundProxy();
     if (proxy && cfg.strictProxyBinding) {
       const reach = await checkProxyReachable(proxy);
       if (!reach.ok) {
@@ -1223,7 +1211,7 @@ export class AccountManager {
         return;
       }
 
-      const proxy = resolveEffectiveProxy(acc.proxyUrl, cfg);
+      const proxy = resolveEffectiveProxy(acc.proxyUrl, cfg) ?? resolveOutboundProxy();
       try {
         const tokenFetchInit: RequestInit & { proxy?: string } = {
           method: "POST",
@@ -1369,7 +1357,7 @@ export class AccountManager {
     if (!acc) return null;
 
     const cfg = getConfig();
-    const proxy = resolveEffectiveProxy(acc.proxyUrl, cfg);
+    const proxy = resolveEffectiveProxy(acc.proxyUrl, cfg) ?? resolveOutboundProxy();
     const emptyPools = {
       gemini_flagship: null,
       gemini_flash: null,

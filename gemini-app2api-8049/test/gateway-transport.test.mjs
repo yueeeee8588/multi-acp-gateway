@@ -13,6 +13,9 @@ import {
 import {
   resolveOutboundProxy,
   createConnectTunnel,
+  parseWindowsProxyServer,
+  readWindowsSystemProxy,
+  clearWindowsSystemProxyCache,
 } from "../src/gateway/outbound-proxy.mjs";
 import { NativeDirectProvider } from "../src/native-provider.mjs";
 import { automaticRecoveryKind } from "../src/gateway/automatic-recovery.mjs";
@@ -469,9 +472,71 @@ test("outbound proxy resolver honors HTTPS_PROXY, HTTP_PROXY, ALL_PROXY, and NO_
     null,
   );
   assert.equal(
-    resolveOutboundProxy("https://robinfrontend-pa.googleapis.com", { HTTPS_PROXY: "socks5://127.0.0.1:1080" }),
-    null,
+    resolveOutboundProxy("https://robinfrontend-pa.googleapis.com", { HTTPS_PROXY: "socks5://127.0.0.1:1080" })?.href,
+    "socks5://127.0.0.1:1080",
   );
+  assert.equal(
+    resolveOutboundProxy("https://robinfrontend-pa.googleapis.com", { ALL_PROXY: "socks5h://u:p@127.0.0.1:10808" })?.protocol,
+    "socks5h:",
+  );
+});
+
+test("Windows system proxy parsing and registry fallback", () => {
+  assert.equal(parseWindowsProxyServer("127.0.0.1:7890", "https:")?.href, "http://127.0.0.1:7890/");
+  assert.equal(
+    parseWindowsProxyServer("http=127.0.0.1:7890;https=127.0.0.1:7891;socks=127.0.0.1:10808", "https:")?.href,
+    "http://127.0.0.1:7891/",
+  );
+  assert.equal(
+    parseWindowsProxyServer("http=127.0.0.1:7890;socks=127.0.0.1:10808", "http:")?.href,
+    "http://127.0.0.1:7890/",
+  );
+  assert.equal(
+    parseWindowsProxyServer("socks=127.0.0.1:10808", "https:")?.href,
+    "socks5://127.0.0.1:10808",
+  );
+  assert.equal(parseWindowsProxyServer("", "https:"), null);
+  assert.equal(parseWindowsProxyServer("not a valid proxy\n", "https:"), null);
+
+  clearWindowsSystemProxyCache();
+  const regEnabledOutput = [
+    "",
+    "HKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings",
+    "    ProxyEnable    REG_DWORD    0x1",
+    "    ProxyServer    REG_SZ    http=127.0.0.1:7890;https=127.0.0.1:7891;socks=127.0.0.1:10808",
+    "    ProxyOverride    REG_SZ    localhost;127.*;*.local;<local>",
+    "",
+  ].join("\r\n");
+
+  const resolved = resolveOutboundProxy("https://robinfrontend-pa.googleapis.com", {}, {
+    platform: "win32",
+    allowWindowsSystemProxy: true,
+    spawnSync: () => ({ status: 0, stdout: regEnabledOutput }),
+  });
+  assert.equal(resolved?.href, "http://127.0.0.1:7891/");
+
+  const bypassed = resolveOutboundProxy("https://myserver.local/test", {}, {
+    platform: "win32",
+    allowWindowsSystemProxy: true,
+    spawnSync: () => ({ status: 0, stdout: regEnabledOutput }),
+  });
+  assert.equal(bypassed, null);
+
+  const disabled = resolveOutboundProxy("https://robinfrontend-pa.googleapis.com", {}, {
+    platform: "win32",
+    allowWindowsSystemProxy: true,
+    spawnSync: () => ({
+      status: 0,
+      stdout: "    ProxyEnable    REG_DWORD    0x0\r\n    ProxyServer    REG_SZ    127.0.0.1:7890\r\n",
+    }),
+  });
+  assert.equal(disabled, null);
+
+  const parsedReg = readWindowsSystemProxy({}, {
+    spawnSync: () => ({ status: 0, stdout: regEnabledOutput }),
+  });
+  assert.equal(parsedReg.enabled, true);
+  assert.equal(parsedReg.proxyServer, "http=127.0.0.1:7890;https=127.0.0.1:7891;socks=127.0.0.1:10808");
 });
 
 test("HTTP CONNECT tunnel forwards HTTP/2 traffic with Proxy-Authorization and fails cleanly on proxy rejection", async (t) => {
@@ -544,5 +609,193 @@ test("HTTP CONNECT tunnel forwards HTTP/2 traffic with Proxy-Authorization and f
       );
       return true;
     },
+  );
+});
+
+test("SOCKS5 tunnel supports no-auth, username/password auth, and handles handshake errors", async (t) => {
+  const target = http2.createServer();
+  target.on("stream", (stream) => {
+    stream.resume();
+    stream.respond({ ":status": 200, "content-type": "application/grpc" }, { waitForTrailers: true });
+    stream.write(frameGrpcMessage(m(1003, m(1, Buffer.concat([m(1, m(2, m(1, Buffer.from("Socks5OK")))), v(9, 1), m(30, Buffer.from("Used 4 Neon High model")), v(41, 3), v(42, 2)])))));
+    stream.once("wantTrailers", () => stream.sendTrailers({ "grpc-status": "0" }));
+    stream.end();
+  });
+  await new Promise((r) => target.listen(0, "127.0.0.1", r));
+  t.after(() => new Promise((r) => target.close(r)));
+  const targetPort = target.address().port;
+
+  let requireAuth = false;
+  let forceRejectConnect = false;
+  let seenCreds = null;
+  let seenAtyp = null;
+  let seenHost = null;
+
+  const socksServer = net.createServer((client) => {
+    let stage = "greeting";
+    let buf = Buffer.alloc(0);
+    let upstream = null;
+
+    client.on("data", (chunk) => {
+      if (stage === "relay") {
+        upstream?.write(chunk);
+        return;
+      }
+      buf = Buffer.concat([buf, chunk]);
+      if (stage === "greeting") {
+        if (buf.length < 2) return;
+        const nmethods = buf[1];
+        if (buf.length < 2 + nmethods) return;
+        const methods = buf.subarray(2, 2 + nmethods);
+        buf = buf.subarray(2 + nmethods);
+        if (requireAuth) {
+          if (!methods.includes(0x02)) {
+            client.write(Buffer.from([0x05, 0xff]));
+            client.destroy();
+            return;
+          }
+          stage = "auth";
+          client.write(Buffer.from([0x05, 0x02]));
+        } else {
+          stage = "connect";
+          client.write(Buffer.from([0x05, 0x00]));
+        }
+      }
+      if (stage === "auth") {
+        if (buf.length < 2) return;
+        const ulen = buf[1];
+        if (buf.length < 3 + ulen) return;
+        const user = buf.subarray(2, 2 + ulen).toString("utf8");
+        const plen = buf[2 + ulen];
+        if (buf.length < 3 + ulen + plen) return;
+        const pass = buf.subarray(3 + ulen, 3 + ulen + plen).toString("utf8");
+        buf = buf.subarray(3 + ulen + plen);
+        seenCreds = `${user}:${pass}`;
+        if (user !== "socksuser" || pass !== "sockspass") {
+          client.write(Buffer.from([0x01, 0x01]));
+          client.destroy();
+          return;
+        }
+        stage = "connect";
+        client.write(Buffer.from([0x01, 0x00]));
+      }
+      if (stage === "connect") {
+        if (buf.length < 4) return;
+        const atyp = buf[3];
+        seenAtyp = atyp;
+        let offset = 4;
+        if (atyp === 0x01) {
+          if (buf.length < 10) return;
+          seenHost = `${buf[4]}.${buf[5]}.${buf[6]}.${buf[7]}`;
+          offset = 8;
+        } else if (atyp === 0x03) {
+          if (buf.length < 5) return;
+          const dlen = buf[4];
+          if (buf.length < 4 + 1 + dlen + 2) return;
+          seenHost = buf.subarray(5, 5 + dlen).toString("utf8");
+          offset = 5 + dlen;
+        } else if (atyp === 0x04) {
+          if (buf.length < 22) return;
+          offset = 20;
+        } else {
+          client.destroy();
+          return;
+        }
+        const port = buf.readUInt16BE(offset);
+        const extra = buf.subarray(offset + 2);
+        buf = Buffer.alloc(0);
+
+        if (forceRejectConnect) {
+          client.write(Buffer.from([0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0]));
+          client.destroy();
+          return;
+        }
+
+        const connectHost = atyp === 0x03 ? "127.0.0.1" : seenHost;
+        upstream = net.connect(port, connectHost, () => {
+          stage = "relay";
+          client.write(Buffer.from([0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0, 0]));
+          if (extra.length > 0) upstream.write(extra);
+          upstream.on("data", (d) => client.write(d));
+          upstream.on("end", () => client.end());
+          upstream.on("error", () => client.destroy());
+        });
+        upstream.on("error", () => client.destroy());
+      }
+    });
+    client.on("error", () => upstream?.destroy());
+  });
+  await new Promise((r) => socksServer.listen(0, "127.0.0.1", r));
+  t.after(() => new Promise((r) => socksServer.close(r)));
+  const socksPort = socksServer.address().port;
+
+  // 1. No-auth SOCKS5 with IPv4 target
+  const noAuthUrl = new URL(`socks5://127.0.0.1:${socksPort}`);
+  const providerNoAuth = new NativeDirectProvider(
+    { getValidAccessToken: async () => "synthetic-token" },
+    {
+      openTurn: (token, options) =>
+        openDirectTurn(token, options, {
+          connect: () =>
+            http2.connect(`http://127.0.0.1:${targetPort}`, {
+              createConnection: () => createConnectTunnel(noAuthUrl, "127.0.0.1", targetPort),
+            }),
+        }),
+      timeoutMs: 2000,
+    },
+  );
+  const res1 = await providerNoAuth.runTurn("synthetic", {
+    model: "gemini-neon",
+    messages: [{ role: "user", content: "hello socks5" }],
+  });
+  assert.equal(res1.content, "Socks5OK");
+  assert.equal(seenAtyp, 0x01);
+
+  // 2. Username/password auth SOCKS5h with domain target (ATYP 0x03)
+  requireAuth = true;
+  const authUrl = new URL(`socks5h://socksuser:sockspass@127.0.0.1:${socksPort}`);
+  const providerAuth = new NativeDirectProvider(
+    { getValidAccessToken: async () => "synthetic-token" },
+    {
+      openTurn: (token, options) =>
+        openDirectTurn(token, options, {
+          connect: () =>
+            http2.connect(`http://localhost:${targetPort}`, {
+              createConnection: () => createConnectTunnel(authUrl, "localhost", targetPort),
+            }),
+        }),
+      timeoutMs: 2000,
+    },
+  );
+  const res2 = await providerAuth.runTurn("synthetic", {
+    model: "gemini-neon",
+    messages: [{ role: "user", content: "hello socks5 auth" }],
+  });
+  assert.equal(res2.content, "Socks5OK");
+  assert.equal(seenCreds, "socksuser:sockspass");
+  assert.equal(seenAtyp, 0x03);
+  assert.equal(seenHost, "localhost");
+
+  // 3. Bad credentials fail cleanly
+  const badAuthUrl = new URL(`socks5://wrong:creds@127.0.0.1:${socksPort}`);
+  await assert.rejects(
+    new Promise((resolve, reject) => {
+      const tunnel = createConnectTunnel(badAuthUrl, "127.0.0.1", targetPort);
+      tunnel.on("error", reject);
+      tunnel.write("ping");
+    }),
+    /SOCKS5_AUTH_FAILED/,
+  );
+
+  // 4. Connection refused reply surfaces cleanly
+  requireAuth = false;
+  forceRejectConnect = true;
+  await assert.rejects(
+    new Promise((resolve, reject) => {
+      const tunnel = createConnectTunnel(noAuthUrl, "127.0.0.1", targetPort);
+      tunnel.on("error", reject);
+      tunnel.write("ping");
+    }),
+    /SOCKS5_CONNECT_FAILED_5/,
   );
 });

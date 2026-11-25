@@ -1,19 +1,63 @@
 import fs from "node:fs";
 import path from "node:path";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { fault } from "./state.mjs";
 
 const DEFAULT_OAUTH_TIMEOUT_MS = 120_000;
 const TERMINAL_STATUSES = new Set(["completed", "failed", "cancelled", "expired"]);
 
+function stripSurroundingQuotes(value) {
+  const trimmed = typeof value === "string" ? value.trim() : "";
+  if (trimmed.length >= 2 && trimmed.startsWith('"') && trimmed.endsWith('"')) {
+    return trimmed.slice(1, -1).trim();
+  }
+  return trimmed;
+}
+
+function queryWindowsAppPath(exeName, env = process.env, opts = {}) {
+  const isWin = (opts.platform ?? process.platform) === "win32";
+  const spawnSyncImpl = opts.spawnSync ?? spawnSync;
+  if (!isWin && !opts.spawnSync && !opts.platform) return null;
+
+  const systemRoot =
+    (typeof env.SystemRoot === "string" && env.SystemRoot.trim()) ||
+    (typeof env.WINDIR === "string" && env.WINDIR.trim()) ||
+    "C:\\Windows";
+  const regPath = path.win32.join(systemRoot, "System32", "reg.exe");
+  const keys = [
+    `HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\App Paths\\${exeName}`,
+    `HKCU\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\App Paths\\${exeName}`,
+  ];
+  for (const key of keys) {
+    const res = spawnSyncImpl(regPath, ["query", key, "/ve"], {
+      encoding: "utf8",
+      timeout: 2000,
+      windowsHide: true,
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    if (res?.error || res?.signal || res?.status !== 0) continue;
+    const match = (res.stdout ?? "").match(/REG_(?:SZ|EXPAND_SZ)\s+(.+)$/im);
+    if (!match) continue;
+    const candidate = stripSurroundingQuotes(match[1]);
+    if (candidate) return candidate;
+  }
+  return null;
+}
+
 export function detectChromePath(
   env = process.env,
   existsSync = fs.existsSync,
+  opts = {},
 ) {
+  const customPath = stripSurroundingQuotes(env?.CHROME_PATH);
+  if (customPath && existsSync(customPath)) {
+    return customPath;
+  }
+
   const roots = [
-    env.ProgramFiles,
-    env["ProgramFiles(x86)"],
-    env.LOCALAPPDATA,
+    env?.ProgramFiles,
+    env?.["ProgramFiles(x86)"],
+    env?.LOCALAPPDATA,
   ]
     .map((v) => (typeof v === "string" ? v.trim() : ""))
     .filter(Boolean);
@@ -34,20 +78,64 @@ export function detectChromePath(
       return candidate;
     }
   }
+
+  const regChrome = queryWindowsAppPath("chrome.exe", env, opts);
+  if (regChrome && existsSync(regChrome)) {
+    return regChrome;
+  }
+
+  for (const root of roots) {
+    const candidate = path.win32.join(
+      root,
+      "Microsoft",
+      "Edge",
+      "Application",
+      "msedge.exe",
+    );
+    const key = candidate.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    if (existsSync(candidate)) {
+      return candidate;
+    }
+  }
+
+  const regEdge = queryWindowsAppPath("msedge.exe", env, opts);
+  if (regEdge && existsSync(regEdge)) {
+    return regEdge;
+  }
+
   return null;
 }
 
-export function getChromeLocalStatePath(env = process.env) {
+export function getChromeLocalStatePath(env = process.env, opts = {}) {
   const localAppData =
-    typeof env.LOCALAPPDATA === "string" ? env.LOCALAPPDATA.trim() : "";
+    typeof env?.LOCALAPPDATA === "string" ? env.LOCALAPPDATA.trim() : "";
   if (!localAppData) return null;
-  return path.win32.join(
+  const existsSync = opts.existsSync ?? fs.existsSync;
+  const chromeLocalState = path.win32.join(
     localAppData,
     "Google",
     "Chrome",
     "User Data",
     "Local State",
   );
+  const edgeLocalState = path.win32.join(
+    localAppData,
+    "Microsoft",
+    "Edge",
+    "User Data",
+    "Local State",
+  );
+  if (
+    typeof opts.browserPath === "string" &&
+    /msedge\.exe$/i.test(opts.browserPath.trim())
+  ) {
+    return edgeLocalState;
+  }
+  if (existsSync(chromeLocalState)) return chromeLocalState;
+  if (existsSync(edgeLocalState)) return edgeLocalState;
+  return chromeLocalState;
 }
 
 export function parseChromeLocalState(jsonText, existingEmails = []) {
@@ -102,9 +190,12 @@ export function scanChromeProfiles(accounts, opts = {}) {
   const existsSync = opts.existsSync ?? fs.existsSync;
   const readFileSync = opts.readFileSync ?? fs.readFileSync;
 
-  const chromePath = detectChromePath(env, existsSync);
+  const chromePath = detectChromePath(env, existsSync, opts);
   const chromeFound = Boolean(chromePath);
-  const localStatePath = getChromeLocalStatePath(env);
+  const localStatePath = getChromeLocalStatePath(env, {
+    existsSync,
+    browserPath: chromePath,
+  });
 
   const existingEmails = [];
   const list = typeof accounts?.list === "function" ? accounts.list() : [];
@@ -180,7 +271,7 @@ export async function runChromeOAuthBatch(
   const chromePath =
     typeof opts.detectChromePath === "function"
       ? opts.detectChromePath()
-      : detectChromePath(env, existsSync);
+      : detectChromePath(env, existsSync, opts);
   if (!chromePath) {
     throw fault("CHROME_NOT_FOUND", 404);
   }

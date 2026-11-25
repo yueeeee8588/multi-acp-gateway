@@ -394,9 +394,11 @@ test('gemini-hydrogen ignores unresolved legacy thinking heartbeats while failin
   }
 });
 
-test('NativeDirectProvider defaults postToolIdleMs to 30000 and allows overrides', () => {
+test('NativeDirectProvider defaults idle watchdogs (5s/15s/45s) and allows overrides', () => {
   const { p } = fixture([]);
-  assert.equal(p.postToolIdleMs, 30_000);
+  assert.equal(p.postCompleteGraceMs, 5_000);
+  assert.equal(p.postToolIdleMs, 15_000);
+  assert.equal(p.postOutputIdleMs, 45_000);
   const custom = new NativeDirectProvider(
     { getValidAccessToken: async () => 'token' },
     { openTurn: () => ({ events: (async function* () {})(), cancel() {} }), postToolIdleMs: 12_000 },

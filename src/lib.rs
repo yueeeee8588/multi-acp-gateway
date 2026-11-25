@@ -135,6 +135,12 @@ impl App {
             use std::os::unix::fs::OpenOptionsExt;
             options.mode(0o600);
         }
+        if let Some(parent) = self.turnstile_env_file.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)
+                .map_err(|error| format!("Could not prepare .env directory: {error}"))?;
+        }
         let mut file = options
             .open(&self.turnstile_env_file)
             .map_err(|error| format!("Could not update project .env: {error}"))?;
@@ -372,11 +378,14 @@ async fn console(State(state): State<Shared>, headers: HeaderMap, uri: Uri) -> R
     }
 }
 pub fn new_app(data_dir: &std::path::Path, web_dir: std::path::PathBuf) -> Result<Shared, String> {
-    let turnstile_env_file = std::env::current_dir()
-        .map_err(|e| e.to_string())?
-        .join(".env");
-    let env_values = std::fs::read_to_string(&turnstile_env_file)
-        .ok()
+    let turnstile_env_file = data_dir.join(".env");
+    let env_contents = std::fs::read_to_string(&turnstile_env_file).ok().or_else(|| {
+        std::env::current_dir()
+            .ok()
+            .map(|dir| dir.join(".env"))
+            .and_then(|fallback| std::fs::read_to_string(fallback).ok())
+    });
+    let env_values = env_contents
         .and_then(|contents| {
             dotenvy::from_read_iter(contents.as_bytes())
                 .collect::<std::result::Result<std::collections::HashMap<_, _>, _>>()

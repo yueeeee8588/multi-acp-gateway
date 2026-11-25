@@ -20,6 +20,7 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+[Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 
 function Resolve-TargetPath {
     param(
@@ -377,6 +378,23 @@ if (-not $SkipBuild) {
     } finally {
         Pop-Location
     }
+} else {
+    $webDistIndex = Join-Path $RepoRoot 'web\dist\index.html'
+    if (-not (Test-Path -LiteralPath $webDistIndex -PathType Leaf)) {
+        throw "Fail-Fast (-SkipBuild): frontend build artifact not found at $webDistIndex. Run 'cd web && npm run build' first or omit -SkipBuild."
+    }
+}
+
+$hasEnvOAuthClientId = -not [string]::IsNullOrWhiteSpace($env:GEMINI_OAUTH_CLIENT_ID)
+$hasEnvOAuthClientSecret = -not [string]::IsNullOrWhiteSpace($env:GEMINI_OAUTH_CLIENT_SECRET)
+if (-not ($hasEnvOAuthClientId -and $hasEnvOAuthClientSecret)) {
+    if ($RequireOAuthProfile) {
+        throw "Fail-Fast (-RequireOAuthProfile): GEMINI_OAUTH_CLIENT_ID and GEMINI_OAUTH_CLIENT_SECRET must both be set."
+    }
+    Write-Warning "=================================================================="
+    Write-Warning "8049 OAuth Profile NOT injected: GEMINI_OAUTH_CLIENT_ID / GEMINI_OAUTH_CLIENT_SECRET are not set."
+    Write-Warning "This bundle will NOT contain a default 8049 OAuth configuration."
+    Write-Warning "=================================================================="
 }
 
 # 2. Prepare clean OutputDir
@@ -549,7 +567,7 @@ foreach ($file in $allFiles) {
     )
     if ($file.Length -gt 0 -and $file.Length -lt 5MB -and $file.Extension -notin @('.exe', '.dll', '.zip', '.png', '.ico') -and ($secretAllowlist -notcontains $relFromOutput)) {
         $rawText = Get-Content -LiteralPath $file.FullName -Raw -ErrorAction SilentlyContinue
-        if ($null -ne $rawText -and $rawText.Contains($secretPrefix, [System.StringComparison]::Ordinal)) {
+        if ($null -ne $rawText -and ($rawText.IndexOf($secretPrefix, [System.StringComparison]::Ordinal) -ge 0)) {
             $violations.Add("Sensitive credential pattern ($secretPrefix) found in: $($file.FullName)")
         }
     }

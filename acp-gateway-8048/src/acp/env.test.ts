@@ -27,6 +27,7 @@ const originalEnv = {
   USERPROFILE: process.env.USERPROFILE,
   HOME: process.env.HOME,
   ProgramFiles: process.env.ProgramFiles,
+  "ProgramFiles(x86)": process.env["ProgramFiles(x86)"],
 };
 
 afterEach(() => {
@@ -115,7 +116,30 @@ describe("resolveOfficialAgyBinary", () => {
     process.env.USERPROFILE = path.join(root, "UserProfile");
     process.env.HOME = path.join(root, "Home");
     process.env.ProgramFiles = path.join(root, "ProgramFiles");
+    process.env["ProgramFiles(x86)"] = path.join(root, "ProgramFilesX86");
 
     expect(() => resolveOfficialAgyBinary("")).toThrow(/AGY_PATH/);
+  });
+
+  test("discovers binary in ProgramFiles(x86) antigravity* and portable Desktop paths on Windows", () => {
+    if (process.platform !== "win32") return;
+
+    const root = makeTempDir("agy-x86-portable-");
+    const pfX86 = path.join(root, "ProgramFilesX86");
+    const x86Bin = touchBinary(path.join(pfX86, "AntigravityCLI", "bin"));
+
+    delete process.env.AGY_PATH;
+    process.env.PATH = "";
+    process.env.LOCALAPPDATA = path.join(root, "LocalAppData");
+    process.env.USERPROFILE = path.join(root, "UserProfile");
+    process.env.HOME = path.join(root, "Home");
+    process.env.ProgramFiles = path.join(root, "ProgramFiles");
+    process.env["ProgramFiles(x86)"] = pfX86;
+
+    expect(resolveOfficialAgyBinary("")).toBe(x86Bin);
+
+    fs.rmSync(pfX86, { recursive: true, force: true });
+    const portableBin = touchBinary(path.join(process.env.HOME, "Desktop", "agy", "bin"));
+    expect(resolveOfficialAgyBinary("")).toBe(portableBin);
   });
 });

@@ -642,7 +642,24 @@ test('P0-8: Google and Gemini distinguish normal completion from mid-stream or n
   assert.equal(gStreamText.includes('event: error'), true);
   assert.match(gStreamText, /"type":"error".*"type":"api_error"/);
 
-  // 4. Gemini SSE stream mid-stream failure -> error object + finishReason OTHER, NO finishReason STOP
+  // 4. Gemini SSE stream:
+  // 4a. Mid-stream failure AFTER usable output (>= 2048B) -> graceful STOP finish, NO error object
+  const mSseUsableRes = createMockRes();
+  const mSseUsableDelivery = createResponseDelivery(mSseUsableRes, {
+    route: 'gemini',
+    stream: true,
+    geminiSse: true,
+    model: 'gemini-neon',
+  });
+  await mSseUsableDelivery.accept({ start: true, response: { id: 'gem_usable_1', model: 'gemini-neon' } });
+  await mSseUsableDelivery.accept({ content: 'B'.repeat(2100), response: { id: 'gem_usable_1', model: 'gemini-neon' } });
+  await mSseUsableDelivery.interrupt(err);
+  const mSseUsableText = mSseUsableRes.body();
+  assert.equal(mSseUsableText.includes('"finishReason":"STOP"'), true);
+  assert.equal(mSseUsableText.includes('"finishReason":"OTHER"'), false);
+  assert.equal(mSseUsableText.includes('"error":{'), false);
+
+  // 4b. Mid-stream failure BEFORE usable output (< 2048B, not postOutputIdleStall) -> error object + finishReason OTHER
   const mSseRes = createMockRes();
   const mSseDelivery = createResponseDelivery(mSseRes, {
     route: 'gemini',
@@ -651,14 +668,32 @@ test('P0-8: Google and Gemini distinguish normal completion from mid-stream or n
     model: 'gemini-neon',
   });
   await mSseDelivery.accept({ start: true, response: { id: 'gem_fail_1', model: 'gemini-neon' } });
-  await mSseDelivery.accept({ content: 'B'.repeat(2100), response: { id: 'gem_fail_1', model: 'gemini-neon' } });
+  await mSseDelivery.accept({ content: 'short', response: { id: 'gem_fail_1', model: 'gemini-neon' } });
   await mSseDelivery.interrupt(err);
   const mSseText = mSseRes.body();
   assert.equal(mSseText.includes('"finishReason":"STOP"'), false);
   assert.equal(mSseText.includes('"finishReason":"OTHER"'), true);
   assert.equal(mSseText.includes('"error":{'), true);
 
-  // 5. Gemini JSON array stream mid-stream failure -> valid JSON array ending with error + finishReason OTHER, NO STOP
+  // 5. Gemini JSON array stream:
+  // 5a. Mid-stream failure AFTER usable output (>= 2048B) -> valid JSON array ending with finishReason STOP, NO error
+  const mArrUsableRes = createMockRes();
+  const mArrUsableDelivery = createResponseDelivery(mArrUsableRes, {
+    route: 'gemini',
+    stream: true,
+    geminiSse: false,
+    model: 'gemini-neon',
+  });
+  await mArrUsableDelivery.accept({ start: true, response: { id: 'gem_usable_2', model: 'gemini-neon' } });
+  await mArrUsableDelivery.accept({ content: 'C'.repeat(2100), response: { id: 'gem_usable_2', model: 'gemini-neon' } });
+  await mArrUsableDelivery.interrupt(err);
+  const mArrUsableJson = JSON.parse(mArrUsableRes.body());
+  assert.ok(Array.isArray(mArrUsableJson) && mArrUsableJson.length >= 2);
+  const lastUsable = mArrUsableJson[mArrUsableJson.length - 1];
+  assert.equal(lastUsable.error, undefined);
+  assert.equal(lastUsable.candidates[0].finishReason, 'STOP');
+
+  // 5b. Mid-stream failure BEFORE usable output (< 2048B) -> valid JSON array ending with error + finishReason OTHER, NO STOP
   const mArrRes = createMockRes();
   const mArrDelivery = createResponseDelivery(mArrRes, {
     route: 'gemini',
@@ -667,7 +702,7 @@ test('P0-8: Google and Gemini distinguish normal completion from mid-stream or n
     model: 'gemini-neon',
   });
   await mArrDelivery.accept({ start: true, response: { id: 'gem_fail_2', model: 'gemini-neon' } });
-  await mArrDelivery.accept({ content: 'C'.repeat(2100), response: { id: 'gem_fail_2', model: 'gemini-neon' } });
+  await mArrDelivery.accept({ content: 'short', response: { id: 'gem_fail_2', model: 'gemini-neon' } });
   await mArrDelivery.interrupt(err);
   const mArrJson = JSON.parse(mArrRes.body());
   assert.ok(Array.isArray(mArrJson) && mArrJson.length >= 2);

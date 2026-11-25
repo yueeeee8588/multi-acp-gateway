@@ -7,6 +7,7 @@ import { StateStore } from "../src/gateway/state.mjs";
 import { Accounts, parseRefreshTokens } from "../src/gateway/accounts.mjs";
 import {
   detectChromePath,
+  getChromeLocalStatePath,
   parseChromeLocalState,
   runChromeOAuthBatch,
 } from "../src/gateway/chrome-oauth.mjs";
@@ -445,4 +446,83 @@ test("Chrome Local State parsing, detectChromePath, and serial chrome-oauth", as
     await accounts.close();
     fs.rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test("detectChromePath supports CHROME_PATH, registry App Paths, and Edge fallback with Local State compatibility", () => {
+  const customExe = "D:\\Portable\\Chrome\\chrome.exe";
+  assert.equal(
+    detectChromePath(
+      { CHROME_PATH: `"${customExe}"`, ProgramFiles: "C:\\Program Files" },
+      (p) => p === customExe,
+    ),
+    customExe,
+  );
+
+  const regChromeExe = "D:\\CustomInstall\\Chrome\\Application\\chrome.exe";
+  assert.equal(
+    detectChromePath(
+      { ProgramFiles: "C:\\Program Files" },
+      (p) => p === regChromeExe,
+      {
+        platform: "win32",
+        spawnSync: (_cmd, args) => {
+          if (String(args[1]).includes("App Paths\\chrome.exe")) {
+            return {
+              status: 0,
+              stdout: `HKEY_LOCAL_MACHINE\\...\r\n    (Default)    REG_SZ    ${regChromeExe}\r\n`,
+            };
+          }
+          return { status: 1, stdout: "" };
+        },
+      },
+    ),
+    regChromeExe,
+  );
+
+  const stdEdgeExe = "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe";
+  assert.equal(
+    detectChromePath(
+      { "ProgramFiles(x86)": "C:\\Program Files (x86)" },
+      (p) => p === stdEdgeExe,
+      { platform: "win32", spawnSync: () => ({ status: 1, stdout: "" }) },
+    ),
+    stdEdgeExe,
+  );
+
+  const regEdgeExe = "D:\\EdgeCustom\\msedge.exe";
+  assert.equal(
+    detectChromePath(
+      { ProgramFiles: "C:\\Program Files" },
+      (p) => p === regEdgeExe,
+      {
+        platform: "win32",
+        spawnSync: (_cmd, args) => {
+          if (String(args[1]).includes("App Paths\\msedge.exe")) {
+            return {
+              status: 0,
+              stdout: `HKEY_LOCAL_MACHINE\\...\r\n    (Default)    REG_SZ    "${regEdgeExe}"\r\n`,
+            };
+          }
+          return { status: 1, stdout: "" };
+        },
+      },
+    ),
+    regEdgeExe,
+  );
+
+  const localAppData = "C:\\Users\\test\\AppData\\Local";
+  const chromeState = "C:\\Users\\test\\AppData\\Local\\Google\\Chrome\\User Data\\Local State";
+  const edgeState = "C:\\Users\\test\\AppData\\Local\\Microsoft\\Edge\\User Data\\Local State";
+  assert.equal(
+    getChromeLocalStatePath({ LOCALAPPDATA: localAppData }, { browserPath: stdEdgeExe, existsSync: () => true }),
+    edgeState,
+  );
+  assert.equal(
+    getChromeLocalStatePath({ LOCALAPPDATA: localAppData }, { existsSync: (p) => p === edgeState }),
+    edgeState,
+  );
+  assert.equal(
+    getChromeLocalStatePath({ LOCALAPPDATA: localAppData }, { existsSync: (p) => p === chromeState }),
+    chromeState,
+  );
 });

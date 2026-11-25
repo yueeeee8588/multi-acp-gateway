@@ -462,19 +462,24 @@ export function createResponseDelivery(res, { route = 'chat', stream = false, ge
         },
       });
     } else if (route === 'gemini') {
-      const geminiErr = buildGeminiErrorPayload(detail, detailStatus);
-      await sendGeminiChunk({
-        ...geminiErr,
-        candidates: [
-          {
-            content: { role: 'model', parts: [] },
-            finishReason: 'OTHER',
-            index: 0,
-          },
-        ],
-        modelVersion: meta.model,
-      });
-      if (!geminiSse) await sendWire(']');
+      if (usable) {
+        await sendGeminiChunk(buildGeminiResponsePayload({ model: meta.model, content: '', calls: [], usage: estimateUsage() }, { includeFinish: true }));
+        if (!geminiSse) await sendWire(']');
+      } else {
+        const geminiErr = buildGeminiErrorPayload(detail, detailStatus);
+        await sendGeminiChunk({
+          ...geminiErr,
+          candidates: [
+            {
+              content: { role: 'model', parts: [] },
+              finishReason: 'OTHER',
+              index: 0,
+            },
+          ],
+          modelVersion: meta.model,
+        });
+        if (!geminiSse) await sendWire(']');
+      }
     } else if (usable) {
       // Deliberate delivery-completion compatibility, matching Chat's stop branch.
       // Codex retries response.incomplete even after receiving usable text. Finish

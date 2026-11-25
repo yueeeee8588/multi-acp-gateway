@@ -1,6 +1,7 @@
 import { execFileSync } from 'node:child_process';
 import { resolveOfficialAgyBinary } from '../acp/env';
 import { getConfig } from '../config/settings';
+import { resolveEffectiveProxy } from './system-proxy';
 import type {
   AccountQuotaSnapshot,
   AccountTier,
@@ -684,7 +685,7 @@ export async function fetchAccountQuota(params: {
     };
   }
 
-  const effectiveProxy = params.proxyUrl?.trim() || getConfig().defaultProxy?.trim() || undefined;
+  const effectiveProxy = resolveEffectiveProxy(params.proxyUrl);
   let resolvedProjectId = params.projectId?.trim() || undefined;
   let detectedTier: AccountTier | null = null;
   let accessTokenRejected = false;

@@ -127,11 +127,14 @@ export function resolveOfficialAgyBinary(agyPath?: string): string {
     pathsToSearch.push(...pathEnv.split(path.delimiter).filter(Boolean));
   }
 
-  const home = HOST_HOME || process.env.USERPROFILE || os.homedir();
+  const home = process.env.HOME || process.env.USERPROFILE || HOST_HOME || os.homedir();
   if (windows) {
     const localAppData = process.env.LOCALAPPDATA || path.join(home, "AppData", "Local");
+    const programData = process.env.ProgramData || "C:\\ProgramData";
     pathsToSearch.push(
       ...collectAntigravityProgramDirs(path.join(localAppData, "Programs")),
+      path.join(localAppData, "Programs", "agy", "bin"),
+      path.join(localAppData, "Programs", "agy"),
       path.join(localAppData, "agy", "bin"),
       path.join(localAppData, "agy"),
       path.join(home, ".local", "bin"),
@@ -142,6 +145,30 @@ export function resolveOfficialAgyBinary(agyPath?: string): string {
         ...collectAntigravityProgramDirs(process.env.ProgramFiles),
       );
     }
+    const programFilesX86 = process.env["ProgramFiles(x86)"];
+    if (programFilesX86) {
+      pathsToSearch.push(
+        ...collectAntigravityProgramDirs(programFilesX86),
+      );
+    }
+    pathsToSearch.push(
+      ...collectAntigravityProgramDirs(home),
+      path.join(home, "agy", "bin"),
+      path.join(home, "agy"),
+      path.join(home, "Desktop", "agy", "bin"),
+      path.join(home, "Desktop", "agy"),
+      path.join(home, "Downloads", "agy", "bin"),
+      path.join(home, "Downloads", "agy"),
+      path.join(home, "scoop", "shims"),
+      path.join(home, "scoop", "apps", "agy", "current", "bin"),
+      path.join(home, "scoop", "apps", "agy", "current"),
+      path.join(programData, "chocolatey", "bin"),
+      path.join(process.cwd(), "agy", "bin"),
+      path.join(process.cwd(), "agy"),
+      path.join(process.cwd(), "bin"),
+      "C:\\agy\\bin",
+      "C:\\agy",
+    );
   } else {
     pathsToSearch.push(
       "/opt/homebrew/bin",

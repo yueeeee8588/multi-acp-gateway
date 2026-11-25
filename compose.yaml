@@ -26,11 +26,6 @@ services:
     volumes:
       - gateway-data:/data
       - update-control:/control:ro
-      - type: bind
-        source: ./.env
-        target: /app/.env
-        bind:
-          create_host_path: false
     depends_on:
       updater:
         condition: service_healthy

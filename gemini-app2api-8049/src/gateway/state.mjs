@@ -187,14 +187,69 @@ function tryAcquireDirFlock(dirFd, customHelper = null) {
   if (!result.error && !result.signal && result.status === 75) return "contended";
   return "failed";
 }
-function isLiveLegacyPidOwner(pid, stat, file) {
+export function isLiveLegacyPidOwner(pid, stat, file, deps = {}) {
+  const platform = deps.platform ?? process.platform;
+  const killFn = deps.kill ?? ((targetPid, sig) => process.kill(targetPid, sig));
+  const spawnSyncImpl = deps.spawnSync ?? spawnSync;
+  const env = deps.env ?? process.env;
+  const safePid = Number(pid);
+  if (!Number.isInteger(safePid) || safePid <= 0) return false;
   try {
-    process.kill(pid, 0);
+    killFn(safePid, 0);
   } catch (error) {
     if (error?.code === "ESRCH" || error?.code === "EPERM") return false;
     return true;
   }
-  if (process.platform === "linux") {
+  if (platform === "win32") {
+    const systemRoot =
+      (typeof env.SystemRoot === "string" && env.SystemRoot.trim()) ||
+      (typeof env.WINDIR === "string" && env.WINDIR.trim()) ||
+      "C:\\Windows";
+    const powershellPath = path.win32.join(
+      systemRoot,
+      "System32",
+      "WindowsPowerShell",
+      "v1.0",
+      "powershell.exe",
+    );
+    const psScript =
+      `[Console]::OutputEncoding = [Text.UTF8Encoding]::new(); ` +
+      `$p = Get-CimInstance Win32_Process -Filter "ProcessId = ${safePid}" -ErrorAction Stop | Select-Object Name, CommandLine; ` +
+      `if ($null -eq $p) { '__MISSING__' } else { $p | ConvertTo-Json -Compress }`;
+    const ps = spawnSyncImpl(
+      powershellPath,
+      ["-NoProfile", "-NonInteractive", "-Command", psScript],
+      {
+        encoding: "utf8",
+        timeout: 3000,
+        windowsHide: true,
+        stdio: ["ignore", "pipe", "ignore"],
+      },
+    );
+    if (ps.error || ps.signal || ps.status !== 0) return true;
+    const trimmed = (ps.stdout ?? "").trim();
+    if (!trimmed || trimmed === "__MISSING__") return false;
+    let parsed;
+    try {
+      parsed = JSON.parse(trimmed);
+    } catch {
+      return true;
+    }
+    const entry = Array.isArray(parsed) ? parsed[0] : parsed;
+    if (!entry || typeof entry !== "object") return false;
+    const procName = typeof entry.Name === "string" ? entry.Name.trim() : "";
+    const cmdLine =
+      typeof entry.CommandLine === "string" ? entry.CommandLine : "";
+    if (!cmdLine) return false;
+    if (/(?:^|[\\/\s"'])gemini-gateway(?:\.exe)?\b|gateway-server\.mjs/i.test(cmdLine)) {
+      return true;
+    }
+    if (procName.toLowerCase() === "node.exe" && /gateway-server\.mjs/i.test(cmdLine)) {
+      return true;
+    }
+    return false;
+  }
+  if (platform === "linux") {
     try {
       const pstat = fs.statSync(`/proc/${pid}`);
       if (
@@ -236,7 +291,7 @@ function isLiveLegacyPidOwner(pid, stat, file) {
       return true;
     }
   }
-  if (process.platform === "darwin") {
+  if (platform === "darwin") {
     const lsof = spawnSync(
       "/usr/sbin/lsof",
       ["-n", "-P", "-w", "-a", "-p", String(pid), "--", file],

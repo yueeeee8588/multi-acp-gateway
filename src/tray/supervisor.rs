@@ -279,6 +279,13 @@ pub fn resolve_2048_exe(install_dir: &Path) -> Option<PathBuf> {
     candidates.into_iter().find(|p| p.is_file())
 }
 
+const JS_RUNTIME_CONFLICT_ENVS: &[&str] = &[
+    "NODE_OPTIONS",
+    "NODE_EXTRA_CA_CERTS",
+    "UV_THREADPOOL_SIZE",
+    "BUN_OPTIONS",
+];
+
 fn build_service_command(id: ServiceId, paths: &TrayPaths) -> Result<Command, ServiceState> {
     match id {
         ServiceId::Proxy8046 => {
@@ -291,6 +298,7 @@ fn build_service_command(id: ServiceId, paths: &TrayPaths) -> Result<Command, Se
             }
             let mut cmd = Command::new(&exe);
             cmd.current_dir(&paths.install_dir);
+            cmd.env_remove("WEB_DIR");
             cmd.env("BIND_ADDR", format!("127.0.0.1:{}", id.port()));
             cmd.env("APP_DATA_DIR", &paths.data_root);
             cmd.env("DATA_DIR", paths.data_root.join("8046"));
@@ -316,6 +324,9 @@ fn build_service_command(id: ServiceId, paths: &TrayPaths) -> Result<Command, Se
             let mut cmd = Command::new(bun);
             cmd.current_dir(cwd);
             cmd.args(["run", "src/server.ts"]);
+            for key in JS_RUNTIME_CONFLICT_ENVS {
+                cmd.env_remove(key);
+            }
             cmd.env("AGY_DB_PATH", data_8048.join("gateway.db"));
             cmd.env("AGY_8048_DATA_DIR", &data_8048);
             cmd.env("AGY_ACP_DATA_DIR", &data_8048);
@@ -329,7 +340,9 @@ fn build_service_command(id: ServiceId, paths: &TrayPaths) -> Result<Command, Se
             let mut cmd = Command::new(node);
             cmd.current_dir(cwd);
             cmd.arg("src/gateway-server.mjs");
-            cmd.env_remove("NODE_OPTIONS");
+            for key in JS_RUNTIME_CONFLICT_ENVS {
+                cmd.env_remove(key);
+            }
             cmd.env("PORT", id.port().to_string());
             cmd.env("GATEWAY_HOST", "127.0.0.1");
             cmd.env("GATEWAY_DATA_DIR", paths.data_root.join("8049"));
