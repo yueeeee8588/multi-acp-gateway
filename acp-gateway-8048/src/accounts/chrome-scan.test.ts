@@ -92,7 +92,7 @@ describe("detectChromePath", () => {
   });
 
   test("prefers CHROME_PATH env var when readable", () => {
-    const customChrome = "D:\\Portable\\Chrome\\chrome.exe";
+    const customChrome = "X:\\Portable\\Chrome\\chrome.exe";
     const stdChrome = path.join("C:\\Program Files", "Google", "Chrome", "Application", "chrome.exe");
     const env: NodeJS.ProcessEnv = {
       CHROME_PATH: `  "${customChrome}"  `,
@@ -107,7 +107,7 @@ describe("detectChromePath", () => {
   });
 
   test("falls back to Windows App Paths registry for chrome.exe before Edge", () => {
-    const regChrome = "D:\\Apps\\Chrome\\chrome.exe";
+    const regChrome = "X:\\Apps\\Chrome\\chrome.exe";
     const edgeStd = path.join("C:\\Program Files (x86)", "Microsoft", "Edge", "Application", "msedge.exe");
     const env: NodeJS.ProcessEnv = {
       "ProgramFiles(x86)": "C:\\Program Files (x86)",
@@ -134,7 +134,7 @@ describe("detectChromePath", () => {
       })
     ).toBe(edgeStd);
 
-    const regEdge = "D:\\CustomEdge\\msedge.exe";
+    const regEdge = "X:\\CustomEdge\\msedge.exe";
     expect(
       detectChromePath(env, (p) => p === regEdge, {
         platform: "win32",

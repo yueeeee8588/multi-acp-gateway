@@ -3443,8 +3443,8 @@ mod tests {
     #[test]
     fn resolve_powershell_exe_uses_system_root_or_windows_fallback() {
         assert_eq!(
-            resolve_powershell_exe_from_system_root(Some(r"D:\Win")),
-            PathBuf::from(r"D:\Win\System32\WindowsPowerShell\v1.0\powershell.exe")
+            resolve_powershell_exe_from_system_root(Some(r"X:\Win")),
+            PathBuf::from(r"X:\Win\System32\WindowsPowerShell\v1.0\powershell.exe")
         );
         assert_eq!(
             resolve_powershell_exe_from_system_root(None),

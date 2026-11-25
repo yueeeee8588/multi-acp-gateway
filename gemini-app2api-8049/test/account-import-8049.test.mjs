@@ -449,7 +449,7 @@ test("Chrome Local State parsing, detectChromePath, and serial chrome-oauth", as
 });
 
 test("detectChromePath supports CHROME_PATH, registry App Paths, and Edge fallback with Local State compatibility", () => {
-  const customExe = "D:\\Portable\\Chrome\\chrome.exe";
+  const customExe = "X:\\Portable\\Chrome\\chrome.exe";
   assert.equal(
     detectChromePath(
       { CHROME_PATH: `"${customExe}"`, ProgramFiles: "C:\\Program Files" },
@@ -458,7 +458,7 @@ test("detectChromePath supports CHROME_PATH, registry App Paths, and Edge fallba
     customExe,
   );
 
-  const regChromeExe = "D:\\CustomInstall\\Chrome\\Application\\chrome.exe";
+  const regChromeExe = "X:\\CustomInstall\\Chrome\\Application\\chrome.exe";
   assert.equal(
     detectChromePath(
       { ProgramFiles: "C:\\Program Files" },
@@ -489,7 +489,7 @@ test("detectChromePath supports CHROME_PATH, registry App Paths, and Edge fallba
     stdEdgeExe,
   );
 
-  const regEdgeExe = "D:\\EdgeCustom\\msedge.exe";
+  const regEdgeExe = "X:\\EdgeCustom\\msedge.exe";
   assert.equal(
     detectChromePath(
       { ProgramFiles: "C:\\Program Files" },

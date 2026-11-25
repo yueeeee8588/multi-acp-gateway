@@ -1076,7 +1076,7 @@ test("isLiveLegacyPidOwner win32 branch handles dead PIDs, reused PIDs, live gat
         status: 0,
         stdout: JSON.stringify({
           Name: "node.exe",
-          CommandLine: "\"C:\\Program Files\\nodejs\\node.exe\" D:\\app\\src\\gateway-server.mjs",
+          CommandLine: "\"C:\\Program Files\\nodejs\\node.exe\" X:\\app\\src\\gateway-server.mjs",
         }),
       }),
     }),
