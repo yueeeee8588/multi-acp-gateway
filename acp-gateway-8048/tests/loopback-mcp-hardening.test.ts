@@ -283,4 +283,98 @@ describe('LoopbackMcpServer & Gateway 3-layer hardening', () => {
     expect(c2.signal.aborted).toBe(true);
     expect(inFlightControllers.size).toBe(0);
   });
+
+  it('5. expectsToolSummary 自动补全默认值、保留已有值、未声明时不注入', async () => {
+    const { tools } = sanitizeToolDeclarations([
+      {
+        name: 'run_command',
+        description: 'Run command',
+        parameters: {
+          type: 'object',
+          properties: {
+            command: { type: 'string' },
+            toolSummary: { type: 'string' },
+          },
+          required: ['command', 'toolSummary'],
+        },
+      },
+      {
+        name: 'read_file',
+        description: 'Read file',
+        parameters: {
+          type: 'object',
+          properties: {
+            path: { type: 'string' },
+            toolSummary: { type: 'string' },
+          },
+          required: ['path', 'toolSummary'],
+        },
+      },
+      {
+        name: 'no_summary_tool',
+        description: 'No summary field',
+        parameters: {
+          type: 'object',
+          properties: {
+            q: { type: 'string' },
+          },
+        },
+      },
+    ]);
+
+    const capturedBatches: Array<{ id: string; name: string; args: Record<string, unknown> }> = [];
+    const broker = new SessionToolBroker({
+      tools,
+      batchWindowMs: 5,
+      toolCallTimeoutMs: 5_000,
+      onBatchReady: (calls) => {
+        for (const c of calls) {
+          capturedBatches.push({ id: c.id, name: c.name, args: c.args });
+        }
+      },
+    });
+
+    const p1 = broker.handleJsonRpc({
+      jsonrpc: '2.0',
+      id: 1,
+      method: 'tools/call',
+      params: { name: 'run_command', arguments: { command: 'ls' } },
+    });
+    const p2 = broker.handleJsonRpc({
+      jsonrpc: '2.0',
+      id: 2,
+      method: 'tools/call',
+      params: { name: 'read_file', arguments: { path: 'a.txt', toolSummary: '   ' } },
+    });
+    const p3 = broker.handleJsonRpc({
+      jsonrpc: '2.0',
+      id: 3,
+      method: 'tools/call',
+      params: { name: 'read_file', arguments: { path: 'b.txt', toolSummary: 'Read b.txt' } },
+    });
+    const p4 = broker.handleJsonRpc({
+      jsonrpc: '2.0',
+      id: 4,
+      method: 'tools/call',
+      params: { name: 'no_summary_tool', arguments: { q: 'hi' } },
+    });
+
+    await new Promise((r) => setTimeout(r, 25));
+    expect(capturedBatches.length).toBe(4);
+
+    expect(capturedBatches[0]!.name).toBe('run_command');
+    expect(capturedBatches[0]!.args.toolSummary).toBe('Run command');
+
+    expect(capturedBatches[1]!.name).toBe('read_file');
+    expect(capturedBatches[1]!.args.toolSummary).toBe('read_file');
+
+    expect(capturedBatches[2]!.name).toBe('read_file');
+    expect(capturedBatches[2]!.args.toolSummary).toBe('Read b.txt');
+
+    expect(capturedBatches[3]!.name).toBe('no_summary_tool');
+    expect(Object.hasOwn(capturedBatches[3]!.args, 'toolSummary')).toBe(false);
+
+    broker.cancelAllPending('test cleanup');
+    await Promise.all([p1, p2, p3, p4]);
+  });
 });

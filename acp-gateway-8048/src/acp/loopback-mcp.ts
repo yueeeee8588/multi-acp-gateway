@@ -266,6 +266,15 @@ export class SessionToolBroker {
         };
       }
 
+      const callArgs = { ...args };
+      if (
+        def.expectsToolSummary &&
+        (typeof callArgs.toolSummary !== "string" || callArgs.toolSummary.trim() === "")
+      ) {
+        callArgs.toolSummary =
+          def.originalName === "run_command" ? "Run command" : def.originalName;
+      }
+
       let resolveFn: (res: McpCallToolResult) => void = () => {};
       const promise = new Promise<McpCallToolResult>((resolve) => {
         resolveFn = resolve;
@@ -276,7 +285,7 @@ export class SessionToolBroker {
         id: callId,
         name: def.originalName,
         mcpName: def.mcpName,
-        args,
+        args: callArgs,
         promise,
         resolve: resolveFn,
         settled: false,
@@ -306,7 +315,7 @@ export class SessionToolBroker {
         id: callId,
         name: def.originalName,
         mcpName: def.mcpName,
-        args,
+        args: callArgs,
       });
 
       const result = await this.awaitParkedCall(parkedCall, signal);

@@ -25,6 +25,7 @@ export interface AcpConnectionOptions {
   redactor?: StderrRedactor;
   onUpdate?: (params: Record<string, unknown>) => void;
   onExit?: (code: number | null, stderr: string) => void;
+  onStderr?: (chunk: string) => void;
 }
 
 interface PendingRequest {
@@ -176,6 +177,7 @@ export class AcpConnection {
   private readonly redactor?: StderrRedactor;
   private readonly onUpdate?: (params: Record<string, unknown>) => void;
   private readonly onExit?: (code: number | null, stderr: string) => void;
+  private stderrHandler?: (chunk: string) => void;
   private closed = false;
   private exited = false;
   private exitPromise: Promise<number | null> | null = null;
@@ -185,6 +187,11 @@ export class AcpConnection {
     this.redactor = options.redactor;
     this.onUpdate = options.onUpdate;
     this.onExit = options.onExit;
+    this.stderrHandler = options.onStderr;
+  }
+
+  onStderr(handler: (chunk: string) => void): void {
+    this.stderrHandler = handler;
   }
 
   get isAlive(): boolean {
@@ -487,11 +494,28 @@ export class AcpConnection {
 
   private async readStderrLoop(stream: ReadableStream<Uint8Array>): Promise<void> {
     const reader = stream.getReader();
+    const decoder = new TextDecoder();
     try {
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
         this.stderrRing.push(value);
+        const text = decoder.decode(value, { stream: true });
+        if (text.length > 0 && this.stderrHandler) {
+          try {
+            this.stderrHandler(text);
+          } catch {
+            // Ignore handler errors so stderr reading continues uninterrupted
+          }
+        }
+      }
+      const tail = decoder.decode();
+      if (tail.length > 0 && this.stderrHandler) {
+        try {
+          this.stderrHandler(tail);
+        } catch {
+          // Ignore handler errors
+        }
       }
     } catch {
       // Stream closed

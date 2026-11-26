@@ -457,4 +457,139 @@ describe('503 capacity classification, fast abort, and real 503 passthrough', ()
       mcpServer.stop();
     }
   });
+
+  it('5. stderr real-time 503 fast-abort: triggers immediate 503 abort across split chunks before any ACP update', async () => {
+    const mcpServer = new LoopbackMcpServer();
+    await mcpServer.start();
+    const closedAccounts: string[] = [];
+    let resolvePrompt: (() => void) | undefined;
+
+    const worker = new AgySessionWorker({
+      account: makeAccount('stderr-503'),
+      model: 'gemini-3-pro-high',
+      mcpServer,
+      idleTimeoutMs: 5000,
+      softErrorCutoffMs: 2800,
+      transportFactory: ({ onStderr }) => {
+        let closed = false;
+        return {
+          async initialize() {
+            return { ok: true };
+          },
+          async newSession() {
+            return { sessionId: 'sess-stderr-503' };
+          },
+          async setModel() {
+            return {};
+          },
+          async prompt() {
+            setTimeout(() => {
+              onStderr?.('⚠ API error (attempt 1): No capa');
+            }, 10);
+            setTimeout(() => {
+              onStderr?.('city available for model gemini-3-pro-high on the server\n');
+            }, 25);
+            await new Promise<void>((resolve) => {
+              resolvePrompt = resolve;
+            });
+            return { stopReason: 'end_turn' };
+          },
+          async cancel() {},
+          async close() {
+            closed = true;
+            closedAccounts.push('stderr-503');
+            resolvePrompt?.();
+          },
+          isAlive() {
+            return !closed;
+          },
+        };
+      },
+    });
+
+    try {
+      const started = performance.now();
+      let caught: unknown;
+      try {
+        await worker.executePrompt({
+          contents: [{ role: 'user', parts: [{ text: 'ping' }] }],
+        });
+      } catch (err) {
+        caught = err;
+      }
+      const elapsedMs = performance.now() - started;
+
+      expect(caught).toBeInstanceOf(WorkerError);
+      const wErr = caught as WorkerError;
+      expect(wErr.code).toBe('CAPACITY_UNAVAILABLE');
+      expect(wErr.upstreamStatus).toBe(503);
+      expect(wErr.message).toContain('No capacity available');
+      expect(closedAccounts).toContain('stderr-503');
+      expect(elapsedMs).toBeLessThan(1000);
+    } finally {
+      resolvePrompt?.();
+      await worker.resetAndClose();
+      mcpServer.stop();
+    }
+  });
+
+  it('6. stderr guardrails: ignores 503 stderr after effective output and ignores ordinary stderr warnings', async () => {
+    const mcpServer = new LoopbackMcpServer();
+    await mcpServer.start();
+    const closedAccounts: string[] = [];
+
+    const worker = new AgySessionWorker({
+      account: makeAccount('stderr-safe'),
+      model: 'gemini-3-pro-high',
+      mcpServer,
+      idleTimeoutMs: 5000,
+      transportFactory: ({ onUpdate, onStderr }) => {
+        let closed = false;
+        return {
+          async initialize() {
+            return { ok: true };
+          },
+          async newSession() {
+            return { sessionId: 'sess-stderr-safe' };
+          },
+          async setModel() {
+            return {};
+          },
+          async prompt() {
+            // Ordinary stderr warning before output must not abort
+            onStderr?.('warn: experimental flag enabled\n');
+            onUpdate({
+              sessionId: 'sess-stderr-safe',
+              update: {
+                sessionUpdate: 'agent_message_chunk',
+                content: { type: 'text', text: 'Real effective output' },
+              },
+            });
+            // 503 stderr after effective output must not abort
+            onStderr?.(`${REAL_503_CLI_CHUNK}\n`);
+            return { stopReason: 'end_turn' };
+          },
+          async cancel() {},
+          async close() {
+            closed = true;
+            closedAccounts.push('stderr-safe');
+          },
+          isAlive() {
+            return !closed;
+          },
+        };
+      },
+    });
+
+    try {
+      const result = await worker.executePrompt({
+        contents: [{ role: 'user', parts: [{ text: 'ping' }] }],
+      });
+      expect(result.parts).toEqual([{ text: 'Real effective output' }]);
+      expect(closedAccounts).toEqual([]);
+    } finally {
+      await worker.resetAndClose();
+      mcpServer.stop();
+    }
+  });
 });

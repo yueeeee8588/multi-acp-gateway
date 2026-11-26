@@ -111,30 +111,34 @@ test('both APIs JSON/SSE replace a held same-ID text draft with the final call i
   assert.equal(attempts, 4);
 });
 
-for (const route of ['chat/completions', 'responses']) test(`${route}: a committed validated tool call survives a later rewrite and never triggers another generation`, async t => {
+for (const route of ['chat/completions', 'responses']) test(`${route}: a buffered tool call is replaced by a later rewrite without another generation`, async t => {
   const f = await fixture({ allowFailover: false, allowAutomaticRecovery: true }); t.after(f.close); let attempts = 0;
-  // The trailing newline closes the fence line, so the splitter commits and publishes the first call before the rewrite arrives.
+  // Even with a closed fence, the first tool call stays buffered until the turn completes.
   f.app.provider.openTurn = () => { attempts++; return turn([snapshot(call('already delivered') + '\n'), snapshot(call('replacement'), { complete: true }), end]); };
   const body = route === 'responses' ? { model: request.model, input: 'Continue.', tools: responseTools, stream: true } : { ...request, stream: true };
   const response = await f.api('/v1/' + route, { method: 'POST', body }); assert.equal(response.status, 200);
-  const wire = await response.text(); assert.match(wire, /already delivered/); assert.doesNotMatch(wire, /replacement|synthetic-private-response-id/);
+  const wire = await response.text(); assert.match(wire, /replacement/); assert.doesNotMatch(wire, /already delivered|NON_MONOTONIC_NATIVE_RESPONSE|synthetic-private-response-id/);
   const events = wire.split('\n').filter(line => line.startsWith('data: {')).map(line => JSON.parse(line.slice(6)));
   if (route === 'responses') {
     const terminal = events.find(e => e.type === 'response.completed');
-    assert.equal(terminal.incomplete, true); assert.equal(terminal.response.incomplete, true); assert.equal(terminal.response.status, 'completed');
-    assert.equal(terminal.response.error.code, 'NON_MONOTONIC_NATIVE_RESPONSE');
+    assert.equal(terminal.response.status, 'completed');
+    assert.notEqual(terminal.incomplete, true); assert.notEqual(terminal.response.incomplete, true);
+    assert.equal(terminal.response.error, null);
+    assert.equal(terminal.response.incomplete_details, null);
     const calls = terminal.response.output.filter(x => x.type === 'function_call'); assert.equal(calls.length, 1);
-    assert.equal(calls[0].arguments, '{"key":"already delivered"}');
+    assert.equal(calls[0].arguments, '{"key":"replacement"}');
     assert.ok(events.some(e => e.type === 'response.function_call_arguments.done'));
     assert.ok(!events.some(e => e.type === 'response.incomplete' || e.type === 'response.failed'));
   } else {
-    const terminal = events.find(e => e.incomplete); assert.equal(terminal.choices[0].finish_reason, 'tool_calls');
-    assert.equal(terminal.incomplete_details.code, 'NON_MONOTONIC_NATIVE_RESPONSE'); assert.match(wire, /\[DONE\]/);
-    assert.equal(events.flatMap(e => e.choices ?? []).flatMap(c => c.delta?.tool_calls ?? []).length, 1);
+    const terminal = events.at(-1); assert.equal(terminal.choices[0].finish_reason, 'tool_calls');
+    assert.ok(!events.some(e => e.incomplete)); assert.match(wire, /\[DONE\]/);
+    const calls = events.flatMap(e => e.choices ?? []).flatMap(c => c.delta?.tool_calls ?? []);
+    assert.equal(calls.length, 1); assert.equal(calls[0].function.arguments, '{"key":"replacement"}');
   }
   assert.equal(attempts, 1); const row = f.app.overview().requests[0];
-  assert.equal(row.outputIncomplete, true); assert.equal(row.providerAttempts, 1); assert.equal(row.toolCalls, 1);
-  assert.equal(row.nativeEvidence.nonMonotonicSite, 'snapshot_stream');
+  // The request log omits outputIncomplete on successful delivery.
+  assert.equal(row.outputIncomplete ?? false, false); assert.equal(row.providerAttempts, 1); assert.equal(row.toolCalls, 1);
+  assert.equal(row.nativeResponseRevisions, 1);
   // A validated call is data for the caller, not evidence of gateway execution.
 });
 

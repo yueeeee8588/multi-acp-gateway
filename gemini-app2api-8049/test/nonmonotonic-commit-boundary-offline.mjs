@@ -39,7 +39,7 @@ const cases = [
   { name: 'anonymous_append', snapshots: [{ text: 'old', id: null }, { text: 'old new', id: null, complete: true }], text: 'old new', revisions: 0 },
   { name: 'published_2048', snapshots: [{ text: oldLong }, { text: newLong, complete: true }], text: newLong, revisions: 1, streamingError: 'NON_MONOTONIC_NATIVE_RESPONSE', streamText: oldLong, site: 'snapshot_stream' },
   { name: 'utf8_published_2049', snapshots: [{ text: '中'.repeat(683) }, { text: revised, complete: true }], text: revised, revisions: 1, streamingError: 'NON_MONOTONIC_NATIVE_RESPONSE', streamText: '中'.repeat(683), site: 'snapshot_stream' },
-  { name: 'validated_call_replaced', tools: true, snapshots: [{ text: tool('old') }, { text: tool('new'), complete: true }], text: '\n', revisions: 1, callValue: 'new', streamCallValue: 'old', streamingError: 'NON_MONOTONIC_NATIVE_RESPONSE', streamText: '\n', site: 'snapshot_stream' },
+  { name: 'validated_call_replaced', tools: true, snapshots: [{ text: tool('old') }, { text: tool('new'), complete: true }], text: '\n', revisions: 1, callValue: 'new', streamCallValue: 'new' },
 ];
 let current, attempts = 0, passed = 0;
 const openTurn = () => { attempts++; return { cancel() {}, events: { async *[Symbol.asyncIterator]() {
@@ -54,7 +54,7 @@ function parsed(raw, route, stream) {
   const events = raw.split('\n').filter(l => l.startsWith('data: {')).map(l => JSON.parse(l.slice(6)));
   return { events, text: route === 'chat' ? events.flatMap(e => e.choices ?? []).map(c => c.delta?.content ?? '').join('') : events.filter(e => e.type === 'response.output_text.delta').map(e => e.delta).join(''),
     calls: route === 'chat' ? events.flatMap(e => e.choices ?? []).flatMap(c => c.delta?.tool_calls ?? []) : events.filter(e => e.type === 'response.output_item.added' && e.item.type === 'function_call').map(e => e.item),
-    incomplete: events.some(e => e.incomplete || e.type === 'response.incomplete'), code: events.find(e => e.error)?.error?.code ?? events.find(e => e.incomplete_details)?.incomplete_details?.code ?? events.at(-1)?.response?.error?.code };
+    incomplete: events.some(e => e.incomplete || e.type === 'response.incomplete'), code: events.find(e => e.error)?.error?.code ?? events.find(e => e.incomplete_details)?.incomplete_details?.code ?? events.at(-1)?.response?.error?.code ?? events.at(-1)?.response?.incomplete_details?.code };
 }
 class Sink extends EventEmitter {
   chunks=[]; destroyed=false; writableEnded=false;

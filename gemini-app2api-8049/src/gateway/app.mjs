@@ -219,7 +219,7 @@ export function errorPayload(error) {
   const previousRequestId = typeof error?.previousRequestId === "string" && /^req_[A-Za-z0-9_-]{1,80}$/.test(error.previousRequestId) ? error.previousRequestId : null;
   const toolReason = error?.nativeEvidence?.toolProtocolReason ?? error?.toolProtocolReason;
   const toolProtocolReason = (code === 'MALFORMED_TOOL_CALL' || previousCode === 'MALFORMED_TOOL_CALL') &&
-    ['opening_fence', 'closing_fence'].includes(toolReason) ? toolReason : null;
+    ['opening_fence', 'closing_fence', 'hallucinated_caller_result'].includes(toolReason) ? toolReason : null;
   const terminal = code === 'GENERATION_FAILED' && error?.terminalNoOutput === true;
   const param =
     typeof error?.param === "string" &&
@@ -229,6 +229,7 @@ export function errorPayload(error) {
   return {
     error: {
       message: terminal ? 'Generation ended without output. Gateway recovery is exhausted; this turn has failed.'
+        : code === 'MALFORMED_TOOL_CALL' && toolProtocolReason === 'hallucinated_caller_result' ? `${code}: upstream emitted a synthetic caller tool result marker. No tool call was released.`
         : code === 'MALFORMED_TOOL_CALL' && toolProtocolReason ? `${code}: invalid ${toolProtocolReason} layout. No tool call was released.`
         : code === 'UNSUPPORTED_PARAMETER' && param ? `UNSUPPORTED_PARAMETER: ${param}`
         : code === 'UNSUPPORTED_MODEL' ? 'UNSUPPORTED_MODEL: supported models are gemini-neon, gemini-hydrogen, gemini-flash-lite (alias: gemini-argon -> gemini-neon)'
@@ -650,6 +651,7 @@ export function createGateway({
           res.setHeader("X-Gemini-Failover-Count", String(providerAttempts - 1));
           if (context.responseSessionId) res.setHeader('X-Session-ID', context.responseSessionId);
           if (context.failoverReason) res.setHeader("X-Gemini-Failover-Reason", context.failoverReason);
+          if (providerFailures.length) res.setHeader('X-Gemini-Recovery-Errors', [...new Set(providerFailures.map(f => f.code))].join(','));
         }
         const wrappedAccept = (event) => {
           if (
@@ -676,7 +678,7 @@ export function createGateway({
         };
         try {
           const turnResult = await provider.runTurn(acc, canonical, wrappedAccept, { ...context, timeoutMs: settings.timeoutMs,
-            incrementalOutput: true, outputMode: outputStreaming ? 'stream' : 'buffered',
+            incrementalOutput: true, deferToolCalls: true, outputMode: outputStreaming ? 'stream' : 'buffered',
             getOutputCommitState: delivery.outputCommitState,
             ...(attemptDiagnostic ? { nativeDiagnostic: attemptDiagnostic } : {}) });
           attempt.durationMs = Date.now() - attemptStartedAt;
@@ -718,15 +720,15 @@ export function createGateway({
             accountId: acc,
             accountLabel,
           });
-          // Only content the caller actually received commits this turn. A held
-          // tiny prefix is still replaceable by one retry.
-          error.responseStarted = res.headersSent === true || delivery.publishedBytes > 0 || delivery.callCount > 0 || res.destroyed === true;
-          if (!error.responseStarted && !error.unverifiedOutput && !error.postOutputIdleStall && delivery.retryableShortfall) error.shortOutput = true;
+          // Delivery owns the cross-attempt commit boundary: a held tiny prefix
+          // or comment-only SSE keepalive header is still replaceable without splicing output.
+          const disposition = delivery.attemptDisposition(error);
+          error.responseStarted = disposition.replayBlocked;
+          if (disposition.shortOutput) error.shortOutput = true;
           const evidence = safeNativeEvidence(error.nativeEvidence);
           const failure = { accountId: acc, status: Number.isInteger(error.status) && error.status >= 400 && error.status <= 599 ? error.status : 502,
             code: errCode, ...(evidence ? { nativeEvidence: evidence } : {}) };
           providerFailures.push(failure);
-          if (!res.headersSent) res.setHeader('X-Gemini-Recovery-Errors', [...new Set(providerFailures.map(f => f.code))].join(','));
           if (evidence && !isClientAbortError({ status: failure.status, code: failure.code })) try {
             accounts.recordUpstreamError(acc, { at: Date.now(), status: failure.status, code: failure.code,
               model: canonical.model, nativeEvidence: evidence });
@@ -784,7 +786,7 @@ export function createGateway({
       if (!playground && !accountTestId && !canonical.native_search && providerAttempts > 0 &&
           NO_OUTPUT_FAILURES.has(error.code) && !delivery.hasContent &&
           !error.partialResult?.content?.length && !error.partialResult?.calls?.length &&
-          !res.headersSent && !res.destroyed && !res.writableEnded &&
+          !res.destroyed && !res.writableEnded &&
           controller.signal.reason?.code !== 'CLIENT_DISCONNECTED') {
         // Codex treats HTTP422 as a reconnectable Responses stream failure;
         // its terminal HTTP400 path is required. Keep server_error + upstream cause.
@@ -792,9 +794,15 @@ export function createGateway({
         const terminal = Object.assign(fault('GENERATION_FAILED', terminalStatus), {
           terminalNoOutput: true, upstreamCode: errorCode, upstreamStatus: status, nativeEvidence,
         });
-        status = terminalStatus; errorCode = terminal.code; outputIncomplete = true; res.incomplete = true;
-        res.setHeader('X-Should-Retry', 'false');
-        throw terminal;
+        if (!res.headersSent) {
+          status = terminalStatus; errorCode = terminal.code; outputIncomplete = true; res.incomplete = true;
+          res.setHeader('X-Should-Retry', 'false');
+          throw terminal;
+        }
+        if (delivery.keepaliveOnlyHeaders) {
+          error = terminal;
+          errorCode = terminal.code;
+        }
       }
       let interrupted = false;
       try {
@@ -1369,22 +1377,21 @@ export function createGateway({
         const owner = security.apiOwner(req, url);
         if (url.search) throw fault("UNSUPPORTED_QUERY_PARAMETER");
         if (p === "/v1/models" && req.method === "GET") {
-          const contextWindows = {
-            "gemini-neon": 512000,
-            "gemini-hydrogen": 512000,
-          };
           return json(res, {
             object: "list",
-            data: protocol.NATIVE_MODELS.map((id) => ({
-              id,
-              object: "model",
-              created: 0,
-              owned_by: "google",
-              // Advisory gateway budget, not a measured upstream token limit.
-              ...(Object.hasOwn(contextWindows, id)
-                ? { context_window: contextWindows[id] }
-                : {}),
-            })),
+            data: protocol.NATIVE_MODELS.map((id) => {
+              const spec = protocol.MODEL_SPECS[id];
+              return {
+                id,
+                object: "model",
+                created: 0,
+                owned_by: "google",
+                // Advisory gateway budget, not a measured upstream token limit.
+                ...(spec?.advertiseContextWindow
+                  ? { context_window: spec.contextWindow }
+                  : {}),
+              };
+            }),
           });
         }
         if (p === "/v1/messages/count_tokens" && req.method === "POST") {

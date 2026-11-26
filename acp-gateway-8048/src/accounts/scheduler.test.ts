@@ -576,6 +576,76 @@ describe('AccountScheduler routing strategies', () => {
     const fallbackStd = await scheduler.acquireAccount('gemini-4-hydrogen', undefined, excludedAllPro);
     expect(fallbackStd.id).toBe('acc-std');
   });
+
+  it('treats Pro accounts with Argon in gemini_flash (and gemini_flagship: null) as full Pro and prioritizes them', async () => {
+    const sharedFlashWithArgon: PoolQuotaSummary = {
+      pool: 'gemini_flash',
+      label: 'Gemini',
+      percentage: 85,
+      remainingFraction: 0.85,
+      resetTime: null,
+      modelCount: 2,
+      bottleneckModel: 'gemini-4-argon',
+      window5h: 85,
+      windowWeekly: 90,
+      models: [
+        { id: 'gemini-4-argon', displayName: 'Gemini 4 Argon', percentage: 85, remainingFraction: 0.85, resetTime: null },
+        { id: 'gemini-4-hydrogen', displayName: 'Gemini 4 Hydrogen', percentage: 85, remainingFraction: 0.85, resetTime: null },
+      ],
+    };
+    const flashWithoutArgon: PoolQuotaSummary = {
+      pool: 'gemini_flash',
+      label: 'Gemini',
+      percentage: 85,
+      remainingFraction: 0.85,
+      resetTime: null,
+      modelCount: 1,
+      bottleneckModel: 'gemini-4-hydrogen',
+      window5h: 85,
+      windowWeekly: 90,
+      models: [
+        { id: 'gemini-4-hydrogen', displayName: 'Gemini 4 Hydrogen', percentage: 85, remainingFraction: 0.85, resetTime: null },
+      ],
+    };
+    const sharedArgonQuota: AccountQuotaSnapshot = {
+      fetchedAt: Date.now(),
+      pools: {
+        gemini_flagship: null,
+        gemini_flash: sharedFlashWithArgon,
+        third_party: null,
+      },
+    };
+    const noArgonQuota: AccountQuotaSnapshot = {
+      fetchedAt: Date.now(),
+      pools: {
+        gemini_flagship: null,
+        gemini_flash: flashWithoutArgon,
+        third_party: null,
+      },
+    };
+
+    const fullPro = makeAccount('acc-shared-argon-pro', { tier: 'pro', quota: sharedArgonQuota });
+    const otherPro = makeAccount('acc-no-argon-pro', { tier: 'pro', quota: noArgonQuota });
+    const standardAcc = makeAccount('acc-std-argon', { tier: 'standard', quota: sharedArgonQuota });
+
+    expect(isFullProAccount(fullPro)).toBe(true);
+    expect(isFullProAccount(otherPro)).toBe(false);
+    expect(isFullProAccount(standardAcc)).toBe(false);
+
+    spies.push(
+      spyOn(settings, 'getConfig').mockImplementation(() =>
+        makeConfig({ routingStrategy: 'performance-first', queueWaitTimeoutMs: 500 }),
+      ),
+      spyOn(store, 'listAccounts').mockImplementation(() => [standardAcc, otherPro, fullPro]),
+      spyOn(store, 'listCooldowns').mockImplementation(() => []),
+    );
+
+    const scheduler = new AccountScheduler();
+    for (let i = 0; i < 4; i++) {
+      const picked = await scheduler.acquireAccount('gemini-4-hydrogen');
+      expect(picked.id).toBe('acc-shared-argon-pro');
+    }
+  });
 });
 
 describe('AUTH_REQUIRED failure handling distinguishes expired tokens from transport jitter', () => {

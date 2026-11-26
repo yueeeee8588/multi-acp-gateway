@@ -8,6 +8,7 @@ import {
   classifyModelPool,
   computeAccountQuotaSnapshot,
   fetchAccountQuota,
+  hasFlagshipModelAccess,
 } from '../src/accounts/quota';
 import { store } from '../src/db/store';
 import { createApp } from '../src/server';
@@ -33,7 +34,8 @@ function flagshipSummary(fiveHour: number, weekly: number) {
 
 describe('classifyModelPool', () => {
   const cases = [
-    ['gemini-4-argon-high', 'gemini_flagship'],
+    ['gemini-4-argon-high', 'gemini_flash'],
+    ['gemini-pro-orchestrator-argon', 'gemini_flash'],
     ['gemini-4-hydrogen-xhigh', 'gemini_flash'],
     ['gemini-2.5-pro', 'gemini_flash'],
     ['gemini-3.8-flash-high', 'gemini_flash'],
@@ -67,9 +69,8 @@ describe('computeAccountQuotaSnapshot', () => {
       },
     });
 
-    expect(pools.gemini_flagship?.percentage).toBe(80);
-    expect(pools.gemini_flagship?.bottleneckModel).toBe('gemini-4-argon');
-    expect(pools.gemini_flash?.modelCount).toBe(3);
+    expect(pools.gemini_flagship).toBeNull();
+    expect(pools.gemini_flash?.modelCount).toBe(4);
     expect(pools.gemini_flash?.percentage).toBe(25);
     expect(pools.gemini_flash?.bottleneckModel).toBe('gemini-4-hydrogen');
   });
@@ -116,6 +117,7 @@ describe('computeAccountQuotaSnapshot', () => {
             'gemini-4-argon-high': modelQuota(0.9),
           },
         },
+        summaryResponse: flagshipSummary(0.9, 0.9),
       });
 
       expect(pools.gemini_flash).toMatchObject({
@@ -128,7 +130,7 @@ describe('computeAccountQuotaSnapshot', () => {
     });
 
     const variants = [
-      ['gemini_flagship', 'gemini-4-argon', 'high', 'Gemini 4 Argon', '(High)'],
+      ['gemini_flash', 'gemini-4-argon', 'high', 'Gemini 4 Argon', '(High)'],
       ['gemini_flash', 'gemini-4-hydrogen', 'tiered-xhigh', 'Gemini 4 Hydrogen', '(Tiered) （XHigh）'],
       ['third_party', 'claude-opus-5-5', 'medium', 'Claude Opus 5.5', '(Medium)'],
       ['third_party', 'gpt-oss-120b', 'minimal-thinking-sonar-medium', 'GPT OSS 120B', '（Medium）'],
@@ -168,7 +170,7 @@ describe('computeAccountQuotaSnapshot', () => {
       const { pools } = computeAccountQuotaSnapshot({
         modelsResponse: {
           models: {
-            'gemini-4-argon-high': modelQuota(0.8),
+            'gemini-4-argon-high': modelQuota(0.9),
             'gemini-3.8-flash-low': modelQuota(0.7),
             'claude-sonnet-4-6': modelQuota(0.6),
           },
@@ -183,15 +185,26 @@ describe('computeAccountQuotaSnapshot', () => {
   }
 
   const bottleneckCases = [
-    { source: '5h window', model: 0.8, fiveHour: 0.4, weekly: 0.9, expected: 40 },
-    { source: 'weekly window', model: 0.8, fiveHour: 0.9, weekly: 0.3, expected: 30 },
-    { source: 'model', model: 0.4, fiveHour: 0.9, weekly: 0.8, expected: 40 },
+    { source: '5h window', model: 0.8, fiveHour: 0.4, weekly: 0.8, expected: 40, independentWeekly: false },
+    { source: 'weekly window', model: 0.8, fiveHour: 0.8, weekly: 0.3, expected: 30, independentWeekly: false },
+    { source: 'model', model: 0.4, fiveHour: 0.9, weekly: 0.8, expected: 40, independentWeekly: true },
   ];
 
-  for (const { source, model, fiveHour, weekly, expected } of bottleneckCases) {
+  for (const { source, model, fiveHour, weekly, expected, independentWeekly } of bottleneckCases) {
     it(`uses the ${source} quota when it has the lowest remainder`, () => {
+      const fetchedAt = Date.parse('2026-11-18T00:00:00.000Z');
+      const regularReset = '2026-11-18T03:00:00.000Z';
+      const weeklyReset = '2026-11-25T00:00:00.000Z';
       const { pools } = computeAccountQuotaSnapshot({
-        modelsResponse: { models: { 'gemini-4-argon-high': modelQuota(model) } },
+        fetchedAt,
+        modelsResponse: {
+          models: independentWeekly
+            ? {
+                'gemini-3.8-flash-low': modelQuota(0.7, regularReset),
+                'gemini-4-argon-high': modelQuota(model, weeklyReset),
+              }
+            : { 'gemini-4-argon-high': modelQuota(model) },
+        },
         summaryResponse: flagshipSummary(fiveHour, weekly),
       });
 
@@ -219,9 +232,9 @@ describe('computeAccountQuotaSnapshot', () => {
       },
     });
 
-    expect(pools.gemini_flagship?.percentage).toBe(80);
-    expect(pools.gemini_flagship?.bottleneckModel).toBe('gemini-4-argon');
-    expect(pools.gemini_flash).toBeNull();
+    expect(pools.gemini_flagship).toBeNull();
+    expect(pools.gemini_flash?.percentage).toBe(80);
+    expect(pools.gemini_flash?.bottleneckModel).toBe('gemini-4-argon');
   });
 
   it('resolves opaque keys by model ID or displayName and ignores unsupported embedding models', () => {
@@ -233,7 +246,7 @@ describe('computeAccountQuotaSnapshot', () => {
         'text-embedding-004': { displayName: 'Gemini Embedding', ...modelQuota(0) },
       } },
     });
-    expect(pools.gemini_flagship?.percentage).toBe(65);
+    expect(pools.gemini_flagship).toBeNull();
     expect(pools.gemini_flash?.percentage).toBe(40);
     expect(pools.third_party?.percentage).toBe(90);
   });
@@ -268,7 +281,7 @@ describe('computeAccountQuotaSnapshot', () => {
     const argonReset = '2026-11-24T15:00:00Z';
     const { pools } = computeAccountQuotaSnapshot({
       modelsResponse: { models: {
-        'gemini-4-argon-high': modelQuota(0.9),
+        'gemini-4-argon-high': modelQuota(0.8),
         'gemini-3.8-flash-low': modelQuota(0.9),
         'claude-sonnet-4-6': { quotaInfo: { remainingFraction: null } },
       } },
@@ -302,7 +315,7 @@ describe('computeAccountQuotaSnapshot', () => {
         ] },
       ] },
     });
-    expect(pools.gemini_flagship?.percentage).toBe(90);
+    expect(pools.gemini_flagship).toBeNull();
     expect(pools.gemini_flash?.percentage).toBe(40);
     expect(pools.third_party?.percentage).toBe(0);
   });
@@ -391,11 +404,91 @@ describe('computeAccountQuotaSnapshot', () => {
 
   it('preserves positive weekly remainder immediately above the depletion threshold', () => {
     const { pools } = computeAccountQuotaSnapshot({
-      modelsResponse: { models: { 'gemini-4-argon-high': modelQuota(0.85) } },
+      modelsResponse: { models: { 'gemini-4-argon-high': modelQuota(0.75) } },
       summaryResponse: flagshipSummary(0.75, 0.0011),
     });
     expect(pools.gemini_flagship?.remainingFraction).toBe(0.0011);
     expect(pools.gemini_flagship?.percentage).toBe(0.11);
+  });
+
+  it('merges Argon into gemini_flash when upstream shares the Gemini Models pool while preserving flagship access', () => {
+    const fetchedAt = Date.parse('2026-11-24T00:00:00.000Z');
+    const sharedReset = '2026-11-24T05:00:00.000Z';
+    const weeklyReset = '2026-12-01T00:00:00.000Z';
+    const snapshot = computeAccountQuotaSnapshot({
+      fetchedAt,
+      modelsResponse: {
+        models: {
+          'gemini-4-argon-high': {
+            displayName: 'Gemini 4 Argon (High)',
+            ...modelQuota(0.85, sharedReset),
+          },
+          'gemini-4-hydrogen-high': {
+            displayName: 'Gemini 4 Hydrogen (High)',
+            ...modelQuota(0.85, sharedReset),
+          },
+        },
+      },
+      summaryResponse: {
+        groups: [
+          {
+            displayName: 'Gemini Models',
+            buckets: [
+              { bucketId: 'gemini-5h', remainingFraction: 0.85, resetTime: sharedReset },
+              { bucketId: 'gemini-weekly', remainingFraction: 0.9, resetTime: weeklyReset },
+            ],
+          },
+        ],
+      },
+    });
+
+    expect(snapshot.pools.gemini_flagship).toBeNull();
+    expect(snapshot.pools.gemini_flash?.models.map((m) => m.id)).toContain('gemini-4-argon');
+    expect(hasFlagshipModelAccess(snapshot)).toBe(true);
+  });
+
+  it('detects flagship model access from legacy gemini_flagship pool or argon models in gemini_flash', () => {
+    expect(hasFlagshipModelAccess(null)).toBe(false);
+    expect(hasFlagshipModelAccess(undefined)).toBe(false);
+    expect(
+      hasFlagshipModelAccess({
+        fetchedAt: 1,
+        pools: {
+          gemini_flagship: {
+            pool: 'gemini_flagship',
+            label: 'G4 Argon',
+            percentage: 100,
+            remainingFraction: 1,
+            resetTime: null,
+            modelCount: 0,
+            bottleneckModel: null,
+            window5h: 100,
+            windowWeekly: 100,
+            models: [],
+          },
+          gemini_flash: null,
+          third_party: null,
+        },
+      })
+    ).toBe(true);
+    expect(
+      hasFlagshipModelAccess(
+        computeAccountQuotaSnapshot({
+          modelsResponse: { models: { 'gemini-4-hydrogen-high': modelQuota(0.9) } },
+        })
+      )
+    ).toBe(false);
+    expect(
+      hasFlagshipModelAccess(
+        computeAccountQuotaSnapshot({
+          modelsResponse: {
+            models: {
+              slotArgon: { model: 'MODEL_PLACEHOLDER_ARGON', displayName: 'Gemini 4 Argon (High)', ...modelQuota(0.9) },
+            },
+          },
+        })
+      )
+    ).toBe(true);
   });
 });
 

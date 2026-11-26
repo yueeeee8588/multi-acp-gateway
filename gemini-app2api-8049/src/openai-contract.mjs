@@ -5,6 +5,7 @@
  * `native_search` is a documented Gemini-native opt-in, not OpenAI web_search.
  */
 import crypto from 'node:crypto';
+import { TOOL_LIMITS } from '../native-wire/consumer-tool-codec.mjs';
 import { plainObject, protocolError, parseBoundedJson, compileToolPolicy, validateToolCall, flattenMessages, buildToolInstruction } from './tool-protocol.mjs';
 import { stripSchemaAnnotations } from './prompt-tool-schema.mjs';
 import { normalizeChatResponseFormat, normalizeResponsesText, buildStructuredOutputInstruction } from './gateway/structured-output.mjs';
@@ -19,6 +20,13 @@ export const NATIVE_MODELS = Object.freeze(['gemini-neon', 'gemini-hydrogen', 'g
 export const MODEL_ALIASES = Object.freeze({ 'gemini-argon': 'gemini-neon' });
 // Native ModeCategory wire values: PRO=3 (Gemini 4 Neon), FAST=1 (Gemini 4 Hydrogen), FLASH_LITE=6. Never auto/Plus.
 export const MODEL_MODES = Object.freeze({ 'gemini-neon': 3, 'gemini-hydrogen': 1, 'gemini-flash-lite': 6 });
+// Shared model metadata source of truth across Gateway (/v1/models), Pi, and OpenClaw.
+export const MODEL_SPECS = Object.freeze({
+  'gemini-neon': Object.freeze({ name: 'Gemini Neon', contextWindow: 512000, maxTokens: 16384, reasoning: true, advertiseContextWindow: true }),
+  'gemini-hydrogen': Object.freeze({ name: 'Gemini Hydrogen', contextWindow: 512000, maxTokens: 16384, reasoning: true, advertiseContextWindow: true }),
+  'gemini-flash-lite': Object.freeze({ name: 'Gemini Flash Lite', contextWindow: 128000, maxTokens: 8192, reasoning: true, advertiseContextWindow: false }),
+  'gemini-auto': Object.freeze({ name: 'Gemini Auto', contextWindow: 128000, maxTokens: 8192, reasoning: false, advertiseContextWindow: false }),
+});
 export function canonicalModel(model) {
   if (typeof model !== 'string') return model;
   const stripped = model.startsWith('models/') ? model.slice(7) : model;
@@ -45,7 +53,10 @@ function thinkingSettings(body) {
 }
 export const PROMPT_MAX_BYTES = 4 * 1024 * 1024;
 export const REQUEST_MAX_NON_IMAGE_BYTES = PROMPT_MAX_BYTES;
+export const MAX_STRIPPED_REASONING_BYTES = 16 * 1024 * 1024;
 export const MAX_MESSAGES = 8192;
+export const CANONICAL_PROMPT_CHARS = Symbol('canonicalPromptChars');
+export const CANONICAL_IMAGE_COUNT = Symbol('canonicalImageCount');
 const REQUEST_MAX_NODES = 131072;
 const configured = Number(process.env.GEMINI_PROMPT_MAX_CHARS);
 const MAX_CHARS = Number.isSafeInteger(configured) && configured > 0 ? Math.min(configured, PROMPT_MAX_BYTES) : PROMPT_MAX_BYTES;
@@ -62,9 +73,10 @@ function keys(value, allowed, prefix = '') {
 // Bound work before compiling schemas, cloning tools or joining text blocks.
 // This is independent of the gateway's raw HTTP body limit.
 function requestBudget(root) {
-  let nodes = 0, bytes = 0, imageBytes = 0, imageCount = 0;
-  // Only declared user-image URL slots get a separate budget, never arbitrary strings.
+  let nodes = 0, bytes = 0, imageBytes = 0, strippedReasoningBytes = 0, imageCount = 0;
+  // Only declared user-image URL slots and stripped reasoning ciphertext get separate budgets.
   const imageSlots = new WeakMap();
+  const strippedSlots = new WeakMap();
   const mark = (part, responses = false) => {
     if (!plainObject(part)) return;
     if ((responses && part.type === 'input_image') || (!responses && part.type === 'image_url')) {
@@ -79,15 +91,19 @@ function requestBudget(root) {
   for (const item of Array.isArray(root.input) ? root.input.slice(0, MAX_MESSAGES) : []) {
     if (item?.type === 'input_image') mark(item, true);
     if (item?.role === 'user' && Array.isArray(item.content) && item.content.length <= 1024) for (const part of item.content) mark(part, true);
+    if ((item?.type === 'function_call_output' || item?.type === 'custom_tool_call_output') && Array.isArray(item.output) && item.output.length <= 1024) for (const part of item.output) mark(part, true);
+    if (plainObject(item) && item.type === 'reasoning') strippedSlots.set(item, 'encrypted_content');
   }
   const ancestors = new Set();
-  const visit = (value, depth, image = false) => {
+  const visit = (value, depth, slot = null) => {
     if (++nodes > REQUEST_MAX_NODES || depth > 32) fail('REQUEST_TOO_LARGE', 413);
     if (typeof value === 'string') {
-      if (image) {
+      if (slot === 'image') {
         const len = Buffer.byteLength(value);
         if (len > MAX_IMAGE_URL_BYTES) fail('IMAGE_TOO_LARGE', 413);
         imageBytes += len;
+      } else if (slot === 'stripped') {
+        strippedReasoningBytes += Buffer.byteLength(value);
       } else bytes += Buffer.byteLength(value);
     }
     else if (value === null || value === undefined || typeof value === 'boolean') bytes += 4;
@@ -105,11 +121,15 @@ function requestBudget(root) {
       } else {
         const entries = Object.entries(value);
         if (entries.length > 4096) fail('REQUEST_TOO_LARGE', 413);
-        for (const [key, child] of entries) { bytes += Buffer.byteLength(key); visit(child, depth + 1, imageSlots.get(value) === key); }
+        for (const [key, child] of entries) {
+          bytes += Buffer.byteLength(key);
+          const childSlot = imageSlots.get(value) === key ? 'image' : strippedSlots.get(value) === key ? 'stripped' : null;
+          visit(child, depth + 1, childSlot);
+        }
       }
       ancestors.delete(value);
     }
-    if (bytes > REQUEST_MAX_NON_IMAGE_BYTES || imageBytes > MAX_TOTAL_IMAGE_URL_BYTES) fail('REQUEST_TOO_LARGE', 413);
+    if (bytes > REQUEST_MAX_NON_IMAGE_BYTES || imageBytes > MAX_TOTAL_IMAGE_URL_BYTES || strippedReasoningBytes > MAX_STRIPPED_REASONING_BYTES) fail('REQUEST_TOO_LARGE', 413);
   };
   visit(root, 0);
 }
@@ -117,6 +137,14 @@ function text(value, { nullable = false } = {}) {
   if (nullable && value === null) return null;
   if (typeof value !== 'string' || Buffer.from(value).toString('utf8') !== value) fail('INVALID_TEXT');
   if (value.length > MAX_CHARS || Buffer.byteLength(value) > PROMPT_MAX_BYTES) fail('PROMPT_TOO_LARGE', 413);
+  return value;
+}
+// Validate UTF-8 and hard byte bounds for stripped replay scratchpad fields
+// without enforcing GEMINI_PROMPT_MAX_CHARS (which bounds rendered prompt text).
+function strippedText(value, param = null) {
+  if (typeof value !== 'string') fail('INVALID_TEXT', 400, param);
+  if (Buffer.byteLength(value) > PROMPT_MAX_BYTES) fail('REQUEST_TOO_LARGE', 413, param);
+  if (Buffer.from(value).toString('utf8') !== value) fail('INVALID_TEXT', 400, param);
   return value;
 }
 function id(value) {
@@ -359,7 +387,7 @@ export function normalizeChatRequest(payload, { allowAutoModel = false } = {}) {
         if (role !== 'assistant' || (message[key] !== null && typeof message[key] !== 'string')) {
           fail('UNSUPPORTED_PARAMETER', 400, `messages.${key}`);
         }
-        if (typeof message[key] === 'string') text(message[key]);
+        if (typeof message[key] === 'string') strippedText(message[key], `messages.${key}`);
       }
     }
     if (message.annotations !== undefined) {
@@ -401,8 +429,58 @@ export function normalizeChatRequest(payload, { allowAutoModel = false } = {}) {
       body.stream_options = { include_usage: payload.stream_options.include_usage };
     }
   }
-  buildCanonicalPrompt(body); // Validate budgets BEFORE any account reservation.
+  const built = buildCanonicalPrompt(body); // Validate budgets BEFORE any account reservation.
+  body[CANONICAL_PROMPT_CHARS] = built.messages.reduce((sum, m) => sum + (typeof m?.content === 'string' ? m.content.length : 0), 0);
+  body[CANONICAL_IMAGE_COUNT] = built.images.length;
   return body;
+}
+
+// Unified OpenAI Responses SDK replay metadata validator (aligned with openai/lib/responses/ResponseInputItems).
+// Keeps inert wire metadata consistent across message, reasoning, tool calls, and tool outputs.
+const MAX_REASONING_PARTS = 256;
+const TOOL_IDENTIFIER_RE = /^[A-Za-z0-9_-]{1,64}$/;
+function validateReplayItemId(value) {
+  if (value === undefined || value === null) return;
+  if (!validBoundedChars(value, 256, 256) || /[\u0000-\u001f\u007f]/.test(value)) {
+    fail('INVALID_INPUT_ITEM', 400, 'input.id');
+  }
+}
+function validateReplayItemMeta(item, { allowCaller = false, allowAsync = false } = {}) {
+  validateReplayItemId(item.id);
+  if (item.status !== undefined && item.status !== null && item.status !== 'completed') {
+    fail('INVALID_INPUT_STATUS', 400, 'input.status');
+  }
+  if (allowCaller && item.caller !== undefined && item.caller !== null) {
+    if (!plainObject(item.caller) || Object.keys(item.caller).some(k => k !== 'type') || item.caller.type !== 'direct') {
+      fail('UNSUPPORTED_PARAMETER', 400, 'input.caller');
+    }
+  }
+  if (allowAsync && item.async !== undefined && item.async !== null && item.async !== false) {
+    fail('UNSUPPORTED_PARAMETER', 400, 'input.async');
+  }
+}
+function validateReasoningItem(item) {
+  keys(item, ['type', 'id', 'status', 'summary', 'content', 'encrypted_content'], 'input');
+  validateReplayItemMeta(item);
+  if (item.summary !== undefined && item.summary !== null) {
+    if (!Array.isArray(item.summary) || item.summary.length > MAX_REASONING_PARTS) fail('INVALID_REASONING_ITEM', 400, 'input.summary');
+    for (const part of item.summary) {
+      keys(part, ['type', 'text'], 'input.summary');
+      if (part.type !== 'summary_text') fail('UNSUPPORTED_CONTENT_TYPE', 400, 'input.summary');
+      strippedText(part.text, 'input.summary');
+    }
+  }
+  if (item.content !== undefined && item.content !== null) {
+    if (!Array.isArray(item.content) || item.content.length > MAX_REASONING_PARTS) fail('INVALID_REASONING_ITEM', 400, 'input.content');
+    for (const part of item.content) {
+      keys(part, ['type', 'text'], 'input.content');
+      if (part.type !== 'reasoning_text') fail('UNSUPPORTED_CONTENT_TYPE', 400, 'input.content');
+      strippedText(part.text, 'input.content');
+    }
+  }
+  if (item.encrypted_content !== undefined && item.encrypted_content !== null) {
+    strippedText(item.encrypted_content, 'input.encrypted_content');
+  }
 }
 
 export function normalizeResponsesRequest(payload, { allowAutoModel = false } = {}) {
@@ -418,33 +496,151 @@ export function normalizeResponsesRequest(payload, { allowAutoModel = false } = 
   if (!Array.isArray(input) || !input.length) fail('INPUT_REQUIRED');
   if (input.length > MAX_MESSAGES) fail('REQUEST_TOO_LARGE', 413, 'input');
   const { tools, choice, callName, identities } = normalizeResponsesTools(payload);
+  const deferredToolImages = [];
+  let toolImageSeq = 0;
+  const openCalls = new Map();
+  const seenCalls = new Set();
+  let hasNormalizedInput = false;
+  const flushToolImages = () => {
+    if (deferredToolImages.length) messages.push({ role: 'user', content: deferredToolImages.splice(0) });
+  };
+  const pushToolOutput = (callId, output) => {
+    if (Array.isArray(output)) {
+      const normalized = content(output, { user: true, responses: true, toolOutput: true, prefix: 'input.output' });
+      if (Array.isArray(normalized)) {
+        const toolTextParts = [];
+        for (const part of normalized) {
+          if (part.type === 'text') {
+            toolTextParts.push(part.text);
+          } else {
+            const label = `[Tool image ${++toolImageSeq} for ${callId}]`;
+            toolTextParts.push(toolTextParts.length ? `\n${label}\n` : label);
+            deferredToolImages.push({ type: 'text', text: `${label}:` }, part);
+          }
+        }
+        messages.push({ role: 'tool', tool_call_id: callId, content: toolTextParts.join('') });
+      } else {
+        messages.push({ role: 'tool', tool_call_id: callId, content: normalized });
+      }
+    } else {
+      messages.push({ role: 'tool', tool_call_id: callId, content: text(output) });
+    }
+  };
   for (const item of input) {
     if (!plainObject(item)) fail('INVALID_INPUT_ITEM');
-    if (item.type === 'function_call') {
-      keys(item, ['type', 'id', 'status', 'call_id', 'namespace', 'name', 'arguments', 'parsed_arguments'], 'input');
-      if (item.parsed_arguments !== undefined && item.parsed_arguments !== null) fail('UNSUPPORTED_PARAMETER', 400, 'input.parsed_arguments');
-      if (item.id !== undefined) id(item.id);
-      if (item.status !== undefined && item.status !== 'completed') fail('INVALID_INPUT_STATUS');
-      const call = { id: id(item.call_id), type: 'function', function: { name: callName(item.name, item.namespace), arguments: item.arguments } };
+    // Replayed reasoning scratchpad items are validated and stripped transparently
+    // without flushing deferred tool images or creating empty assistant messages.
+    if (item.type === 'reasoning') {
+      validateReasoningItem(item);
+      continue;
+    }
+    if (item.type === 'function_call' || item.type === 'custom_tool_call') {
+      flushToolImages();
+      hasNormalizedInput = true;
+      let call;
+      if (item.type === 'function_call') {
+        keys(item, ['type', 'id', 'status', 'call_id', 'namespace', 'name', 'arguments', 'parsed_arguments', 'caller', 'async'], 'input');
+        if (item.parsed_arguments !== undefined && item.parsed_arguments !== null) fail('UNSUPPORTED_PARAMETER', 400, 'input.parsed_arguments');
+        validateReplayItemMeta(item, { allowCaller: true, allowAsync: true });
+        const callId = id(item.call_id);
+        if (seenCalls.has(callId)) fail('INVALID_TOOL_CALL');
+        const resolvedName = callName(item.name, item.namespace);
+        seenCalls.add(callId);
+        openCalls.set(callId, { kind: 'function_call', name: item.name, namespace: item.namespace ?? null });
+        call = { id: callId, type: 'function', function: { name: resolvedName, arguments: item.arguments } };
+      } else {
+        keys(item, ['type', 'id', 'status', 'call_id', 'namespace', 'name', 'input', 'caller', 'async'], 'input');
+        validateReplayItemMeta(item, { allowCaller: true, allowAsync: true });
+        const callId = id(item.call_id);
+        if (seenCalls.has(callId)) fail('INVALID_TOOL_CALL');
+        const rawInput = text(item.input);
+        if (Buffer.byteLength(rawInput, 'utf8') > TOOL_LIMITS.bytes) fail('INVALID_TOOL_ARGUMENTS', 400, 'input.input');
+        const wrapped = JSON.stringify({ input: rawInput });
+        if (Buffer.byteLength(wrapped, 'utf8') > TOOL_LIMITS.bytes) fail('INVALID_TOOL_ARGUMENTS', 400, 'input.input');
+        const resolvedName = callName(item.name, item.namespace);
+        seenCalls.add(callId);
+        openCalls.set(callId, { kind: 'custom_tool_call', name: item.name, namespace: item.namespace ?? null });
+        call = { id: callId, type: 'function', function: { name: resolvedName, arguments: wrapped } };
+      }
       const previous = messages.at(-1);
       if (previous?.role === 'assistant') (previous.tool_calls ??= []).push(call);
       else messages.push({ role: 'assistant', content: null, tool_calls: [call] });
-    } else if (item.type === 'function_call_output') {
-      keys(item, ['type', 'id', 'call_id', 'output'], 'input');
-      if (item.id !== undefined) id(item.id);
-      messages.push({ role: 'tool', tool_call_id: id(item.call_id), content: text(item.output) });
+    } else if (item.type === 'function_call_output' || item.type === 'custom_tool_call_output') {
+      hasNormalizedInput = true;
+      const isFunctionOutput = item.type === 'function_call_output';
+      keys(
+        item,
+        isFunctionOutput
+          ? ['type', 'id', 'status', 'call_id', 'output', 'caller', 'name', 'namespace']
+          : ['type', 'id', 'status', 'call_id', 'output', 'caller'],
+        'input',
+      );
+      validateReplayItemMeta(item, { allowCaller: true });
+      if (isFunctionOutput) {
+        if (item.name !== undefined && item.name !== null && (typeof item.name !== 'string' || !TOOL_IDENTIFIER_RE.test(item.name))) {
+          fail('INVALID_TOOL_RESULT', 400, 'input.name');
+        }
+        if (item.namespace !== undefined && item.namespace !== null && (typeof item.namespace !== 'string' || !TOOL_IDENTIFIER_RE.test(item.namespace))) {
+          fail('INVALID_TOOL_RESULT', 400, 'input.namespace');
+        }
+      }
+      const callId = id(item.call_id);
+      const expectedKind = isFunctionOutput ? 'function_call' : 'custom_tool_call';
+      const openCall = openCalls.get(callId);
+      if (openCall !== undefined && openCall.kind !== expectedKind) fail('INVALID_TOOL_RESULT');
+      if (openCall === undefined) {
+        // Avoid decoding base64/PNG images on unlinked outputs; normalizeChatRequest will reject
+        // the orphan call_id with INVALID_TOOL_RESULT after validating earlier call arguments.
+        messages.push({ role: 'tool', tool_call_id: callId, content: '' });
+      } else {
+        if (isFunctionOutput) {
+          if (item.name !== undefined && item.name !== null && item.name !== openCall.name) {
+            fail('INVALID_TOOL_RESULT', 400, 'input.name');
+          }
+          if (item.namespace !== undefined && item.namespace !== null && item.namespace !== openCall.namespace) {
+            fail('INVALID_TOOL_RESULT', 400, 'input.namespace');
+          }
+        }
+        openCalls.delete(callId);
+        pushToolOutput(callId, item.output);
+      }
     } else if (item.type === 'input_text') {
+      flushToolImages();
+      hasNormalizedInput = true;
       keys(item, ['type', 'text'], 'input'); messages.push({ role: 'user', content: text(item.text) });
     } else if (item.type === 'input_image') {
+      flushToolImages();
+      hasNormalizedInput = true;
       messages.push({ role: 'user', content: content([item], { user: true, responses: true, prefix: 'input' }) });
+    } else if (item.type === undefined || item.type === 'message') {
+      flushToolImages();
+      hasNormalizedInput = true;
+      keys(item, ['type', 'id', 'status', 'role', 'content', 'phase'], 'input');
+      validateReplayItemMeta(item);
+      if (item.phase !== undefined && item.phase !== null) {
+        if (item.role !== 'assistant' || !['commentary', 'final_answer'].includes(item.phase)) {
+          fail('UNSUPPORTED_PARAMETER', 400, 'input.phase');
+        }
+      }
+      const normalizedContent = content(item.content, { assistant: item.role === 'assistant', user: item.role === 'user', responses: true, prefix: 'input.content' });
+      const previous = messages.at(-1);
+      // A single OpenAI Responses turn can interleave assistant commentary messages
+      // with parallel tool calls before tool outputs arrive; coalesce assistant text
+      // onto the open assistant turn so sibling calls stay in one tool batch.
+      if (openCalls.size > 0 && item.role === 'assistant' && previous?.role === 'assistant') {
+        if (typeof normalizedContent === 'string' && normalizedContent.length) {
+          previous.content = previous.content ? `${previous.content}\n${normalizedContent}` : normalizedContent;
+        }
+      } else {
+        messages.push({ role: item.role, content: normalizedContent });
+      }
     } else {
-      keys(item, ['type', 'id', 'status', 'role', 'content'], 'input');
-      if (item.type !== undefined && item.type !== 'message') fail('UNSUPPORTED_INPUT_TYPE');
-      if (item.id !== undefined) id(item.id);
-      if (item.status !== undefined && (item.role !== 'assistant' || item.status !== 'completed')) fail('INVALID_INPUT_STATUS');
-      messages.push({ role: item.role, content: content(item.content, { assistant: item.role === 'assistant', user: item.role === 'user', responses: true, prefix: 'input.content' }) });
+      fail('UNSUPPORTED_INPUT_TYPE', 400, 'input.type');
     }
   }
+  flushToolImages();
+  if (!hasNormalizedInput) fail('INPUT_REQUIRED', 400, 'input');
+  if (messages.length > MAX_MESSAGES) fail('REQUEST_TOO_LARGE', 413, 'input');
   const { include: _include, ...inertCompat } = compat;
   const body = normalizeChatRequest({ ...resolved, ...inertCompat, ...(response_format ? { response_format } : {}), messages, tools, tool_choice: choice, [RESPONSE_TOOL_IDENTITIES]: identities }, { allowAutoModel });
   const projected = collectImageInputs(body.messages).messages;

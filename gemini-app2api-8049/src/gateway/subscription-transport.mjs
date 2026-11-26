@@ -1,6 +1,7 @@
 // Read-only GetUsageInfo tier lookup. No generation, quota mutation, terms acceptance or retry.
 import http2 from 'node:http2';
 import { GrpcMessageReader, frameGrpcMessage } from '../../native-wire/robin-current.mjs';
+const GATEWAY_USER_AGENT = 'gemini-app2api/1.0';
 import { buildSubscriptionRequest } from './subscription.mjs';
 import { connectHttp2 } from './outbound-proxy.mjs';
 export const SUBSCRIPTION_ORIGIN = 'https://robinfrontend-pa.googleapis.com';
@@ -53,7 +54,7 @@ export async function fetchGoogleSubscription(accessToken, { signal, timeoutMs =
     try {
       client = connect(SUBSCRIPTION_ORIGIN); client.on('error', () => finish(failure('SUBSCRIPTION_CONNECTION_FAILED')));
       request = client.request({ ':method': 'POST', ':path': SUBSCRIPTION_RPC, authorization: 'Bearer ' + accessToken,
-        'content-type': 'application/grpc', te: 'trailers', 'grpc-timeout': timeoutMs + 'm', 'user-agent': 'gemini-app2api/1.0' });
+        'content-type': 'application/grpc', te: 'trailers', 'grpc-timeout': timeoutMs + 'm', 'user-agent': GATEWAY_USER_AGENT });
       request.on('response', status); request.on('trailers', status);
       request.on('data', chunk => {
         if (settled) return;

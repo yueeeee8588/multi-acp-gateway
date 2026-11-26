@@ -5,6 +5,7 @@ import { getConfig } from "../config/settings";
 import { store, type GatewayStore } from "../db/store";
 import { eventBus } from "../logs/events";
 import type { AccountRecord, CooldownRecord, RoutingStrategy } from "../types";
+import { hasFlagshipModelAccess } from "./quota";
 
 export const CACHE_WORTH_TOKENS = 1024;
 export const HEAVY_COLD_PROMPT_TOKENS = 16000;
@@ -46,11 +47,10 @@ function readAccessTokenExpiryMs(homeDir: string): number | null {
   return null;
 }
 
-/** 判断是否为拥有 gemini_flagship 配额桶的非特价完整 Pro 账号。 */
+/** 判断是否为拥有旗舰模型（Argon）访问权限的非特价完整 Pro 账号。 */
 export function isFullProAccount(account: AccountRecord): boolean {
   if (account.tier !== "pro") return false;
-  const flagship = account.quota?.pools?.gemini_flagship;
-  return flagship !== null && flagship !== undefined && typeof flagship === "object" && !Array.isArray(flagship);
+  return hasFlagshipModelAccess(account.quota);
 }
 
 export interface StickyEntry {

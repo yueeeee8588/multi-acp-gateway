@@ -110,6 +110,7 @@ export interface AcpTransport {
   cancel(sessionId: string): Promise<void>;
   close(): Promise<void>;
   isAlive(): boolean;
+  onStderr?(handler: (chunk: string) => void): void;
 }
 
 export type AcpTransportFactory = (opts: {
@@ -119,6 +120,7 @@ export type AcpTransportFactory = (opts: {
   env: Record<string, string>;
   onUpdate: (params: Record<string, unknown>) => void;
   onExit: (code: number | null, stderr: string) => void;
+  onStderr?: (chunk: string) => void;
 }) => AcpTransport;
 
 export interface PrewarmedTransportOptions {
@@ -258,6 +260,7 @@ export function defaultTransportFactory(opts: {
   env: Record<string, string>;
   onUpdate: (params: Record<string, unknown>) => void;
   onExit: (code: number | null, stderr: string) => void;
+  onStderr?: (chunk: string) => void;
 }): AcpTransport {
   const conn = new AcpConnection({
     binaryPath: opts.binaryPath,
@@ -266,6 +269,7 @@ export function defaultTransportFactory(opts: {
     env: opts.env,
     onUpdate: opts.onUpdate,
     onExit: opts.onExit,
+    onStderr: opts.onStderr,
   });
 
   return {
@@ -281,6 +285,7 @@ export function defaultTransportFactory(opts: {
       conn.close();
     },
     isAlive: () => conn.isAlive,
+    onStderr: (handler) => conn.onStderr(handler),
   };
 }
 
@@ -533,6 +538,8 @@ export class AgySessionWorker {
   private activeTurnPromptStartMs: number | null = null;
   private modelSelection: WorkerModelSelection = {};
   private verifyingModel = false;
+  private stderrBuffer = "";
+  private stderrAbortTriggered = false;
   private stepUsageCursorState: {
     sessionId: string;
     dbPath: string;
@@ -617,6 +624,12 @@ export class AgySessionWorker {
     accountOverride?: AccountRecord,
   ): boolean {
     if (!this.isAlive) return false;
+    if (
+      accountOverride &&
+      (accountOverride.id !== this.account.id || accountOverride.homeDir !== this.account.homeDir)
+    ) {
+      return false;
+    }
     const config = configSnapshot ?? getConfig();
     const gatewayConfig =
       configSnapshot && "defaultProxy" in configSnapshot && typeof configSnapshot.defaultProxy === "string"
@@ -709,6 +722,8 @@ export class AgySessionWorker {
     this.lastUsedAt = Date.now();
     this.activeTurnParts = [];
     this.internal429RetryCount = 0;
+    this.stderrBuffer = "";
+    this.stderrAbortTriggered = false;
     this.activeTurnCallbacks = callbacks;
     this.activeTurnTimings = {
       coldStart: false,
@@ -1070,6 +1085,8 @@ export class AgySessionWorker {
       this.activeSoftErrorAbort = undefined;
       this.activeToolBatchResolve = undefined;
       this.activeTurnCallbacks = undefined;
+      this.stderrBuffer = "";
+      this.stderrAbortTriggered = false;
       this.busy = false;
     }
   }
@@ -1151,6 +1168,7 @@ export class AgySessionWorker {
         onExit: (code, stderr) => this.handleExit(code, stderr),
       });
       this.transport = prewarmed.transport;
+      this.transport.onStderr?.((chunk) => this.handleStderrChunk(chunk));
       this.boundProxyUrl = prewarmed.boundProxyUrl;
       initCaps = prewarmed.initCaps;
     } else {
@@ -1204,7 +1222,9 @@ export class AgySessionWorker {
         env,
         onUpdate: (params) => this.handleUpdate(params),
         onExit: (code, stderr) => this.handleExit(code, stderr),
+        onStderr: (chunk) => this.handleStderrChunk(chunk),
       });
+      this.transport.onStderr?.((chunk) => this.handleStderrChunk(chunk));
       this.activeTurnTimings.spawnMs = roundMs(performance.now() - spawnStart);
 
       const initStart = performance.now();
@@ -1255,6 +1275,7 @@ export class AgySessionWorker {
       if (!supportsResume) return false;
       if (typeof this.transport?.resumeSession !== "function") return false;
       if (persisted.model && persisted.model !== this.model) return false;
+      if (persisted.accountId && persisted.accountId !== this.account.id) return false;
       if (nextSensitiveFingerprint !== (persisted.sensitiveFilterFingerprint ?? "")) {
         return false;
       }
@@ -1525,6 +1546,32 @@ export class AgySessionWorker {
     return true;
   }
 
+  private handleStderrChunk(chunk: string): void {
+    if (!chunk) return;
+    if (!this.busy || this.stderrAbortTriggered) return;
+    if (!this.activeSoftErrorAbort) return;
+    if (this.activeTurnParts.some(isEffectiveOutputPart)) return;
+
+    this.stderrBuffer += chunk;
+    if (this.stderrBuffer.length > 4096) {
+      this.stderrBuffer = this.stderrBuffer.slice(-4096);
+    }
+
+    const classified = classifyUpstreamError(this.stderrBuffer);
+    if (classified?.code === "CAPACITY_UNAVAILABLE") {
+      this.stderrAbortTriggered = true;
+      const line =
+        this.stderrBuffer
+          .split(/\r?\n/)
+          .map((l) => l.trim())
+          .filter(Boolean)
+          .find((l) => classifyUpstreamError(l)?.code === "CAPACITY_UNAVAILABLE") ??
+        this.stderrBuffer.trim();
+      this.stderrBuffer = "";
+      this.abortTurnImmediately(line, classified);
+    }
+  }
+
   private abortTurnImmediately(
     rawText: string,
     classified: { code: WorkerErrorCode; upstreamStatus: number; retryAfterMs?: number },
@@ -1612,6 +1659,8 @@ export class AgySessionWorker {
     this.inFlightPromptPromise = null;
     this.activeTurnOpen = false;
     this.internal429RetryCount = 0;
+    this.stderrBuffer = "";
+    this.stderrAbortTriggered = false;
     this.unemittedToolCalls = [];
     this.activeToolBatchResolve = undefined;
     this.awaitingTools.clear();

@@ -22,8 +22,9 @@ export function normalizeResponsesTools(payload) {
   if (Buffer.byteLength(JSON.stringify(source)) > PROMPT_TOOL_LIMITS.declarationBytes) fail('TOOL_SIZE_LIMIT', 'tools.bytes');
   const declarations = [], namespaces = new Set(), reserved = new Set(), identities = new Map(), aliases = new Map();
   const add = (tool, namespace, description) => {
-    keys(tool, ['type', 'name', 'description', 'parameters', 'strict']);
+    if (!plainObject(tool)) fail('INVALID_TOOL_DECLARATION');
     if (tool.type !== 'function') fail('UNSUPPORTED_TOOL_TYPE');
+    keys(tool, ['type', 'name', 'description', 'parameters', 'strict']);
     name(tool.name);
     if (tool.description !== undefined && typeof tool.description !== 'string') fail('INVALID_TOOL_DECLARATION');
     if (declarations.length >= PROMPT_TOOL_LIMITS.tools) fail('TOOL_SIZE_LIMIT', 'tools.count');
@@ -42,7 +43,7 @@ export function normalizeResponsesTools(payload) {
   // Reserve historical flat names too: an undeclared old call must not alias a
   // currently declared namespace tool. History is not current authorization.
   for (const item of Array.isArray(payload.input) ? payload.input : []) {
-    if (item?.type === 'function_call' && item.namespace == null && typeof item.name === 'string') reserved.add(item.name);
+    if ((item?.type === 'function_call' || item?.type === 'custom_tool_call') && item.namespace == null && typeof item.name === 'string') reserved.add(item.name);
   }
   let nextAlias = 0;
   const callName = (toolName, namespace) => {

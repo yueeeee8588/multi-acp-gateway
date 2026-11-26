@@ -65,4 +65,65 @@ describe('acp/schema-sanitizer', () => {
     expect(sanitizedLong2.length).toBeLessThanOrEqual(64);
     expect(sanitizedLong2).not.toBe(sanitizedLong);
   });
+
+  it('strips toolSummary from top-level required while preserving properties.toolSummary and setting expectsToolSummary', () => {
+    const result = sanitizeToolDeclarations([
+      {
+        name: 'run_command',
+        description: 'Run a shell command',
+        parameters: {
+          type: 'object',
+          properties: {
+            command: { type: 'string' },
+            toolSummary: { type: 'string', description: 'Short summary' },
+          },
+          required: ['command', 'toolSummary'],
+        },
+      },
+      {
+        name: 'custom_only_summary',
+        description: 'Tool whose only required field is toolSummary',
+        parameters: {
+          type: 'object',
+          properties: {
+            toolSummary: { type: 'string' },
+            optionalFlag: { type: 'boolean' },
+          },
+          required: ['toolSummary'],
+        },
+      },
+      {
+        name: 'plain_tool',
+        description: 'Tool without toolSummary',
+        parameters: {
+          type: 'object',
+          properties: {
+            query: { type: 'string' },
+          },
+          required: ['query'],
+        },
+      },
+    ]);
+
+    expect(result.tools.length).toBe(3);
+
+    const runCmd = result.tools[0]!;
+    expect(runCmd.expectsToolSummary).toBe(true);
+    expect((runCmd.inputSchema.properties as Record<string, unknown>).toolSummary).toEqual({
+      type: 'string',
+      description: 'Short summary',
+    });
+    expect(runCmd.inputSchema.required).toEqual(['command']);
+
+    const onlySummary = result.tools[1]!;
+    expect(onlySummary.expectsToolSummary).toBe(true);
+    expect((onlySummary.inputSchema.properties as Record<string, unknown>).toolSummary).toEqual({
+      type: 'string',
+    });
+    expect(onlySummary.inputSchema.required).toBeUndefined();
+
+    const plain = result.tools[2]!;
+    expect(plain.expectsToolSummary).toBe(false);
+    expect(plain.inputSchema.required).toEqual(['query']);
+  });
 });

@@ -120,7 +120,6 @@ function classifyName(name: string): QuotaPoolKey | null {
   const words = labelWords(cleaned);
   if (!words || /\bembeddings?\b/.test(words)) return null;
   if (/(?:claude|opus|sonnet|haiku|gpt)/i.test(cleaned)) return 'third_party';
-  if (/argon/i.test(cleaned)) return 'gemini_flagship';
   if (/^(?:gemini|image|imagen)\b/.test(words)) return 'gemini_flash';
   return null;
 }
@@ -142,9 +141,25 @@ function classifyExplicitPool(
     const cleaned = name.replace(/^models\//i, '').trim();
     if (!cleaned) continue;
     if (/(?:claude|opus|sonnet|haiku|gpt)/i.test(cleaned)) return 'third_party';
-    if (/argon/i.test(cleaned)) return 'gemini_flagship';
   }
   return null;
+}
+
+/** 判断账号配额快照中是否包含旗舰模型（Argon）访问权限。 */
+export function hasFlagshipModelAccess(quota?: AccountQuotaSnapshot | null): boolean {
+  const flagship = quota?.pools?.gemini_flagship;
+  if (flagship !== null && flagship !== undefined && typeof flagship === 'object' && !Array.isArray(flagship)) {
+    return true;
+  }
+  const flashModels = quota?.pools?.gemini_flash?.models;
+  if (Array.isArray(flashModels)) {
+    return flashModels.some(
+      (model) =>
+        (typeof model?.id === 'string' && /argon/i.test(model.id)) ||
+        (typeof model?.displayName === 'string' && /argon/i.test(model.displayName))
+    );
+  }
+  return false;
 }
 
 /** 将模型 ID 或展示名称归类到三号池之一。 */

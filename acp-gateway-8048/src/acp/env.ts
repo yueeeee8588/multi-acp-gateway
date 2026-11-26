@@ -12,6 +12,8 @@ export interface BuildIsolatedAgyEnvOptions {
   proxyUrl?: string;
   agyPath?: string;
   dataRoot?: string;
+  /** 允许 CLI 拉起浏览器（仅用于交互式登录，后台 Worker 默认禁止） */
+  allowBrowser?: boolean;
 }
 
 export interface BuildAgyWorkerArgsOptions {
@@ -246,19 +248,24 @@ export function buildIsolatedAgyEnv(opts: BuildIsolatedAgyEnvOptions): Record<st
   env.XDG_CACHE_HOME = path.join(homeDir, ".cache");
   env.XDG_STATE_HOME = path.join(homeDir, ".local", "state");
   env.XDG_DATA_HOME = path.join(homeDir, ".local", "share");
-  env.SSH_CONNECTION = "127.0.0.1 0 127.0.0.1 22";
   env.AGY_CLI_DISABLE_AUTO_UPDATE = "true";
-  env.BROWSER = "/usr/bin/false";
+
+  if (opts.allowBrowser !== true) {
+    env.SSH_CONNECTION = "127.0.0.1 0 127.0.0.1 22";
+    env.BROWSER = "/usr/bin/false";
+  }
 
   if (opts.agyPath) {
     env.AGY_PATH = opts.agyPath;
   }
 
-  const shimDir = getBrowserShimDir(opts.dataRoot);
-  const currentPath = env.PATH ?? env.Path ?? HOST_PATH;
-  env.PATH = currentPath ? `${shimDir}${path.delimiter}${currentPath}` : shimDir;
-  if (process.platform === "win32" && "Path" in env) {
-    env.Path = env.PATH;
+  if (opts.allowBrowser !== true) {
+    const shimDir = getBrowserShimDir(opts.dataRoot);
+    const currentPath = env.PATH ?? env.Path ?? HOST_PATH;
+    env.PATH = currentPath ? `${shimDir}${path.delimiter}${currentPath}` : shimDir;
+    if (process.platform === "win32" && "Path" in env) {
+      env.Path = env.PATH;
+    }
   }
 
   const normalizedProxy = opts.proxyUrl?.trim();
@@ -276,6 +283,19 @@ export function buildIsolatedAgyEnv(opts: BuildIsolatedAgyEnvOptions): Record<st
   }
 
   return env;
+}
+
+/** 构造交互式 `agy acp --login` 参数，确保认证写入账号隔离目录。 */
+export function buildAgyLoginArgs(homeDir: string): string[] {
+  const resolvedHome = path.resolve(homeDir);
+  return [
+    "acp",
+    "--login",
+    "--gemini-dir",
+    path.join(resolvedHome, ".gemini"),
+    "--app-data-dir",
+    "antigravity-cli",
+  ];
 }
 
 export function buildAgyWorkerArgs(opts: BuildAgyWorkerArgsOptions): string[] {

@@ -82,11 +82,18 @@ type StatusFilter = "all" | "ready" | "cooldown" | "attention";
 type AccountTierBucket = "pro_flagship" | "pro_special" | "standard";
 type TierFilter = "all" | AccountTierBucket;
 
+function hasFlagshipModelAccess(acc: AccountRecord): boolean {
+  if (Boolean(acc.quota?.pools?.gemini_flagship)) return true;
+  const flashModels = acc.quota?.pools?.gemini_flash?.models;
+  if (!Array.isArray(flashModels)) return false;
+  return flashModels.some(
+    (m) => Boolean(m) && (/argon/i.test(m.id) || /argon/i.test(m.displayName ?? ""))
+  );
+}
+
 function getAccountTierBucket(acc: AccountRecord): AccountTierBucket {
   if (acc.tier !== "pro") return "standard";
-  return Boolean(acc.quota?.pools?.gemini_flagship)
-    ? "pro_flagship"
-    : "pro_special";
+  return hasFlagshipModelAccess(acc) ? "pro_flagship" : "pro_special";
 }
 
 function renderTierBadge(tierBucket: AccountTierBucket) {
@@ -303,7 +310,7 @@ function AcpQuotaCell({
     <>
       {hasQuota && (
         <div
-          aria-label="三号池剩余用量"
+          aria-label="配额池剩余用量"
           style={{
             display: "grid",
             gridTemplateColumns: "repeat(2, minmax(0, 1fr))",

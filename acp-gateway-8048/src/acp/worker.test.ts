@@ -898,4 +898,67 @@ describe("AgySessionWorker slot B optimizations", () => {
       await mcpServer.stop();
     }
   });
+
+  test("canReuse returns false when accountOverride has different id or homeDir", async () => {
+    const mcpServer = new LoopbackMcpServer();
+    await mcpServer.start();
+
+    const baseAccount: AccountRecord = {
+      ...makeUsageAccount(),
+      id: "acc-reuse-1",
+      homeDir: "C:/homes/acc-1",
+      proxyUrl: "",
+    };
+
+    const worker = new AgySessionWorker({
+      account: baseAccount,
+      model: "gemini-4-hydrogen-medium",
+      workspaceDir: "unused",
+      mcpServer,
+      transportFactory: ({ onUpdate }): AcpTransport => ({
+        initialize: async () => ({ ok: true }),
+        newSession: async () => ({ sessionId: "sess-reuse-account-guard" }),
+        setModel: async () => ({}),
+        prompt: async () => {
+          onUpdate({
+            sessionId: "sess-reuse-account-guard",
+            update: {
+              sessionUpdate: "agent_message_chunk",
+              content: { type: "text", text: "ok" },
+            },
+          });
+          return { stopReason: "end_turn" };
+        },
+        cancel: async () => {},
+        close: async () => {},
+        isAlive: () => true,
+      }),
+    });
+
+    try {
+      const req1: GeminiGenerateRequest = {
+        contents: [{ role: "user", parts: [{ text: "hello" }] }],
+      };
+      await worker.executePrompt(req1);
+
+      const nextReq: GeminiGenerateRequest = {
+        contents: [
+          ...req1.contents,
+          { role: "model", parts: [{ text: "ok" }] },
+          { role: "user", parts: [{ text: "follow up" }] },
+        ],
+      };
+
+      expect(worker.canReuse(nextReq, undefined, baseAccount)).toBe(true);
+      expect(
+        worker.canReuse(nextReq, undefined, { ...baseAccount, id: "acc-reuse-2" }),
+      ).toBe(false);
+      expect(
+        worker.canReuse(nextReq, undefined, { ...baseAccount, homeDir: "C:/homes/acc-2" }),
+      ).toBe(false);
+    } finally {
+      await worker.resetAndClose();
+      await mcpServer.stop();
+    }
+  });
 });

@@ -14,6 +14,7 @@ export interface SanitizedToolDefinition {
   mcpName: string;
   description: string;
   inputSchema: JsonSchema;
+  expectsToolSummary?: boolean;
 }
 
 export interface SanitizedToolsResult {
@@ -272,10 +273,11 @@ export function sanitizeToolDeclarations(
     if (!isObject(sanitized.properties)) {
       sanitized.properties = {};
     }
+    const props = sanitized.properties as Record<string, unknown>;
+    const expectsToolSummary = Object.hasOwn(props, "toolSummary");
     if (Array.isArray(sanitized.required)) {
-      const props = sanitized.properties as Record<string, unknown>;
       sanitized.required = sanitized.required.filter(
-        (r): r is string => typeof r === "string" && Object.hasOwn(props, r),
+        (r): r is string => typeof r === "string" && r !== "toolSummary" && Object.hasOwn(props, r),
       );
       if ((sanitized.required as string[]).length === 0) {
         delete sanitized.required;
@@ -287,6 +289,7 @@ export function sanitizeToolDeclarations(
       mcpName,
       description: typeof decl.description === "string" ? decl.description : "",
       inputSchema: sanitized,
+      expectsToolSummary,
     });
   }
 

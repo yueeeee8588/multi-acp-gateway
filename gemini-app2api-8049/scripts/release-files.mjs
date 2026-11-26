@@ -40,6 +40,8 @@ const fixed = [
   "src/prompt-tool-schema.mjs",
   "src/openai-contract.mjs",
   "src/openai-usage.mjs",
+  "src/gemini-contract.mjs",
+  "src/Google-contract.mjs",
   "src/responses-tool-namespaces.mjs",
   "src/image-input.mjs",
   "src/image-url.mjs",

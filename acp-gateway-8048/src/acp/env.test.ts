@@ -3,7 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { DEFAULT_CONFIG } from "../config/settings";
-import { resolveOfficialAgyBinary } from "./env";
+import { buildAgyLoginArgs, buildIsolatedAgyEnv, getBrowserShimDir, resolveOfficialAgyBinary } from "./env";
 
 const tempDirs: string[] = [];
 
@@ -28,6 +28,8 @@ const originalEnv = {
   HOME: process.env.HOME,
   ProgramFiles: process.env.ProgramFiles,
   "ProgramFiles(x86)": process.env["ProgramFiles(x86)"],
+  SSH_CONNECTION: process.env.SSH_CONNECTION,
+  BROWSER: process.env.BROWSER,
 };
 
 afterEach(() => {
@@ -141,5 +143,57 @@ describe("resolveOfficialAgyBinary", () => {
     fs.rmSync(pfX86, { recursive: true, force: true });
     const portableBin = touchBinary(path.join(process.env.HOME, "Desktop", "agy", "bin"));
     expect(resolveOfficialAgyBinary("")).toBe(portableBin);
+  });
+});
+
+describe("buildIsolatedAgyEnv", () => {
+  test("blocks browser by default and when allowBrowser is false", () => {
+    const root = makeTempDir("agy-env-default-");
+    const homeDir = path.join(root, "home");
+    const dataRoot = path.join(root, "data");
+    const expectedShimDir = getBrowserShimDir(dataRoot);
+
+    for (const allowBrowser of [undefined, false] as const) {
+      const env = buildIsolatedAgyEnv({ homeDir, dataRoot, allowBrowser });
+      expect(env.BROWSER).toBe("/usr/bin/false");
+      expect(env.SSH_CONNECTION).toBe("127.0.0.1 0 127.0.0.1 22");
+      expect(env.PATH.startsWith(`${expectedShimDir}${path.delimiter}`)).toBe(true);
+      if (process.platform === "win32" && "Path" in env) {
+        expect(env.Path).toBe(env.PATH);
+      }
+    }
+  });
+
+  test("allows browser and skips SSH_CONNECTION / bin-shims when allowBrowser is true", () => {
+    const root = makeTempDir("agy-env-browser-");
+    const homeDir = path.join(root, "home");
+    const dataRoot = path.join(root, "data");
+    const expectedShimDir = path.join(dataRoot, "bin-shims");
+
+    delete process.env.SSH_CONNECTION;
+    delete process.env.BROWSER;
+
+    const env = buildIsolatedAgyEnv({ homeDir, dataRoot, allowBrowser: true });
+    expect(env.BROWSER).toBeUndefined();
+    expect(env.SSH_CONNECTION).toBeUndefined();
+    expect(env.PATH.startsWith(`${expectedShimDir}${path.delimiter}`)).toBe(false);
+    if (process.platform === "win32" && "Path" in env) {
+      expect(env.Path.startsWith(`${expectedShimDir}${path.delimiter}`)).toBe(false);
+    }
+  });
+});
+
+describe("buildAgyLoginArgs", () => {
+  test("returns acp --login with isolated gemini-dir and app-data-dir", () => {
+    const root = makeTempDir("agy-login-args-");
+    const homeDir = path.join(root, "acc-home");
+    expect(buildAgyLoginArgs(homeDir)).toEqual([
+      "acp",
+      "--login",
+      "--gemini-dir",
+      path.join(path.resolve(homeDir), ".gemini"),
+      "--app-data-dir",
+      "antigravity-cli",
+    ]);
   });
 });

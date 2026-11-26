@@ -61,7 +61,6 @@ function currentStoredSettings(input) {
   if (current.maxBodyBytes === LEGACY_DEFAULT_MAX_BODY_BYTES) current.maxBodyBytes = defaults.maxBodyBytes;
   return current;
 }
-const isWin32 = process.platform === "win32";
 export const defaults = Object.freeze({
   host: "127.0.0.1",
   port: 8049,
@@ -132,6 +131,115 @@ const equal = (a, b) =>
   typeof b === "string" &&
   a.length === b.length &&
   crypto.timingSafeEqual(Buffer.from(a), Buffer.from(b));
+const IS_WIN32 = process.platform === "win32";
+export const UV_FS_O_EXLOCK = fs.constants.UV_FS_O_EXLOCK ?? 0x10000000;
+const WIN32_PAUSE_BUF = typeof SharedArrayBuffer === "function" ? new Int32Array(new SharedArrayBuffer(4)) : null;
+function pauseSync(ms) {
+  if (WIN32_PAUSE_BUF && ms > 0) Atomics.wait(WIN32_PAUSE_BUF, 0, 0, ms);
+}
+export function restrictWin32DirectoryAcl(directory, { spawn = spawnSync, env = process.env } = {}) {
+  try {
+    const sysRoot = env?.SystemRoot || env?.WINDIR || "C:\\Windows";
+    const whoamiExe = path.win32.join(sysRoot, "System32", "whoami.exe");
+    const icaclsExe = path.win32.join(sysRoot, "System32", "icacls.exe");
+    const whoami = spawn(whoamiExe, ["/user", "/fo", "csv", "/nh"], {
+      encoding: "utf8",
+      timeout: 5000,
+      windowsHide: true,
+    });
+    if (whoami.error || whoami.status !== 0) return { applied: false };
+    const line = (whoami.stdout ?? "").trim().split(/\r?\n/)[0] ?? "";
+    const match = line.match(/,(?:"?)(S-1-[0-9]+(?:-[0-9]+)+)(?:"?)\s*$/);
+    if (!match) return { applied: false };
+    const sid = match[1];
+    const icacls = spawn(
+      icaclsExe,
+      [
+        directory,
+        "/inheritance:r",
+        "/grant:r",
+        "*S-1-5-18:(OI)(CI)F",
+        "*S-1-5-32-544:(OI)(CI)F",
+        `*${sid}:(OI)(CI)F`,
+      ],
+      { encoding: "utf8", timeout: 5000, windowsHide: true },
+    );
+    return { applied: !icacls.error && icacls.status === 0, sid };
+  } catch {
+    return { applied: false };
+  }
+}
+export function tryAcquireWin32KernelLock(directory, { fsImpl = fs } = {}) {
+  const lockFile = path.join(directory, ".state.lock");
+  try {
+    const existing = fsImpl.lstatSync(lockFile);
+    if (existing.isSymbolicLink() || !existing.isFile() || existing.nlink !== 1) {
+      throw fault("UNSAFE_STATE_PERMISSIONS", 503);
+    }
+  } catch (error) {
+    if (error?.code === "UNSAFE_STATE_PERMISSIONS") throw error;
+    if (error?.code !== "ENOENT") {
+      if (error?.code === "EBUSY") return { status: "contended" };
+      if (error?.code === "EACCES" || error?.code === "EPERM") return { status: "denied" };
+      return { status: "failed" };
+    }
+  }
+  const exlockFlag = fsImpl.constants?.UV_FS_O_EXLOCK ?? UV_FS_O_EXLOCK;
+  const openFlags =
+    (fsImpl.constants?.O_RDWR ?? fs.constants.O_RDWR) |
+    (fsImpl.constants?.O_CREAT ?? fs.constants.O_CREAT) |
+    exlockFlag;
+  let fd;
+  try {
+    fd = fsImpl.openSync(lockFile, openFlags, 0o600);
+  } catch (error) {
+    if (error?.code === "EBUSY") return { status: "contended" };
+    if (error?.code === "EACCES" || error?.code === "EPERM") return { status: "denied" };
+    return { status: "failed" };
+  }
+  try {
+    const st = fsImpl.fstatSync(fd);
+    if (!st.isFile() || st.nlink !== 1) {
+      throw fault("UNSAFE_STATE_PERMISSIONS", 503);
+    }
+    // Fail-closed self-probe: verify OS kernel exclusivity (CreateFileW dwShareMode = 0)
+    // is genuinely enforced by confirming a second open fails specifically with EBUSY
+    // (ERROR_SHARING_VIOLATION). Never certify on EACCES/EPERM/EAGAIN.
+    let probeFd;
+    let probeBlocked = false;
+    try {
+      probeFd = fsImpl.openSync(lockFile, fsImpl.constants?.O_RDONLY ?? fs.constants.O_RDONLY);
+    } catch (error) {
+      if (error?.code === "EBUSY") {
+        probeBlocked = true;
+      }
+    } finally {
+      if (probeFd !== undefined) {
+        try { fsImpl.closeSync(probeFd); } catch {}
+      }
+    }
+    if (!probeBlocked) {
+      try { fsImpl.closeSync(fd); } catch {}
+      return { status: "unsupported" };
+    }
+    return { status: "acquired", fd };
+  } catch (error) {
+    try { fsImpl.closeSync(fd); } catch {}
+    throw error;
+  }
+}
+export function renameWithWin32Retry(temp, target, { fsImpl = fs, sleep = pauseSync, attempts = 4, delayMs = 15 } = {}) {
+  for (let i = 0; i < attempts; i++) {
+    try {
+      fsImpl.renameSync(temp, target);
+      return;
+    } catch (error) {
+      const transient = ["EPERM", "EACCES", "EBUSY"].includes(error?.code);
+      if (!transient || i + 1 >= attempts) throw error;
+      sleep(delayMs);
+    }
+  }
+}
 function checkFile(file, directory = false) {
   const st = fs.lstatSync(file);
   if (
@@ -139,7 +247,7 @@ function checkFile(file, directory = false) {
     (directory ? !st.isDirectory() : !st.isFile()) ||
     (!directory && st.nlink !== 1) ||
     (typeof process.getuid === "function" && st.uid !== process.getuid()) ||
-    (!isWin32 && (st.mode & 0o077))
+    (!IS_WIN32 && (st.mode & 0o077))
   )
     throw fault("UNSAFE_STATE_PERMISSIONS", 503);
 }
@@ -346,7 +454,7 @@ function verifyAndClearStalePidFile(file) {
       !stat.isFile() ||
       stat.nlink !== 1 ||
       (typeof process.getuid === "function" && stat.uid !== process.getuid()) ||
-      (!isWin32 && (stat.mode & 0o077)) ||
+      (!IS_WIN32 && (stat.mode & 0o077)) ||
       stat.size === 0 ||
       stat.size > 64
     ) {
@@ -391,13 +499,21 @@ export class StateStore {
     this.file = path.join(this.directory, "state.json");
     // Reject symlink ancestors rather than following an untrusted state path.
     let ancestor = this.directory;
-    while (!fs.existsSync(ancestor)) ancestor = path.dirname(ancestor);
-    for (let p = ancestor; ; p = path.dirname(p)) {
-      if (fs.lstatSync(p).isSymbolicLink())
-        throw fault("UNSAFE_STATE_PATH", 503);
-      if (path.dirname(p) === p) break;
+    while (!fs.existsSync(ancestor)) {
+      const parent = path.dirname(ancestor);
+      if (parent === ancestor) break;
+      ancestor = parent;
     }
+    if (fs.existsSync(ancestor)) {
+      for (let p = ancestor; ; p = path.dirname(p)) {
+        if (fs.lstatSync(p).isSymbolicLink())
+          throw fault("UNSAFE_STATE_PATH", 503);
+        if (path.dirname(p) === p) break;
+      }
+    }
+    const existedBefore = fs.existsSync(this.directory);
     fs.mkdirSync(this.directory, { recursive: true, mode: 0o700 });
+    if (!existedBefore && IS_WIN32) restrictWin32DirectoryAcl(this.directory);
     checkFile(this.directory, true);
     this.flockHelper = flockHelper;
     this.lockFd = undefined;
@@ -442,38 +558,69 @@ export class StateStore {
   }
   lock() {
     if (this.locked) throw fault("STATE_IN_USE", 503);
-    if (isWin32 && this.flockHelper === null) {
+    if (IS_WIN32) {
       checkFile(this.directory, true);
-      const file = path.join(this.directory, "runtime.lock");
-      verifyAndClearStalePidFile(file);
-      const createFlags =
-        fs.constants.O_WRONLY |
-        fs.constants.O_CREAT |
-        fs.constants.O_EXCL;
-      let pidFd;
-      let identity;
-      let createdPidFile = false;
+      const acquired = tryAcquireWin32KernelLock(this.directory);
+      if (acquired.status === "contended") throw fault("STATE_IN_USE", 503);
+      if (acquired.status === "denied") throw fault("UNSAFE_STATE_PERMISSIONS", 503);
+      if (acquired.status !== "acquired") throw fault("STATE_LOCK_UNAVAILABLE", 503);
+      let lockFd = acquired.fd;
       try {
-        pidFd = fs.openSync(file, createFlags, 0o600);
-        createdPidFile = true;
-        fs.writeFileSync(pidFd, String(process.pid));
-        fs.fsyncSync(pidFd);
-        const pidStat = fs.fstatSync(pidFd);
-        identity = { dev: pidStat.dev, ino: pidStat.ino };
-      } catch {
-        if (createdPidFile) {
-          try { fs.unlinkSync(file); } catch {}
+        const pidFile = path.join(this.directory, "runtime.lock");
+        // Validate any stale diagnostic PID marker under the held kernel lock before
+        // reclaiming it; never O_TRUNC an unknown, malformed, symlinked, or hardlinked file.
+        try {
+          const existingPid = fs.lstatSync(pidFile);
+          if (
+            existingPid.isSymbolicLink() ||
+            !existingPid.isFile() ||
+            existingPid.nlink !== 1 ||
+            existingPid.size === 0 ||
+            existingPid.size > 64
+          ) {
+            throw fault("STATE_IN_USE", 503);
+          }
+          const raw = fs.readFileSync(pidFile, "utf8").trim();
+          if (!/^[1-9][0-9]{0,9}$/.test(raw)) throw fault("STATE_IN_USE", 503);
+          fs.unlinkSync(pidFile);
+        } catch (error) {
+          if (error?.code === "STATE_IN_USE") throw error;
+          if (error?.code !== "ENOENT") throw fault("STATE_IN_USE", 503);
         }
-        throw fault("STATE_IN_USE", 503);
+        let pidFd;
+        let identity;
+        let createdPidFile = false;
+        try {
+          pidFd = fs.openSync(
+            pidFile,
+            fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL,
+            0o600,
+          );
+          createdPidFile = true;
+          fs.writeFileSync(pidFd, String(process.pid));
+          fs.fsyncSync(pidFd);
+          const pidStat = fs.fstatSync(pidFd);
+          identity = { dev: pidStat.dev, ino: pidStat.ino };
+        } catch {
+          if (createdPidFile) {
+            try { fs.unlinkSync(pidFile); } catch {}
+          }
+          throw fault("STATE_IN_USE", 503);
+        } finally {
+          if (pidFd !== undefined) {
+            try { fs.closeSync(pidFd); } catch {}
+          }
+        }
+        this.lockFd = lockFd;
+        lockFd = undefined;
+        this.pidLockIdentity = identity;
+        this.locked = true;
+        this.closed = false;
       } finally {
-        if (pidFd !== undefined) {
-          try { fs.closeSync(pidFd); } catch {}
+        if (lockFd !== undefined) {
+          try { fs.closeSync(lockFd); } catch {}
         }
       }
-      this.lockFd = undefined;
-      this.pidLockIdentity = identity;
-      this.locked = true;
-      this.closed = false;
       return;
     }
     let dirFd;
@@ -574,7 +721,7 @@ export class StateStore {
         !cur.isSymbolicLink() &&
         cur.isFile() &&
         expected &&
-        cur.dev === expected.dev &&
+        (cur.dev === expected.dev || (IS_WIN32 && (cur.dev === 0 || expected.dev === 0))) &&
         cur.ino === expected.ino
       ) {
         try {
@@ -604,8 +751,10 @@ export class StateStore {
       fs.fsyncSync(fd);
       fs.closeSync(fd);
       fd = undefined;
-      fs.renameSync(temp, this.file);
-      if (!isWin32) {
+      if (IS_WIN32) {
+        renameWithWin32Retry(temp, this.file);
+      } else {
+        fs.renameSync(temp, this.file);
         const dir = fs.openSync(this.directory, "r");
         try {
           fs.fsyncSync(dir);
@@ -614,8 +763,12 @@ export class StateStore {
         }
       }
     } finally {
-      if (fd !== undefined) fs.closeSync(fd);
-      if (fs.existsSync(temp)) fs.unlinkSync(temp);
+      if (fd !== undefined) {
+        try { fs.closeSync(fd); } catch {}
+      }
+      try {
+        if (fs.existsSync(temp)) fs.unlinkSync(temp);
+      } catch {}
     }
   }
   verifyRuntimePassword(value) {

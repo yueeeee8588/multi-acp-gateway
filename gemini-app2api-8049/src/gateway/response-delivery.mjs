@@ -12,7 +12,41 @@ const MAX = 8 * 1024 * 1024;
 // interrupted turn that produced only this tiny prefix has not shown the caller
 // anything, so the pool may discard it and retry once without splicing output.
 const PREFIX_BYTES = 2048;
+const RETRYABLE_AFTER_KEEPALIVE_CODES = new Set([
+  'SERVER_SHUTDOWN',
+  'NATIVE_UPSTREAM_UNAVAILABLE',
+  'NATIVE_RATE_LIMITED',
+  'NATIVE_QUOTA_EXHAUSTED',
+  'NATIVE_QUOTA_INSUFFICIENT',
+  'GATEWAY_BUSY',
+  'NO_AVAILABLE_ACCOUNTS',
+]);
 const safeCode = error => /^[A-Z0-9_]{1,80}$/.test(error?.code ?? '') ? error.code : 'UPSTREAM_INTERRUPTED';
+export function classifyInterruptEnding({ route, wirePhase, publishedBytes, callCount, content, partialContent, partialCalls, error }) {
+  const code = safeCode(error);
+  const isTerminalNoOutput = error?.terminalNoOutput === true;
+  const keepaliveUncommitted = wirePhase === 'comments_only' && publishedBytes === 0 && !partialCalls.length;
+  const keepaliveZeroOutput = keepaliveUncommitted && !partialContent?.length;
+  const retryableAfterKeepalive = RETRYABLE_AFTER_KEEPALIVE_CODES.has(code);
+  const detail = {
+    code,
+    type: isTerminalNoOutput ? 'server_error' : error?.status === 429 ? 'rate_limit_error' : error?.status === 401 ? 'authentication_error' : error?.status < 500 ? 'invalid_request_error' : 'server_error',
+    message: isTerminalNoOutput
+      ? 'Generation ended without output. Gateway recovery is exhausted; this turn has failed.'
+      : code === 'SERVER_SHUTDOWN'
+        ? 'SERVER_SHUTDOWN: gateway is restarting; retry the request'
+        : code,
+    ...(isTerminalNoOutput || (keepaliveZeroOutput && !retryableAfterKeepalive)
+      ? { terminal: true, retryable: false, client_action: 'stop_turn' }
+      : keepaliveUncommitted && retryableAfterKeepalive
+        ? { retryable: true }
+        : {}),
+    ...(isTerminalNoOutput && error?.upstreamCode ? { upstream_code: error.upstreamCode, upstream_status: error.upstreamStatus } : {}),
+  };
+  const usable = publishedBytes >= PREFIX_BYTES || callCount > 0 || (error?.postOutputIdleStall === true && content.trim().length > 0);
+  const needsStart = wirePhase !== 'events_started' && (route !== 'chat' || !keepaliveZeroOutput);
+  return { detail, keepaliveZeroOutput, usable, needsStart };
+}
 const commonPrefixBytes = (prior, next) => {
   const limit = Math.min(prior.length, next.length);
   let i = 0;
@@ -65,12 +99,17 @@ async function write(res, chunk, signal = null, writeTimeoutMs = 30000) {
 }
 export function createResponseDelivery(res, { route = 'chat', stream = false, geminiSse = true, includeUsage = false, model, thinkingLevel, reasoningEffort, parallelToolCalls = true, promptChars, imageCount = 0, deferEmptyStart = false, signal = null, writeTimeoutMs = 30000, keepaliveMs = 15000, keepaliveHeadersDelayMs = 12000 } = {}) {
   let meta = { id: 'chatcmpl-' + crypto.randomBytes(16).toString('hex'), created: Math.floor(Date.now() / 1000), model,
-    requestedThinkingLevel: thinkingLevel, ...(reasoningEffort === undefined ? {} : { requestedReasoningEffort: reasoningEffort }) };
-  let started = false, keepaliveHeadersSent = false, settled = false, content = '', calls = [], bytes = 0, sequence = 0, message = null;
+    requestedThinkingLevel: thinkingLevel,
+    ...(reasoningEffort === undefined ? {} : { requestedReasoningEffort: reasoningEffort }) };
+  // Monotonic wire lifecycle: 'pending' -> 'comments_only' -> 'events_started' -> 'settled'.
+  // discard() clears attempt buffers without rewinding wirePhase.
+  let wirePhase = 'pending', eventsEverStarted = false, content = '', calls = [], bytes = 0, sequence = 0, message = null;
   let publishedLength = 0, publishedBytes = 0;
   let googleBlockIndex = 0, googleTextOpen = false;
   let geminiArrayFirst = true;
   let keepaliveTimer = null, deferredHeaderTimer = null;
+  const isSettled = () => wirePhase === 'settled';
+  const hasWireHeaders = () => wirePhase === 'comments_only' || wirePhase === 'events_started';
   const stopDeferredHeaderTimer = () => {
     if (deferredHeaderTimer !== null) {
       clearTimeout(deferredHeaderTimer);
@@ -88,11 +127,11 @@ export function createResponseDelivery(res, { route = 'chat', stream = false, ge
     signal?.removeEventListener?.('abort', stopKeepalive);
   };
   const armKeepalive = () => {
-    if (!stream || (route === 'gemini' && !geminiSse) || settled || (!started && !keepaliveHeadersSent) || !Number.isFinite(keepaliveMs) || keepaliveMs <= 0) return;
+    if (!stream || (route === 'gemini' && !geminiSse) || isSettled() || !hasWireHeaders() || !Number.isFinite(keepaliveMs) || keepaliveMs <= 0) return;
     if (keepaliveTimer !== null) clearTimeout(keepaliveTimer);
     keepaliveTimer = setTimeout(() => {
       keepaliveTimer = null;
-      if (settled || (route === 'gemini' && !geminiSse) || res.destroyed || res.writableEnded) { stopKeepalive(); return; }
+      if (isSettled() || (route === 'gemini' && !geminiSse) || res.destroyed || res.writableEnded) { stopKeepalive(); return; }
       if (!res.writableNeedDrain) {
         try {
           if (typeof res.writeKeepalive === 'function') res.writeKeepalive(': keepalive\n\n');
@@ -123,14 +162,14 @@ export function createResponseDelivery(res, { route = 'chat', stream = false, ge
   };
   const flushKeepaliveHeaders = () => {
     deferredHeaderTimer = null;
-    if (!stream || (route === 'gemini' && !geminiSse) || !deferEmptyStart || settled || started || keepaliveHeadersSent || res.headersSent || res.destroyed || res.writableEnded || signal?.aborted) return;
+    if (!stream || (route === 'gemini' && !geminiSse) || !deferEmptyStart || wirePhase !== 'pending' || res.headersSent || res.destroyed || res.writableEnded || signal?.aborted) return;
     try {
       res.removeHeader?.('X-Gemini-Provider-Attempts');
       res.removeHeader?.('X-Gemini-Failover-Count');
       res.removeHeader?.('X-Gemini-Failover-Reason');
       res.removeHeader?.('X-Gemini-Recovery-Errors');
       writeSseHeaders({ 'X-Gemini-Keepalive-Headers': '1' });
-      keepaliveHeadersSent = true;
+      wirePhase = 'comments_only';
       if (!res.writableNeedDrain) {
         if (typeof res.writeKeepalive === 'function') res.writeKeepalive(': keepalive\n\n');
         else res.write(': keepalive\n\n');
@@ -159,8 +198,9 @@ export function createResponseDelivery(res, { route = 'chat', stream = false, ge
   const responseId = () => meta.id.startsWith('resp_') ? meta.id : 'resp_' + meta.id.replace(/^chatcmpl-/, '');
   const chatBase = () => ({ id: meta.id, object: 'chat.completion.chunk', created: meta.created, model: meta.model,
     ...(meta.requestedReasoningEffort === undefined ? {} : { reasoning_effort: meta.requestedReasoningEffort }) });
-  const response = (status, error = null) => ({ id: responseId(), object: 'response', created_at: meta.created, status,
-    error, ...(error ? { incomplete: true } : {}), incomplete_details: error ? { reason: 'upstream_interrupted', code: error.code } : null, model: meta.model,
+  const response = (status, error = null, incompleteDetails = null) => ({ id: responseId(), object: 'response', created_at: meta.created, status,
+    error, ...(incompleteDetails ? { incomplete: true } : {}),
+    incomplete_details: incompleteDetails, model: meta.model,
     output: output.map(item => ({ ...item, status: status === 'completed' ? 'completed' : 'incomplete' })),
     usage: status === 'in_progress' ? null : toResponsesUsage(estimateUsage()),
     parallel_tool_calls: parallelToolCalls, ...(meta.nativeSearch ? { native_search: meta.nativeSearch } : {}),
@@ -241,15 +281,17 @@ export function createResponseDelivery(res, { route = 'chat', stream = false, ge
   }
 
   async function start(identity) {
-    if (settled) return;
-    if (!started && identity) meta = { ...meta, ...identity };
-    if (!stream || started) return;
+    if (isSettled()) return;
+    if (wirePhase !== 'events_started' && identity) meta = { ...meta, ...identity };
+    if (!stream || wirePhase === 'events_started') return;
     stopDeferredHeaderTimer();
-    started = true;
+    wirePhase = 'events_started';
+    eventsEverStarted = true;
     writeSseHeaders();
+    res.off?.('close', stopKeepalive);
+    res.off?.('error', stopKeepalive);
     res.once?.('close', stopKeepalive);
     res.once?.('error', stopKeepalive);
-    signal?.addEventListener?.('abort', stopKeepalive, { once: true });
     if (!(route === 'gemini' && !geminiSse)) armKeepalive();
     if (route === 'chat') await sendChat({ role: 'assistant' });
     else if (route === 'google') {
@@ -266,7 +308,7 @@ export function createResponseDelivery(res, { route = 'chat', stream = false, ge
     } else { const initial = response('in_progress'); await sendResponse('response.created', { response: initial }); await sendResponse('response.in_progress', { response: initial }); }
   }
   async function accept(event) {
-    if (settled) throw fault('OUTPUT_ALREADY_FINISHED', 502);
+    if (isSettled()) throw fault('OUTPUT_ALREADY_FINISHED', 502);
     if (event.reset) {
       if (event.sameResponseIdentity !== true || (stream && (publishedBytes > 0 || calls.length > 0))) throw Object.assign(fault('NON_MONOTONIC_NATIVE_RESPONSE', 502), {
         nativeEvidence: { phase: 'output', nonMonotonicSite: 'delivery_reset', sameResponseIdentity: event.sameResponseIdentity === true,
@@ -275,18 +317,18 @@ export function createResponseDelivery(res, { route = 'chat', stream = false, ge
       content = ''; calls = []; bytes = 0; publishedLength = 0; publishedBytes = 0; message = null; output.length = 0; return;
     }
     if (event.start) {
-      if (deferEmptyStart && !started) meta = { ...meta, ...event.response };
+      if (deferEmptyStart && wirePhase !== 'events_started') meta = { ...meta, ...event.response };
       else await start(event.response);
       return;
     }
-    if (event.response && !started) meta = { ...meta, ...event.response };
+    if (event.response && wirePhase !== 'events_started') meta = { ...meta, ...event.response };
     if (typeof event.content === 'string' && event.content.length) {
       const nextBytes = bytes + Buffer.byteLength(event.content);
       if (nextBytes > MAX) throw fault('RESPONSE_TOO_LARGE', 502);
       bytes = nextBytes;
       // Hold SSE headers and initial events behind the prefix gate when deferEmptyStart
       // is enabled so a short-fragment failure never commits downstream headers before retry.
-      const holdPrefix = stream && deferEmptyStart && !started && !publishedLength && nextBytes < PREFIX_BYTES;
+      const holdPrefix = stream && deferEmptyStart && wirePhase !== 'events_started' && !publishedLength && nextBytes < PREFIX_BYTES;
       if (!holdPrefix) await start(event.response);
       content += event.content;
       if (!stream) return;
@@ -333,17 +375,17 @@ export function createResponseDelivery(res, { route = 'chat', stream = false, ge
     }
   }
   async function complete(result) {
-    if (settled) return;
+    if (isSettled()) return;
     if (!stream) {
       const resultCalls = Array.isArray(result.calls) ? result.calls : [];
       const outputBytes = Buffer.byteLength(result.content ?? '') +
         resultCalls.reduce((total, call) => total + Buffer.byteLength(JSON.stringify(call)), 0);
       if (resultCalls.length > 32 || outputBytes > MAX) throw fault('RESPONSE_TOO_LARGE', 502);
-      settled = true;
+      wirePhase = 'settled';
       writeNonStream({ ...result, parallelToolCalls, usage: estimateUsage(outputBytes) });
       return;
     }
-    if (!started) meta = { ...meta, ...result };
+    if (wirePhase !== 'events_started') meta = { ...meta, ...result };
     else for (const key of ['nativeSearch', 'thinkingLevel', 'annotations']) if (result[key] !== undefined) meta[key] = result[key];
     if (!result.content.startsWith(content)) {
       const sameResponse = result.id === meta.id && result.nativeEvidence?.nativeResponseIdentityVerified === true;
@@ -384,13 +426,16 @@ export function createResponseDelivery(res, { route = 'chat', stream = false, ge
       await finishResponseItems();
       await sendResponse('response.completed', { response: response('completed') });
     }
-    settled = true; stopKeepalive(); res.end();
+    wirePhase = 'settled'; stopKeepalive(); res.end();
   }
   async function interrupt(error) {
     stopDeferredHeaderTimer();
-    if (settled || res.destroyed || res.writableEnded) { stopKeepalive(); return false; }
+    if (isSettled() || res.destroyed || res.writableEnded) { stopKeepalive(); return false; }
     if (error?.unverifiedOutput === true) {
-      if (!started) { discard(); if (!keepaliveHeadersSent) { stopKeepalive(); return false; } }
+      if (wirePhase !== 'events_started') {
+        discard();
+        if (wirePhase === 'pending') { stopKeepalive(); return false; }
+      }
       content = content.slice(0, publishedLength);
       bytes = Buffer.byteLength(content) + calls.reduce((total, call) => total + Buffer.byteLength(JSON.stringify(call)), 0);
     }
@@ -399,30 +444,30 @@ export function createResponseDelivery(res, { route = 'chat', stream = false, ge
     const partialBytes = Buffer.byteLength(partial.content ?? '') +
       partialCalls.reduce((total, call) => total + Buffer.byteLength(JSON.stringify(call)), 0);
     if (partialCalls.length > 32 || partialBytes > MAX) {
-      if (!started) discard();
+      if (wirePhase !== 'events_started') discard();
       stopKeepalive();
       throw fault('RESPONSE_TOO_LARGE', 502);
     }
-    if (!started && !keepaliveHeadersSent && error?.code === 'RESPONSE_TOO_LARGE') { discard(); stopKeepalive(); return false; }
-    if (!started && !keepaliveHeadersSent && !partial.content?.length && !partialCalls.length) { stopKeepalive(); return false; }
+    if (wirePhase === 'pending' && error?.code === 'RESPONSE_TOO_LARGE') { discard(); stopKeepalive(); return false; }
+    if (wirePhase === 'pending' && !partial.content?.length && !partialCalls.length) { stopKeepalive(); return false; }
     const detailStatus = Number.isInteger(error?.status) && error.status >= 400 && error.status <= 599 ? error.status : 502;
-    const detail = {
-      code: safeCode(error),
-      status: detailStatus,
-      type: detailStatus === 429 ? 'rate_limit_error' : detailStatus === 401 ? 'authentication_error' : detailStatus < 500 ? 'invalid_request_error' : 'server_error',
-      message: safeCode(error),
-    };
+    const { detail, keepaliveZeroOutput, usable, needsStart } = classifyInterruptEnding({
+      route,
+      wirePhase,
+      publishedBytes,
+      callCount: calls.length,
+      content,
+      partialContent: partial.content,
+      partialCalls,
+      error,
+    });
     res.incomplete = true;
     if (!stream) {
-      settled = true;
+      wirePhase = 'settled';
       writeNonStream({ ...partial, calls: partialCalls, parallelToolCalls, incomplete: true, incompleteDetails: { reason: 'upstream_interrupted', code: detail.code }, outputError: detail });
       return true;
     }
-    if (!started) await start(partial);
-    // Decide from what the caller has actually seen, before the held prefix flushes.
-    // Verified post-output upstream silence (HTTP 200, no reset/EOF, clean text) also
-    // finishes cleanly with incomplete metadata instead of trapping callers in retries.
-    const usable = publishedBytes >= PREFIX_BYTES || calls.length > 0 || (error?.postOutputIdleStall === true && content.trim().length > 0);
+    if (needsStart) await start(partial);
     // Deliver whatever the prefix gate was still holding before the error.
     await emitHeld();
     if (route === 'chat') {
@@ -482,30 +527,68 @@ export function createResponseDelivery(res, { route = 'chat', stream = false, ge
       }
     } else if (usable) {
       // Deliberate delivery-completion compatibility, matching Chat's stop branch.
-      // Codex retries response.incomplete even after receiving usable text. Finish
-      // only the delivered items/turn; keep the interruption explicit in extensions
-      // and res.incomplete. This is not proof of full upstream generation completion.
+      // Codex retries response.incomplete even after receiving usable text, and strict
+      // Responses proxies treat non-null response.error on response.completed as a
+      // transport failure (triggering reconnect loops). Keep response.error null while
+      // preserving interruption visibility via incomplete: true, incomplete_details, and
+      // res.incomplete. This is not proof of full upstream generation completion.
       await finishResponseItems();
-      await sendResponse('response.completed', { incomplete: true, response: response('completed', detail) });
-    } else await sendResponse('response.incomplete', { response: response('incomplete', detail) });
-    settled = true; stopKeepalive(); res.end(); return true;
+      await sendResponse('response.completed', {
+        incomplete: true,
+        response: response('completed', null, { reason: 'upstream_interrupted', code: detail.code }),
+      });
+    } else if (keepaliveZeroOutput) {
+      const failedError = {
+        code: 'server_error',
+        message: detail.message,
+        gateway_code: detail.code,
+        ...(detail.upstream_code ? { upstream_code: detail.upstream_code, upstream_status: detail.upstream_status } : {}),
+        ...(detail.terminal
+          ? { terminal: true, retryable: false, client_action: 'stop_turn' }
+          : detail.retryable
+            ? { retryable: true }
+            : {}),
+      };
+      await sendResponse('response.failed', { response: response('failed', failedError) });
+    } else await sendResponse('response.incomplete', {
+      response: response('incomplete', detail, { reason: 'upstream_interrupted', code: detail.code }),
+    });
+    wirePhase = 'settled'; stopKeepalive(); res.end(); return true;
   }
-  // A retried attempt must not inherit a discarded fragment.
+  // A retried attempt must not inherit a discarded fragment; wirePhase never rewinds.
   function discard() {
-    if (settled) return;
-    stopKeepalive();
+    if (isSettled()) return;
+    if (!stream || res.destroyed || res.writableEnded) stopKeepalive();
     delete meta.annotations;
     content = ''; calls = []; bytes = 0; publishedLength = 0; publishedBytes = 0; message = null; output.length = 0;
     googleBlockIndex = 0; googleTextOpen = false; geminiArrayFirst = true;
   }
+  function attemptDisposition(error) {
+    const replayBlocked =
+      (res.headersSent === true && wirePhase !== 'comments_only') ||
+      wirePhase === 'events_started' ||
+      wirePhase === 'settled' ||
+      publishedBytes > 0 ||
+      calls.length > 0 ||
+      res.destroyed === true;
+    const shortOutput =
+      !replayBlocked &&
+      !error?.unverifiedOutput &&
+      !error?.postOutputIdleStall &&
+      bytes > 0 &&
+      bytes < PREFIX_BYTES;
+    return { replayBlocked, shortOutput };
+  }
   return { accept, complete, interrupt, discard, close: stopKeepalive,
     outputCommitState: () => ({ publishedBytes, toolCallCount: stream ? calls.length : 0 }),
-    get started() { return started; },
-    get keepaliveOnlyHeaders() { return keepaliveHeadersSent && !started; },
+    attemptDisposition,
+    get wirePhase() { return wirePhase; },
+    get started() { return wirePhase === 'events_started' || (wirePhase === 'settled' && eventsEverStarted); },
+    get keepaliveOnlyHeaders() { return wirePhase === 'comments_only'; },
     get hasContent() { return content.length > 0 || calls.length > 0; },
     get callCount() { return calls.length; },
     get publishedBytes() { return publishedBytes; },
     // A fragment, not an empty or quota failure: some text arrived but the
     // caller has seen nothing usable, so replacing it splices nothing.
-    get retryableShortfall() { return !settled && calls.length === 0 && publishedBytes === 0 && bytes > 0 && bytes < PREFIX_BYTES; } };
+    get retryableShortfall() { return !isSettled() && calls.length === 0 && publishedBytes === 0 && bytes > 0 && bytes < PREFIX_BYTES; } };
 }

@@ -225,6 +225,7 @@ test("POST /admin/api/accounts/login/:flowId/callback completes OAuth flow", asy
     );
   } finally {
     await ctx.app.close();
+    ctx.store.unlock();
     fs.rmSync(ctx.dir, { recursive: true, force: true });
   }
 });
@@ -322,6 +323,7 @@ test("POST /admin/api/accounts/import-tokens and GET /admin/api/accounts/export"
     ]);
   } finally {
     await ctx.app.close();
+    ctx.store.unlock();
     fs.rmSync(ctx.dir, { recursive: true, force: true });
   }
 });
@@ -444,6 +446,7 @@ test("Chrome Local State parsing, detectChromePath, and serial chrome-oauth", as
     assert.match(spawned[0].args[1], /hint=one%40example\.com/);
   } finally {
     await accounts.close();
+    store.unlock();
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
