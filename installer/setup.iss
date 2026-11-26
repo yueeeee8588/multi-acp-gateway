@@ -5,7 +5,7 @@
   #define AppName "Multi-ACP Gateway"
 #endif
 #ifndef AppVersion
-  #define AppVersion "0.16.7"
+  #define AppVersion "0.16.8"
 #endif
 #ifndef AppPublisher
   #define AppPublisher "Multi-ACP Gateway"
