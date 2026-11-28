@@ -52,6 +52,75 @@ describe('acp/schema-sanitizer', () => {
     expect(schema.properties.tags.items.properties.label.type).toBe('string');
   });
 
+  it('explicitly opens empty object schemas after tool root normalization and in nested properties', () => {
+    const { tools } = sanitizeToolDeclarations([
+      { name: 'no_parameters' },
+      { name: 'no_properties', parameters: { type: 'object' } },
+      {
+        name: 'nested',
+        parameters: { properties: {
+          missing: { type: 'object' },
+          empty: { type: 'object', properties: {} },
+          unevaluatedAllowed: { type: 'object', unevaluatedProperties: true },
+          emptyPatterns: { type: 'object', patternProperties: {} },
+        } },
+      },
+    ]);
+
+    expect(tools[0].inputSchema).toEqual({ type: 'object', properties: {}, additionalProperties: true });
+    expect(tools[1].inputSchema).toEqual(tools[0].inputSchema);
+    expect(tools[2].inputSchema).toEqual({ type: 'object', properties: {
+      missing: { type: 'object', additionalProperties: true },
+      empty: { type: 'object', properties: {}, additionalProperties: true },
+      unevaluatedAllowed: { type: 'object', unevaluatedProperties: true, additionalProperties: true },
+      emptyPatterns: { type: 'object', patternProperties: {}, additionalProperties: true },
+    } });
+  });
+
+  it.each([
+    { additionalProperties: false },
+    { additionalProperties: { type: 'string' } },
+    { unevaluatedProperties: false },
+    { unevaluatedProperties: { type: 'string' } },
+    { properties: { known: { type: 'string' } } },
+    { patternProperties: { '^known': { type: 'string' } } },
+  ])('preserves object constraints %j', (constraint) => {
+    const { tools } = sanitizeToolDeclarations([
+      { name: 'constrained', parameters: { type: 'object', ...constraint } },
+    ]);
+    expect(tools[0].inputSchema).toEqual({ type: 'object', properties: {}, ...constraint });
+  });
+
+  it('retains an allOf branch or sibling closure and preserves known properties', () => {
+    const { tools } = sanitizeToolDeclarations([
+      { name: 'branch_closed', parameters: { allOf: [
+        { type: 'object', additionalProperties: false },
+        { type: 'object', properties: {} },
+        { type: 'object', additionalProperties: true },
+      ] } },
+      { name: 'sibling_closed', parameters: { additionalProperties: false, allOf: [
+        { type: 'object', properties: {} },
+      ] } },
+      { name: 'known_branch', parameters: { allOf: [
+        { type: 'object' }, { properties: { known: { type: 'string' } } },
+      ] } },
+      { name: 'branch_unevaluated', parameters: { allOf: [
+        { type: 'object' }, { unevaluatedProperties: false },
+      ] } },
+      { name: 'branch_pattern', parameters: { allOf: [
+        { type: 'object' }, { patternProperties: { '^known': false } },
+      ] } },
+    ]);
+    const closed = { type: 'object', properties: {}, additionalProperties: false };
+    expect(tools.map(({ inputSchema }) => inputSchema)).toEqual([
+      closed,
+      closed,
+      { type: 'object', properties: { known: { type: 'string' } } },
+      { type: 'object', properties: {}, unevaluatedProperties: false },
+      { type: 'object', properties: {}, patternProperties: { '^known': false } },
+    ]);
+  });
+
   it('truncates long tool names and avoids reserved names with collision-free mapping', () => {
     const used = new Set<string>();
     const reserved = normalizeMcpToolName('await_result', used);

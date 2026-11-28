@@ -5,6 +5,7 @@ import { getConfig } from "../config/settings";
 import { store, type GatewayStore } from "../db/store";
 import { eventBus } from "../logs/events";
 import type { AccountRecord, CooldownRecord, RoutingStrategy } from "../types";
+import { matchesModelAccessRule, resolveModelAccountBinding } from './model-binding';
 import { hasFlagshipModelAccess } from "./quota";
 
 export const CACHE_WORTH_TOKENS = 1024;
@@ -17,6 +18,14 @@ const MAX_CACHE_SETTLING_ENTRIES = 4096;
 const WORKER_SPAWN_WINDOW_MS = 60_000;
 const ACCOUNT_QUOTA_BACKOFF_DEFAULT_MS = 30_000;
 const ACCOUNT_QUOTA_BACKOFF_MAX_MS = 60_000;
+
+const LOCATION_UNSUPPORTED_RE =
+  /\b(?:user\s+)?location\s+(?:is\s+)?not\s+supported\b|\bnot\s+available\s+in\s+your\s+(?:country|region|location)\b|\b(?:country|region)\s+(?:is\s+)?not\s+supported\b|\bunsupported\s+(?:country|region|location)\b|地区不支持|当前地区不可用|所在地区不受支持/i;
+
+function isLocationUnsupportedError(rawError?: string): boolean {
+  if (!rawError) return false;
+  return LOCATION_UNSUPPORTED_RE.test(rawError);
+}
 
 function createAbortError(reason?: unknown): Error {
   if (reason instanceof Error) return reason;
@@ -113,6 +122,13 @@ export class NoReadyAccountsError extends Error {
   constructor(message = "No ready accounts available in pool") {
     super(message);
     this.name = "NoReadyAccountsError";
+  }
+}
+
+export class ExclusiveModelBindingError extends NoReadyAccountsError {
+  constructor(model: string, bindingId: string) {
+    super(`No available account for model '${model}' under exclusive binding '${bindingId}'`);
+    this.name = 'ExclusiveModelBindingError';
   }
 }
 
@@ -610,7 +626,34 @@ export class AccountScheduler {
       return;
     }
 
-    if (opts.reasonCode === "RESTRICTED" || opts.upstreamStatus === 403) {
+    if (opts.reasonCode === "ACCOUNT_DISABLED_REFUSED") {
+      const cooldownMs = hasRetryHint ? retryAfterMs : 10 * 60_000;
+      const untilMs = now + cooldownMs;
+      const acc = this.dbStore.getAccount(accountId);
+      if (acc && acc.status !== "disabled") {
+        this.dbStore.upsertAccount({
+          ...acc,
+          status: "restricted",
+          statusReason: opts.rawError || "Account disabled / ToS violation (10m global cooldown)",
+          updatedAt: now,
+        });
+        eventBus.emit("accounts", this.dbStore.listAccounts());
+      }
+      this.dbStore.upsertCooldown({
+        accountId,
+        family: "*",
+        scopeType: "global",
+        reason: "ACCOUNT_DISABLED_REFUSED",
+        untilMs,
+        consecutiveFailures: 1,
+        lastError: opts.rawError || "Account disabled / ToS violation",
+      });
+      eventBus.emit("cooldowns", this.dbStore.listCooldowns(now));
+      return untilMs;
+    }
+
+    const isLocationUnsupported = isLocationUnsupportedError(opts.rawError);
+    if ((opts.reasonCode === "RESTRICTED" || opts.upstreamStatus === 403) && !isLocationUnsupported) {
       const cfg = getConfig();
       const cooldownMs = cfg.policyBlockCooldownMs ?? 21_600_000;
       const untilMs = now + cooldownMs;
@@ -669,17 +712,25 @@ export class AccountScheduler {
     const finalUntilMs =
       stillCooling && existing!.untilMs > candidateUntilMs ? existing!.untilMs : candidateUntilMs;
 
+    const resolvedReason = isLocationUnsupported
+      ? "EXIT_LOCATION_UNSUPPORTED"
+      : opts.reasonCode || (opts.upstreamStatus === 429 ? "QUOTA_EXHAUSTED" : "SOFT_ERROR");
+
     const record: CooldownRecord = {
       accountId,
       family,
       scopeType: "family",
-      reason: opts.reasonCode || (opts.upstreamStatus === 429 ? "QUOTA_EXHAUSTED" : "SOFT_ERROR"),
+      reason: resolvedReason,
       untilMs: finalUntilMs,
       consecutiveFailures: nextFailures,
       lastError: opts.rawError || "",
     };
 
-    this.dbStore.upsertCooldown(record);
+    const preserveLongerCooling =
+      stillCooling && !isQuotaError && existing!.untilMs > candidateUntilMs;
+    if (!preserveLongerCooling) {
+      this.dbStore.upsertCooldown(record);
+    }
     if (isQuotaError && cfg.quotaCooldownScope === "account") {
       const accountBackoffMs = Math.min(
         hasRetryHint ? retryAfterMs! : ACCOUNT_QUOTA_BACKOFF_DEFAULT_MS,
@@ -803,71 +854,7 @@ export class AccountScheduler {
     sessionKey?: string,
     signal?: AbortSignal,
   ): Promise<AccountLeaseResult> {
-    const cfg = getConfig();
-    const family = normalizeModelFamily(model);
-    const queueTimeout = cfg.queueWaitTimeoutMs || 60_000;
-    const deadline = Date.now() + queueTimeout;
-
-    while (true) {
-      signal?.throwIfAborted();
-      const now = Date.now();
-      const allAccounts = this.dbStore.listAccounts();
-      const account = allAccounts.find((a) => a.id === accountId && a.status === "ready");
-      if (!account) {
-        throw new NoReadyAccountsError(`Fallback account '${accountId}' is not ready`);
-      }
-
-      const activeCooldowns = this.dbStore.listCooldowns(now);
-      let blockingUntilMs = 0;
-      for (const cd of activeCooldowns) {
-        if (cd.accountId !== accountId) continue;
-        if (cd.family !== family && cd.family !== "*") continue;
-        // 仅允许绕过本轮纯思考空响应产生的 family 级 SOFT_ERROR 软避让，绝不绕过其他任何冷却
-        if (cd.family === family && cd.scopeType === "family" && cd.reason === "SOFT_ERROR") {
-          continue;
-        }
-        if (cd.untilMs > blockingUntilMs) {
-          blockingUntilMs = cd.untilMs;
-        }
-      }
-      if (blockingUntilMs > now) {
-        const retryAfterSeconds = Math.max(1, Math.ceil((blockingUntilMs - now) / 1000));
-        throw new AllAccountsCooldownError(family, retryAfterSeconds);
-      }
-
-      const spawnNow = this.nowFn();
-      if (this.isWorkerSpawnRateLimited(account.id, spawnNow)) {
-        const timestamps = this.workerSpawnTimestamps.get(account.id) ?? [];
-        const oldest = timestamps[0] ?? spawnNow;
-        const retryAfterSeconds = Math.max(
-          1,
-          Math.ceil((oldest + WORKER_SPAWN_WINDOW_MS - spawnNow) / 1000),
-        );
-        throw new AllAccountsCooldownError(family, retryAfterSeconds);
-      }
-
-      const exitIpConcurrency = this.buildExitIpConcurrencyMap(allAccounts);
-      if (
-        this.getAccountActiveWorkers(account) < account.concurrencyLimit &&
-        this.hasExitIpSlot(account, cfg.maxConcurrencyPerExitIp ?? 0, exitIpConcurrency)
-      ) {
-        const lease = this.createLease(account.id);
-        try {
-          await this.awaitCacheSettling(account.id, sessionKey, signal);
-          await this.awaitDispatchPacing(account.id, account.exitIp, signal);
-        } catch (err) {
-          lease.release();
-          throw err;
-        }
-        return { account, ...lease };
-      }
-
-      const remainingDeadlineMs = deadline - Date.now();
-      if (remainingDeadlineMs <= 0) {
-        throw new AccountQueueTimeoutError();
-      }
-      await this.waitForChange(Math.min(100, remainingDeadlineMs), signal);
-    }
+    return this.acquireAccountInternal(model, sessionKey, new Set(), signal, true, accountId);
   }
 
   private async acquireAccountInternal(
@@ -876,10 +863,10 @@ export class AccountScheduler {
     excludeAccountIds: Set<string>,
     signal: AbortSignal | undefined,
     shouldReserve: boolean,
+    fallbackAccountId?: string,
   ): Promise<AccountLeaseResult> {
-    const cfg = getConfig();
     const family = normalizeModelFamily(model);
-    const queueTimeout = cfg.queueWaitTimeoutMs || 60_000;
+    const queueTimeout = getConfig().queueWaitTimeoutMs || 60_000;
     const deadline = Date.now() + queueTimeout;
     const cacheWaitCapMs = Math.min(queueTimeout, 15_000);
     const cacheWaitDeadline = Date.now() + cacheWaitCapMs;
@@ -888,13 +875,28 @@ export class AccountScheduler {
       signal?.throwIfAborted();
       const now = Date.now();
       const spawnNow = this.nowFn();
+      const cfg = getConfig();
       const allAccounts = this.dbStore.listAccounts();
-      const readyAccounts = allAccounts.filter(
-        (a) => a.status === "ready" && !excludeAccountIds.has(a.id),
+      const binding = resolveModelAccountBinding(cfg.modelAccountBindings, model);
+      const bindingIds = new Set(binding?.accountIds);
+      const exclusive = binding?.mode === 'exclusive';
+      const accessAllowed = allAccounts.filter((a) => matchesModelAccessRule(a.modelAccessRule, model));
+      const stickyAccountId = sessionKey ? this.stickyBindings.get(sessionKey)?.accountId : undefined;
+      if (sessionKey && stickyAccountId &&
+          (!accessAllowed.some((a) => a.id === stickyAccountId) || (exclusive && !bindingIds.has(stickyAccountId)))) {
+        this.abandonSession(sessionKey);
+      }
+      const readyAccounts = accessAllowed.filter((a) =>
+        a.status === 'ready' && !excludeAccountIds.has(a.id) &&
+        (!exclusive || bindingIds.has(a.id)) &&
+        (!fallbackAccountId || binding?.mode === 'priority' || a.id === fallbackAccountId),
       );
 
       if (readyAccounts.length === 0) {
-        throw new NoReadyAccountsError();
+        if (exclusive) throw new ExclusiveModelBindingError(model, binding.id);
+        throw new NoReadyAccountsError(fallbackAccountId
+          ? `Fallback account '${fallbackAccountId}' is not ready or is denied access to model '${model}'`
+          : undefined);
       }
 
       const exitIpConcurrency = this.buildExitIpConcurrencyMap(allAccounts);
@@ -903,30 +905,42 @@ export class AccountScheduler {
       const activeCooldowns = this.dbStore.listCooldowns(now);
       const cooldownMap = new Map<string, CooldownRecord>();
       for (const cd of activeCooldowns) {
-        if (cd.family !== family && cd.family !== "*") continue;
+        if (cd.family !== family && cd.family !== '*') continue;
+        if (cd.accountId === fallbackAccountId && cd.family === family &&
+            cd.scopeType === 'family' && cd.reason === 'SOFT_ERROR') continue;
         const current = cooldownMap.get(cd.accountId);
         if (!current || cd.untilMs > current.untilMs) {
           cooldownMap.set(cd.accountId, cd);
         }
       }
 
+      const uncooled = readyAccounts.filter((a) => !cooldownMap.has(a.id));
+      const available = uncooled.filter(
+        (a) =>
+          this.getAccountActiveWorkers(a) < a.concurrencyLimit &&
+          this.hasExitIpSlot(a, maxPerExitIp, exitIpConcurrency) &&
+          !this.isWorkerSpawnRateLimited(a.id, spawnNow),
+      );
+      if (exclusive && available.length === 0) {
+        throw new ExclusiveModelBindingError(model, binding.id);
+      }
+      const priorityAvailable = binding?.mode === 'priority'
+        ? available.filter((a) => bindingIds.has(a.id))
+        : [];
+      const preferred = priorityAvailable.length > 0 ? priorityAvailable : available;
       const boundEntry = sessionKey ? this.stickyBindings.get(sessionKey) : undefined;
       const cacheProtected = this.isCacheProtected(boundEntry, now);
 
-      if ((cfg.routingStrategy === "cache-first" || cacheProtected) && sessionKey) {
+      if (!fallbackAccountId && (cfg.routingStrategy === 'cache-first' || cacheProtected) && sessionKey) {
         const boundId = boundEntry?.accountId;
         const boundAccount =
-          boundId && !excludeAccountIds.has(boundId)
+          boundId && (priorityAvailable.length === 0 || bindingIds.has(boundId))
             ? readyAccounts.find((a) => a.id === boundId)
             : undefined;
 
         if (boundAccount) {
           const boundCd = cooldownMap.get(boundAccount.id);
-          const boundHasSlot =
-            this.getAccountActiveWorkers(boundAccount) < boundAccount.concurrencyLimit &&
-            this.hasExitIpSlot(boundAccount, maxPerExitIp, exitIpConcurrency);
-          const boundRateLimited = this.isWorkerSpawnRateLimited(boundAccount.id, spawnNow);
-          if (!boundCd && boundHasSlot && !boundRateLimited) {
+          if (available.includes(boundAccount)) {
             this.touchSticky(sessionKey, boundAccount.id, now);
             const lease = shouldReserve
               ? this.createLease(boundAccount.id)
@@ -942,7 +956,9 @@ export class AccountScheduler {
             }
             return { account: boundAccount, ...lease };
           }
-          if (!boundRateLimited) {
+          const usePoolOutsideBinding = binding?.mode === 'priority' && priorityAvailable.length === 0 &&
+            available.length > 0 && bindingIds.has(boundAccount.id);
+          if (!usePoolOutsideBinding && !this.isWorkerSpawnRateLimited(boundAccount.id, spawnNow)) {
             const remainingCdMs = boundCd ? boundCd.untilMs - now : 0;
             const canWaitCooldown = !boundCd || remainingCdMs <= cacheWaitCapMs;
             if (canWaitCooldown && now < cacheWaitDeadline) {
@@ -958,7 +974,6 @@ export class AccountScheduler {
         }
       }
 
-      const uncooled = readyAccounts.filter((a) => !cooldownMap.has(a.id));
       if (uncooled.length === 0) {
         let minUntil = Infinity;
         for (const a of readyAccounts) {
@@ -971,24 +986,23 @@ export class AccountScheduler {
         throw new AllAccountsCooldownError(family, retryAfterSeconds);
       }
 
-      const available = uncooled.filter(
-        (a) =>
-          this.getAccountActiveWorkers(a) < a.concurrencyLimit &&
-          this.hasExitIpSlot(a, maxPerExitIp, exitIpConcurrency) &&
-          !this.isWorkerSpawnRateLimited(a.id, spawnNow),
-      );
-      if (available.length > 0) {
+      if (fallbackAccountId && binding?.mode !== 'priority' && this.isWorkerSpawnRateLimited(fallbackAccountId, spawnNow)) {
+        const oldest = this.workerSpawnTimestamps.get(fallbackAccountId)?.[0] ?? spawnNow;
+        throw new AllAccountsCooldownError(family, Math.ceil((oldest + WORKER_SPAWN_WINDOW_MS - spawnNow) / 1000));
+      }
+      if (preferred.length > 0) {
         // 优先调度非特价完整 Pro 账号（含 gemini_flagship 桶），其次其他 Pro 账号，
         // 最后回退到全量可用账号（普通账号）。
-        const fullProAvailable = available.filter(isFullProAccount);
-        const proAvailable = available.filter((a) => a.tier === 'pro');
+        const fullProAvailable = preferred.filter(isFullProAccount);
+        const proAvailable = preferred.filter((a) => a.tier === 'pro');
         const pool =
           fullProAvailable.length > 0
             ? fullProAvailable
             : proAvailable.length > 0
               ? proAvailable
-              : available;
-        const chosen = this.selectAccount(pool, cfg.routingStrategy, sessionKey, now);
+              : preferred;
+        const chosen = preferred.find((a) => a.id === fallbackAccountId)
+          ?? this.selectAccount(pool, cfg.routingStrategy, sessionKey, now);
         const lease = shouldReserve
           ? this.createLease(chosen.id)
           : { release: () => {}, onWorkerAcquired: () => {} };

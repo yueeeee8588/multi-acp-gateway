@@ -1,10 +1,28 @@
 import { createHash } from "node:crypto";
-import { buildAgyWorkerArgs, buildIsolatedAgyEnv, getDataRoot, resolveAgyBinary } from "./env";
+import { statSync } from "node:fs";
+import { open } from "node:fs/promises";
+import { buildAgyWorkerArgs, buildIsolatedAgyEnv, createAgyWorkerLogPath, getDataRoot, removeAgyWorkerLog, resolveAgyBinary } from "./env";
 import { ensureMinimalAgentDefinition } from "./minimal-agent";
 import { AcpConnection } from "./connection";
 import { LoopbackMcpServer, SessionToolBroker, type ExposedToolCall, type ToolResultPayload } from "./loopback-mcp";
 import { serializeContentsWithBudget } from "./history-budget";
-import { sanitizeToolDeclarations, type GeminiFunctionDeclaration } from "./schema-sanitizer";
+import {
+  sanitizeToolDeclarations,
+  type GeminiFunctionDeclaration,
+  type SanitizedToolDefinition,
+} from "./schema-sanitizer";
+import { AgyStreamGuard } from "./stream-guard";
+import {
+  findReusablePrefixLength,
+  summarizeMessageForHistory,
+  type HistoryMessageSummary,
+} from "./history-matcher";
+import {
+  normalizeSystemInstructionForHash,
+  stripVolatileSystem,
+  type VolatileSystemOptions,
+} from "./volatile-system";
+import type { AcpSessionMidTurnMeta } from "../db/store";
 import {
   isStepUsageEnabled,
   modelUsageAfter,
@@ -50,6 +68,9 @@ const CLI_WARNING_PREFIX_RE = /^\s*⚠\s+/;
 const RETRY_429_HINT_RE =
   /^\s*(?:retrying\b.*\b(?:429|resource_exhausted|rate[_\s-]?limit|quota|too many requests)\b|(?:429|resource_exhausted)\b.*\bretrying\b)/i;
 
+const AGY_RETRY_LOG_RE = /\] (?:Run|CallWithRetry): attempt \d+ failed \((.+)\), retrying in /;
+const MAX_LOG_READ_BYTES = 256 * 1024;
+
 const FAST_ABORT_ERROR_CODES: ReadonlySet<WorkerErrorCode> = new Set([
   "CAPACITY_UNAVAILABLE",
   "AUTH_REQUIRED",
@@ -93,6 +114,11 @@ export interface AcpSessionSnapshot {
   toolsHash: string;
   sensitiveFilterFingerprint?: string;
   committedHashes: string[];
+  committedNormalized?: string[];
+  committedSummaries?: HistoryMessageSummary[];
+  midTurn?: boolean;
+  committedCount?: number;
+  midTurnMeta?: AcpSessionMidTurnMeta | null;
   updatedAt: number;
 }
 
@@ -105,6 +131,7 @@ export interface AcpTransport {
     mcpServers: Array<Record<string, unknown>>;
     _meta?: Record<string, unknown>;
   }, timeoutMs?: number): Promise<{ sessionId?: string }>;
+  closeSession?(sessionId: string): Promise<void>;
   setModel?(params: { sessionId: string; modelId: string }): Promise<unknown>;
   prompt(params: Record<string, unknown>): Promise<unknown>;
   cancel(sessionId: string): Promise<void>;
@@ -127,6 +154,7 @@ export interface PrewarmedTransportOptions {
   transport: AcpTransport;
   envHomeDir?: string;
   boundProxyUrl?: string;
+  logFile?: string;
   initCaps?: unknown;
   bindHandlers?: (handlers: {
     onUpdate: (params: Record<string, unknown>) => void;
@@ -140,6 +168,7 @@ export interface WorkerOptions {
   agyPath?: string;
   softErrorCutoffMs?: number;
   idleTimeoutMs?: number;
+  logPollIntervalMs?: number;
   mcpServer: LoopbackMcpServer;
   workspaceDir?: string;
   transportFactory?: AcpTransportFactory;
@@ -276,17 +305,26 @@ export function defaultTransportFactory(opts: {
     initialize: () => conn.initialize(),
     newSession: (params) => conn.request<{ sessionId: string }>("session/new", params),
     resumeSession: (params, timeoutMs) => conn.request<{ sessionId?: string }>("session/resume", params, timeoutMs),
+    closeSession: async (sessionId) => {
+      await conn.request("session/close", { sessionId });
+    },
     setModel: (params) => conn.request("session/set_model", params),
     prompt: (params) => conn.request("session/prompt", params, 0),
     cancel: async (sessionId) => {
       conn.notify("session/cancel", { sessionId });
     },
-    close: async () => {
-      conn.close();
-    },
+    close: () => conn.close(),
     isAlive: () => conn.isAlive,
     onStderr: (handler) => conn.onStderr(handler),
   };
+}
+
+export async function closeAgyTransport(transport: AcpTransport, logFile?: string): Promise<void> {
+  try {
+    await transport.close();
+  } finally {
+    await removeAgyWorkerLog(logFile);
+  }
 }
 
 function hashJson(value: unknown): string {
@@ -316,17 +354,18 @@ function collectToolDeclarations(request: GeminiGenerateRequest): GeminiFunction
 function computeSystemHash(
   request: GeminiGenerateRequest,
   config: SensitiveFilterConfig,
+  options?: VolatileSystemOptions,
 ): string {
-  const raw = request.systemInstruction ?? null;
+  const normalized = normalizeSystemInstructionForHash(request.systemInstruction ?? null, options);
   if (getEffectiveSensitiveRules(config).length === 0) {
-    return hashJson(raw);
+    return hashJson(normalized);
   }
   const filteredText = applySensitiveFilterToText(
-    extractTextFromContent(request.systemInstruction),
+    stripVolatileSystem(extractTextFromContent(request.systemInstruction), options),
     config,
     'system',
   );
-  return hashJson({ raw, filteredText });
+  return hashJson({ raw: normalized, filteredText });
 }
 
 function computeToolsHash(
@@ -342,6 +381,28 @@ function computeToolsHash(
     config,
   );
   return hashJson({ raw, filteredDeclarations });
+}
+
+export function isToolsSuperset(
+  prevTools: readonly SanitizedToolDefinition[],
+  nextTools: readonly SanitizedToolDefinition[],
+): boolean {
+  if (nextTools.length < prevTools.length) return false;
+  const nextByOriginal = new Map<string, SanitizedToolDefinition>();
+  for (const tool of nextTools) {
+    if (nextByOriginal.has(tool.originalName)) {
+      return false;
+    }
+    nextByOriginal.set(tool.originalName, tool);
+  }
+  for (const prev of prevTools) {
+    const next = nextByOriginal.get(prev.originalName);
+    if (!next) return false;
+    if (hashJson(prev) !== hashJson(next)) {
+      return false;
+    }
+  }
+  return true;
 }
 
 function isEffectiveOutputPart(part: GeminiPart): boolean {
@@ -392,6 +453,26 @@ function mapStopReasonToFinishReason(stopReason?: unknown): string {
     default:
       return "STOP";
   }
+}
+
+export function isToolResponseError(response: unknown): boolean {
+  if (typeof response !== "object" || response === null || Array.isArray(response)) {
+    return false;
+  }
+  const obj = response as Record<string, unknown>;
+  if (obj.is_error === true || obj.isError === true) {
+    return true;
+  }
+  if (
+    typeof obj.error === "string" &&
+    obj.error.trim().length > 0 &&
+    obj.output === undefined &&
+    obj.result === undefined &&
+    obj.content === undefined
+  ) {
+    return true;
+  }
+  return false;
 }
 
 export function classifyUpstreamError(
@@ -491,7 +572,7 @@ const DEFAULT_SESSION_TTL_MS = 6 * 60 * 60 * 1000;
 
 export class AgySessionWorker {
   public readonly account: AccountRecord;
-  public readonly model: string;
+  public model: string;
   public lastUsedAt: number = Date.now();
 
   private readonly agyPath?: string;
@@ -500,9 +581,9 @@ export class AgySessionWorker {
   private readonly mcpServer: LoopbackMcpServer;
   private readonly workspaceDir: string;
   private readonly transportFactory: AcpTransportFactory;
-  private readonly stickyKey?: string;
+  private stickyKey?: string;
   private persistedSession: AcpSessionSnapshot | null;
-  private readonly onSessionStateChange?: (snapshot: AcpSessionSnapshot | null) => void;
+  private onSessionStateChange?: (snapshot: AcpSessionSnapshot | null) => void;
   private readonly tryAcquireWorkerSpawn: (accountId: string) => boolean;
   private readonly sessionTtlMs: number;
 
@@ -512,8 +593,9 @@ export class AgySessionWorker {
   private broker: SessionToolBroker | null = null;
   private registeredMcp: { token: string; url: string; unregister: () => void } | null = null;
 
-  private committedContents: GeminiContent[] = [];
+  private committedSummaries: HistoryMessageSummary[] = [];
   private committedHashes: string[] = [];
+  private pendingRequestedModel?: string;
   private lastAssistantText: string | null = null;
   private systemInstructionHash = "";
   private toolsHash = "";
@@ -521,6 +603,9 @@ export class AgySessionWorker {
   private awaitingTools = new Map<string, ExposedToolCall>();
   private busy = false;
   private inFlightPromptPromise: Promise<unknown> | null = null;
+  private logFile?: string;
+  private promptLog?: { file: string; offset: number; reading: boolean };
+  private readonly logPollIntervalMs: number;
 
   // Per-turn collection state
   private activeTurnParts: GeminiPart[] = [];
@@ -529,11 +614,16 @@ export class AgySessionWorker {
   private activeSoftErrorAbort?: (err: WorkerError) => void;
   private activeToolBatchResolve?: () => void;
   private activeTurnOpen = false;
+  private activeTurnId = 0;
+  private resumingSession = false;
   private unemittedToolCalls: ExposedToolCall[] = [];
   private softErrorTimer: ReturnType<typeof setTimeout> | null = null;
   private idleTimer: ReturnType<typeof setTimeout> | null = null;
   private mcpToOriginal = new Map<string, string>();
+  private registeredTools: SanitizedToolDefinition[] = [];
   private prewarmedTransport: PrewarmedTransportOptions | null = null;
+  private initCaps: unknown = null;
+  private streamGuard: AgyStreamGuard | null = null;
   private activeTurnTimings: WorkerTimings = {};
   private activeTurnPromptStartMs: number | null = null;
   private modelSelection: WorkerModelSelection = {};
@@ -552,6 +642,8 @@ export class AgySessionWorker {
     this.agyPath = opts.agyPath;
     this.softErrorCutoffMs = opts.softErrorCutoffMs ?? 2800;
     this.idleTimeoutMs = opts.idleTimeoutMs ?? 180_000;
+    const logPollIntervalMs = opts.logPollIntervalMs ?? 500;
+    this.logPollIntervalMs = Number.isFinite(logPollIntervalMs) ? Math.max(50, logPollIntervalMs) : 500;
     this.mcpServer = opts.mcpServer;
     this.workspaceDir = opts.workspaceDir ?? getDataRoot();
     this.transportFactory = opts.transportFactory ?? defaultTransportFactory;
@@ -574,6 +666,7 @@ export class AgySessionWorker {
         {
           initCaps: opts.prewarmedTransport.initCaps,
           boundProxyUrl: opts.prewarmedTransport.boundProxyUrl,
+          logFile: opts.prewarmedTransport.logFile,
           bindHandlers: opts.prewarmedTransport.bindHandlers,
         },
       );
@@ -586,16 +679,18 @@ export class AgySessionWorker {
     options?: {
       initCaps?: unknown;
       boundProxyUrl?: string;
+      logFile?: string;
       bindHandlers?: PrewarmedTransportOptions["bindHandlers"];
     },
   ): void {
     if (this.prewarmedTransport && this.prewarmedTransport.transport !== transport) {
-      void this.prewarmedTransport.transport.close().catch(() => {});
+      void closeAgyTransport(this.prewarmedTransport.transport, this.prewarmedTransport.logFile).catch(() => {});
     }
     this.prewarmedTransport = {
       transport,
       envHomeDir,
       boundProxyUrl: options?.boundProxyUrl,
+      logFile: options?.logFile,
       initCaps: options?.initCaps,
       bindHandlers: options?.bindHandlers,
     };
@@ -613,6 +708,47 @@ export class AgySessionWorker {
     return Boolean(this.transport?.isAlive() && this.sessionId);
   }
 
+  setRequestedModel(model: string): void {
+    this.pendingRequestedModel = model;
+  }
+
+  bindSessionPersistence(
+    stickyKey: string,
+    onSessionStateChange: (snapshot: AcpSessionSnapshot | null) => void,
+  ): void {
+    this.stickyKey = stickyKey;
+    this.onSessionStateChange = onSessionStateChange;
+  }
+
+  private emitSessionSnapshot(committedCount: number, midTurn: boolean): void {
+    if (!this.sessionId) return;
+    const awaitingToolsList = Array.from(this.awaitingTools.values()).map((t) => ({
+      id: t.id,
+      name: t.name,
+      mcpName: t.mcpName,
+      args: t.args,
+    }));
+    this.onSessionStateChange?.({
+      stickyKey: this.stickyKey,
+      sessionId: this.sessionId,
+      accountId: this.account.id,
+      model: this.model,
+      systemHash: this.systemInstructionHash,
+      toolsHash: this.toolsHash,
+      sensitiveFilterFingerprint: this.sensitiveFilterFingerprint,
+      committedHashes: [...this.committedHashes],
+      committedNormalized: this.committedSummaries.map((s) => s.norm),
+      committedSummaries: [...this.committedSummaries],
+      midTurn,
+      committedCount,
+      midTurnMeta:
+        midTurn && awaitingToolsList.length > 0
+          ? { awaitingTools: awaitingToolsList }
+          : null,
+      updatedAt: this.lastUsedAt,
+    });
+  }
+
   /**
    * 彻底消除 409 死锁：
    * 仅当 systemInstruction、tools、已提交前缀完全一致且工具挂起状态匹配时才复用；
@@ -622,8 +758,16 @@ export class AgySessionWorker {
     request: GeminiGenerateRequest,
     configSnapshot?: SensitiveFilterConfig & Partial<Pick<GatewayConfig, "defaultProxy">>,
     accountOverride?: AccountRecord,
+    requestedModel?: string,
   ): boolean {
     if (!this.isAlive) return false;
+    if (
+      requestedModel &&
+      requestedModel !== this.model &&
+      typeof this.transport?.setModel !== "function"
+    ) {
+      return false;
+    }
     if (
       accountOverride &&
       (accountOverride.id !== this.account.id || accountOverride.homeDir !== this.account.homeDir)
@@ -645,18 +789,45 @@ export class AgySessionWorker {
     }
     const nextSysHash = computeSystemHash(request, config);
     const nextToolsHash = computeToolsHash(request, config);
-    if (nextSysHash !== this.systemInstructionHash || nextToolsHash !== this.toolsHash) {
+    if (nextSysHash !== this.systemInstructionHash) {
       return false;
+    }
+    if (nextToolsHash !== this.toolsHash) {
+      if (!this.broker || this.registeredTools.length === 0) {
+        return false;
+      }
+      const nextDeclarations = applySensitiveFilterToTools(
+        collectToolDeclarations(request),
+        config,
+      );
+      const nextSanitized = sanitizeToolDeclarations(nextDeclarations);
+      if (
+        nextSanitized.tools.length <= this.registeredTools.length ||
+        !isToolsSuperset(this.registeredTools, nextSanitized.tools)
+      ) {
+        return false;
+      }
     }
 
     const incoming = request.contents ?? [];
-    if (incoming.length <= this.committedHashes.length) {
+    const committedLen =
+      this.committedSummaries.length > 0
+        ? this.committedSummaries.length
+        : this.committedHashes.length;
+    if (incoming.length <= committedLen) {
       return false;
     }
 
-    for (let i = 0; i < this.committedHashes.length; i++) {
-      if (hashJson(incoming[i]) !== this.committedHashes[i]) {
+    if (this.committedSummaries.length > 0) {
+      const { matchedCount } = findReusablePrefixLength(this.committedSummaries, incoming);
+      if (matchedCount !== this.committedSummaries.length) {
         return false;
+      }
+    } else {
+      for (let i = 0; i < this.committedHashes.length; i++) {
+        if (hashJson(incoming[i]) !== this.committedHashes[i]) {
+          return false;
+        }
       }
     }
 
@@ -664,7 +835,7 @@ export class AgySessionWorker {
       return false;
     }
 
-    // 如果当前有挂起的工具调用，新追加的内容必须包含对应的 functionResponse
+    // Continue a pending batch if the client answers at least one emitted call.
     if (this.awaitingTools.size > 0) {
       const unemittedIds = new Set(this.unemittedToolCalls.map((c) => c.id));
       const emittedAwaiting = new Map<string, ExposedToolCall>();
@@ -674,7 +845,7 @@ export class AgySessionWorker {
         }
       }
 
-      const tail = incoming.slice(this.committedHashes.length);
+      const tail = incoming.slice(committedLen);
       const providedIds = new Set<string>();
       for (const c of tail) {
         for (const p of c.parts ?? []) {
@@ -684,8 +855,9 @@ export class AgySessionWorker {
             }
           } else if (p.functionResponse?.name) {
             for (const [id, call] of emittedAwaiting.entries()) {
-              if (call.name === p.functionResponse.name) {
+              if (!providedIds.has(id) && call.name === p.functionResponse.name) {
                 providedIds.add(id);
+                break;
               }
             }
           }
@@ -707,7 +879,11 @@ export class AgySessionWorker {
     callbacks?: WorkerStreamCallbacks,
     signal?: AbortSignal,
     _retriedTokenLimit = false,
+    requestedModel?: string,
   ): Promise<WorkerPromptResult> {
+    const targetModel = requestedModel ?? this.pendingRequestedModel ?? this.model;
+    this.pendingRequestedModel = undefined;
+
     if (signal?.aborted) {
       await this.resetAndClose();
       throw new WorkerError("Request cancelled", { code: "CANCELLED" });
@@ -718,12 +894,14 @@ export class AgySessionWorker {
       await this.resetAndClose();
     }
 
+    const myTurnId = ++this.activeTurnId;
     this.busy = true;
     this.lastUsedAt = Date.now();
     this.activeTurnParts = [];
     this.internal429RetryCount = 0;
     this.stderrBuffer = "";
     this.stderrAbortTriggered = false;
+    this.streamGuard = new AgyStreamGuard();
     this.activeTurnCallbacks = callbacks;
     this.activeTurnTimings = {
       coldStart: false,
@@ -733,6 +911,7 @@ export class AgySessionWorker {
 
     const configSnapshot = getConfig();
     let onAbort: (() => void) | undefined;
+    let stopLogPolling: (() => void) | undefined;
     const abortPromise = signal
       ? new Promise<never>((_, reject) => {
           if (signal.aborted) {
@@ -747,12 +926,29 @@ export class AgySessionWorker {
       : null;
     abortPromise?.catch(() => {});
 
+    let toolsGrewUpdated = false;
     try {
       let reuse = false;
       const tryExecute = async () => {
-        reuse = this.canReuse(request, configSnapshot);
+        reuse = this.canReuse(request, configSnapshot, undefined, targetModel);
+        if (reuse && targetModel !== this.model) {
+          const prevModel = this.model;
+          this.model = targetModel;
+          try {
+            await this.selectModel({ models: { currentModelId: prevModel } }, undefined);
+          } catch (err) {
+            if (err instanceof WorkerError && err.code === "MODEL_SELECTION_FAILED") {
+              await this.resetAndClose();
+              this.onSessionStateChange?.(null);
+              reuse = false;
+            } else {
+              throw err;
+            }
+          }
+        }
         if (!reuse) {
-          const coldStartPromise = this.coldStart(request, configSnapshot);
+          this.model = targetModel;
+          const coldStartPromise = this.coldStart(request, configSnapshot, signal);
           if (abortPromise) {
             coldStartPromise.catch(() => {});
             reuse = await Promise.race([coldStartPromise, abortPromise]);
@@ -794,14 +990,32 @@ export class AgySessionWorker {
         }
       }
 
+      let newlyLoadedTools: SanitizedToolDefinition[] = [];
+      if (reuse) {
+        const nextToolsHash = computeToolsHash(request, configSnapshot);
+        if (nextToolsHash !== this.toolsHash && this.broker) {
+          const nextDeclarations = applySensitiveFilterToTools(
+            collectToolDeclarations(request),
+            configSnapshot,
+          );
+          const nextSanitized = sanitizeToolDeclarations(nextDeclarations);
+          const { added } = this.broker.updateTools(nextSanitized.tools);
+          newlyLoadedTools = added;
+          this.mcpToOriginal = nextSanitized.mcpToOriginal;
+          this.registeredTools = nextSanitized.tools;
+          this.toolsHash = nextToolsHash;
+          toolsGrewUpdated = true;
+        }
+      }
+
       const incoming = request.contents ?? [];
       const committedBeforeLen = this.committedHashes.length;
       const delta = reuse ? incoming.slice(committedBeforeLen) : incoming;
 
       // 收集需要喂给 broker 的工具调用结果（在挂载完本轮等待器后再交付）
       const payloads: ToolResultPayload[] = [];
+      const unemittedIds = new Set(this.unemittedToolCalls.map((c) => c.id));
       if (reuse && this.awaitingTools.size > 0 && this.broker) {
-        const unemittedIds = new Set(this.unemittedToolCalls.map((c) => c.id));
         for (const c of delta) {
           for (const p of c.parts ?? []) {
             if (!p.functionResponse) continue;
@@ -814,10 +1028,13 @@ export class AgySessionWorker {
                 }
               }
             }
-            if (callId && this.awaitingTools.has(callId)) {
+            if (callId && !unemittedIds.has(callId) && this.awaitingTools.has(callId)) {
+              const response = p.functionResponse.response ?? {};
+              const isError = isToolResponseError(response);
               payloads.push({
                 callId,
-                response: p.functionResponse.response ?? {},
+                response,
+                ...(isError ? { isError: true } : {}),
               });
               this.awaitingTools.delete(callId);
             }
@@ -834,10 +1051,6 @@ export class AgySessionWorker {
       this.activeTurnOpen = true;
       this.resetIdleTimer();
 
-      if (payloads.length > 0 && this.broker) {
-        this.broker.deliverResults(payloads);
-      }
-
       if (this.unemittedToolCalls.length > 0) {
         const pending = this.unemittedToolCalls.splice(0);
         for (const call of pending) {
@@ -853,6 +1066,24 @@ export class AgySessionWorker {
         }
         this.activeTurnOpen = false;
         this.activeToolBatchResolve?.();
+      }
+
+      if (payloads.length > 0 && this.broker) {
+        for (const id of this.awaitingTools.keys()) {
+          if (!unemittedIds.has(id)) {
+            payloads.push({
+              callId: id,
+              isError: true,
+              response: { error: "Client omitted tool result for this call" },
+            });
+            this.awaitingTools.delete(id);
+          }
+        }
+        this.broker.deliverResults(payloads);
+        if (this.awaitingTools.size > 0) {
+          this.lastUsedAt = Date.now();
+          this.emitSessionSnapshot(this.committedHashes.length, true);
+        }
       }
 
       if (!this.inFlightPromptPromise) {
@@ -874,27 +1105,38 @@ export class AgySessionWorker {
           configSnapshot,
         );
         const promptBlocks = serializeContentsWithBudget(filteredContents);
+        if (newlyLoadedTools.length > 0) {
+          const loadedNames = newlyLoadedTools.map((t) => t.mcpName).join(", ");
+          promptBlocks.push({
+            type: "text",
+            text: `These tools were loaded and can be called now: ${loadedNames}.`,
+          });
+        }
 
+        if (this.logFile) {
+          try {
+            const offset = statSync(this.logFile, { throwIfNoEntry: false })?.size ?? 0;
+            this.promptLog = { file: this.logFile, offset, reading: false };
+          } catch {
+            // An unreadable log leaves the stderr and ACP error paths active.
+          }
+        }
         this.activeTurnPromptStartMs = performance.now();
         const rawPrompt = this.transport!.prompt({
           sessionId: this.sessionId,
           model: this.model,
           prompt: promptBlocks,
         });
-        rawPrompt.then(
-          () => {
-            if (this.inFlightPromptPromise === rawPrompt) {
-              this.inFlightPromptPromise = null;
-            }
-          },
-          () => {
-            if (this.inFlightPromptPromise === rawPrompt) {
-              this.inFlightPromptPromise = null;
-            }
-          },
-        );
+        const clearPrompt = () => {
+          if (this.inFlightPromptPromise === rawPrompt) {
+            this.inFlightPromptPromise = null;
+            this.promptLog = undefined;
+          }
+        };
+        void rawPrompt.then(clearPrompt, clearPrompt);
         this.inFlightPromptPromise = rawPrompt;
       }
+      stopLogPolling = this.pollPromptLog();
 
       const raceCandidates: Promise<unknown>[] = [
         this.inFlightPromptPromise,
@@ -907,6 +1149,27 @@ export class AgySessionWorker {
 
       const raceResult = await Promise.race(raceCandidates);
       this.activeTurnOpen = false;
+      if (this.streamGuard) {
+        const flushed = this.streamGuard.flush();
+        if (flushed.emit) {
+          const part: GeminiPart = { text: flushed.emit };
+          this.activeTurnParts.push(part);
+          this.activeTurnCallbacks?.onPart?.(part);
+        }
+        if (flushed.quotaError) {
+          const retryAfterMs =
+            flushed.quotaError.retryAfterSec !== undefined
+              ? flushed.quotaError.retryAfterSec * 1000
+              : undefined;
+          await this.resetAndClose();
+          throw new WorkerError(flushed.quotaError.message, {
+            code: "QUOTA_EXHAUSTED",
+            upstreamStatus: 429,
+            ...(retryAfterMs !== undefined ? { retryAfterMs } : {}),
+            rawError: flushed.quotaError.message,
+          });
+        }
+      }
       const promptModel = reportedModel(raceResult);
       if (promptModel) {
         this.modelSelection.confirmedModel = promptModel;
@@ -942,27 +1205,15 @@ export class AgySessionWorker {
           ? "STOP"
           : mapStopReasonToFinishReason(stopReason);
 
-      this.committedContents = incoming.map((c) => structuredClone(c));
-      this.committedHashes = incoming.map((c) => hashJson(c));
+      this.committedSummaries = incoming.map((c) => summarizeMessageForHistory(c));
+      this.committedHashes = this.committedSummaries.map((s) => s.exactHash);
       this.lastAssistantText =
         this.awaitingTools.size === 0
           ? extractNonThoughtAssistantText(this.activeTurnParts)
           : null;
       this.lastUsedAt = Date.now();
 
-      if (this.sessionId) {
-        this.onSessionStateChange?.({
-          stickyKey: this.stickyKey,
-          sessionId: this.sessionId,
-          accountId: this.account.id,
-          model: this.model,
-          systemHash: this.systemInstructionHash,
-          toolsHash: this.toolsHash,
-          sensitiveFilterFingerprint: this.sensitiveFilterFingerprint,
-          committedHashes: [...this.committedHashes],
-          updatedAt: this.lastUsedAt,
-        });
-      }
+      this.emitSessionSnapshot(this.committedHashes.length, this.awaitingTools.size > 0);
 
       const rawUsage =
         this.awaitingTools.size === 0 && raceResult && typeof raceResult === "object"
@@ -1059,18 +1310,29 @@ export class AgySessionWorker {
         this.activeTurnCallbacks = undefined;
         this.busy = false;
         await this.resetAndClose();
-        return this.executePrompt(request, callbacks, signal, true);
+        return await this.executePrompt(request, callbacks, signal, true, targetModel);
       }
-      this.onSessionStateChange?.(null);
       const error = err instanceof WorkerError ? err : new WorkerError(
         msg,
         classifyUpstreamError(msg) ?? { code: "TRANSPORT_ERROR", rawError: msg },
       );
+      const keepsParkedStep =
+        error.code !== "MODEL_SELECTION_FAILED" &&
+        error.code !== "TIMEOUT" &&
+        error.code !== "CANCELLED" &&
+        this.awaitingTools.size > 0;
+      if (keepsParkedStep) {
+        this.lastUsedAt = Date.now();
+        this.emitSessionSnapshot(this.committedHashes.length, true);
+      } else {
+        this.onSessionStateChange?.(null);
+      }
       if (
         error.code === "MODEL_SELECTION_FAILED" ||
         error.code === "TIMEOUT" ||
         (this.broker && this.broker.pendingCount > 0) ||
-        this.inFlightPromptPromise !== null
+        this.inFlightPromptPromise !== null ||
+        (toolsGrewUpdated && this.awaitingTools.size === 0)
       ) {
         await this.resetAndClose();
       }
@@ -1079,22 +1341,31 @@ export class AgySessionWorker {
       if (signal && onAbort) {
         signal.removeEventListener("abort", onAbort);
       }
-      this.clearSoftErrorTimer();
-      this.clearIdleTimer();
-      this.activeTurnOpen = false;
-      this.activeSoftErrorAbort = undefined;
-      this.activeToolBatchResolve = undefined;
-      this.activeTurnCallbacks = undefined;
-      this.stderrBuffer = "";
-      this.stderrAbortTriggered = false;
-      this.busy = false;
+      stopLogPolling?.();
+      if (myTurnId === this.activeTurnId) {
+        this.clearSoftErrorTimer();
+        this.clearIdleTimer();
+        this.activeTurnOpen = false;
+        this.activeSoftErrorAbort = undefined;
+        this.activeToolBatchResolve = undefined;
+        this.activeTurnCallbacks = undefined;
+        this.streamGuard = null;
+        this.stderrBuffer = "";
+        this.stderrAbortTriggered = false;
+        this.busy = false;
+      }
     }
   }
 
   private async coldStart(
     request: GeminiGenerateRequest,
     configSnapshot?: SensitiveFilterConfig,
+    signal?: AbortSignal,
   ): Promise<boolean> {
+    if (signal?.aborted) {
+      await this.resetAndClose();
+      throw new WorkerError("Request cancelled", { code: "CANCELLED" });
+    }
     this.activeTurnTimings.coldStart = true;
     this.activeTurnTimings.sessionResumed = false;
 
@@ -1102,11 +1373,30 @@ export class AgySessionWorker {
     this.persistedSession = null;
     const prewarmed = this.prewarmedTransport;
     this.prewarmedTransport = null;
-    await this.resetAndClose();
 
     const gatewayConfig = getConfig();
     const config = configSnapshot ?? gatewayConfig;
     const effectiveProxy = resolveEffectiveProxy(this.account.proxyUrl, gatewayConfig);
+
+    const canReuseRecycled =
+      prewarmed === null &&
+      persisted === null &&
+      this.transport !== null &&
+      this.transport.isAlive() &&
+      this.sessionId === null &&
+      this.boundProxyUrl === effectiveProxy &&
+      this.initCaps !== null;
+
+    if (!canReuseRecycled) {
+      await this.resetAndClose();
+    }
+    if (signal?.aborted) {
+      if (prewarmed) {
+        await closeAgyTransport(prewarmed.transport, prewarmed.logFile).catch(() => {});
+      }
+      throw new WorkerError("Request cancelled", { code: "CANCELLED" });
+    }
+
     const declarations = applySensitiveFilterToTools(
       collectToolDeclarations(request),
       config,
@@ -1157,27 +1447,37 @@ export class AgySessionWorker {
 
     let initCaps: unknown;
     const canAdoptPrewarmed =
+      !canReuseRecycled &&
       prewarmed !== null &&
       prewarmed.transport.isAlive() &&
       (prewarmed.envHomeDir === undefined || prewarmed.envHomeDir === this.account.homeDir) &&
       prewarmed.boundProxyUrl === effectiveProxy;
 
-    if (canAdoptPrewarmed && prewarmed) {
+    if (canReuseRecycled) {
+      initCaps = this.initCaps;
+      this.transport?.onStderr?.((chunk) => this.handleStderrChunk(chunk));
+    } else if (canAdoptPrewarmed && prewarmed) {
       prewarmed.bindHandlers?.({
         onUpdate: (params) => this.handleUpdate(params),
         onExit: (code, stderr) => this.handleExit(code, stderr),
       });
       this.transport = prewarmed.transport;
+      this.logFile = prewarmed.logFile;
       this.transport.onStderr?.((chunk) => this.handleStderrChunk(chunk));
       this.boundProxyUrl = prewarmed.boundProxyUrl;
       initCaps = prewarmed.initCaps;
+      this.initCaps = initCaps;
     } else {
       if (prewarmed) {
-        void prewarmed.transport.close().catch(() => {});
+        void closeAgyTransport(prewarmed.transport, prewarmed.logFile).catch(() => {});
       }
 
       if (effectiveProxy && gatewayConfig.strictProxyBinding) {
         const reach = await checkProxyReachable(effectiveProxy);
+        if (signal?.aborted) {
+          await this.resetAndClose();
+          throw new WorkerError("Request cancelled", { code: "CANCELLED" });
+        }
         if (!reach.ok) {
           await this.resetAndClose();
           throw new WorkerError(
@@ -1198,9 +1498,11 @@ export class AgySessionWorker {
         proxyUrl: effectiveProxy,
         agyPath: binaryPath,
       });
+      const logFile = createAgyWorkerLogPath(this.account.homeDir);
       const args = buildAgyWorkerArgs({
         homeDir: this.account.homeDir,
         workspaceDir: this.workspaceDir,
+        logFile,
       });
 
       if (!this.tryAcquireWorkerSpawn(this.account.id)) {
@@ -1215,15 +1517,24 @@ export class AgySessionWorker {
       }
 
       this.boundProxyUrl = effectiveProxy;
-      this.transport = this.transportFactory({
-        binaryPath,
-        args,
-        cwd: this.workspaceDir,
-        env,
-        onUpdate: (params) => this.handleUpdate(params),
-        onExit: (code, stderr) => this.handleExit(code, stderr),
-        onStderr: (chunk) => this.handleStderrChunk(chunk),
-      });
+      try {
+        this.transport = this.transportFactory({
+          binaryPath,
+          args,
+          cwd: this.workspaceDir,
+          env,
+          onUpdate: (params) => this.handleUpdate(params),
+          onExit: (code, stderr) => {
+            void removeAgyWorkerLog(logFile);
+            this.handleExit(code, stderr);
+          },
+          onStderr: (chunk) => this.handleStderrChunk(chunk),
+        });
+      } catch (err) {
+        await removeAgyWorkerLog(logFile);
+        throw err;
+      }
+      this.logFile = logFile;
       this.transport.onStderr?.((chunk) => this.handleStderrChunk(chunk));
       this.activeTurnTimings.spawnMs = roundMs(performance.now() - spawnStart);
 
@@ -1231,6 +1542,11 @@ export class AgySessionWorker {
       initCaps = await this.transport.initialize().finally(() => {
         this.activeTurnTimings.initializeMs = roundMs(performance.now() - initStart);
       });
+      if (signal?.aborted) {
+        await this.resetAndClose();
+        throw new WorkerError("Request cancelled", { code: "CANCELLED" });
+      }
+      this.initCaps = initCaps;
     }
 
     const nextSysHash = computeSystemHash(request, config);
@@ -1243,17 +1559,16 @@ export class AgySessionWorker {
       config,
       'system',
     );
-    const cleanedSystemText = systemText.trim();
     const supportsSystemAppend = Boolean(
       (initCaps as unknown as { raw?: { agentCapabilities?: { _meta?: { antigravity?: { systemPrompt?: { append?: boolean } } } } } })
         ?.raw?.agentCapabilities?._meta?.antigravity?.systemPrompt?.append ?? true
     );
     const meta =
-      cleanedSystemText.trim().length > 0 && supportsSystemAppend
+      systemText.trim().length > 0 && supportsSystemAppend
         ? {
             antigravity: {
               systemPrompt: {
-                append: cleanedSystemText,
+                append: systemText,
               },
             },
           }
@@ -1268,13 +1583,19 @@ export class AgySessionWorker {
     };
     const canTryResume = (() => {
       if (!persisted) return false;
-      if (!Array.isArray(persisted.committedHashes) || persisted.committedHashes.length === 0) {
-        return false;
-      }
+      const persistedSummaries = Array.isArray(persisted.committedSummaries)
+        ? persisted.committedSummaries
+        : [];
+      const committedLen =
+        persistedSummaries.length > 0
+          ? persistedSummaries.length
+          : Array.isArray(persisted.committedHashes)
+            ? persisted.committedHashes.length
+            : 0;
+      if (committedLen === 0) return false;
       if (Date.now() - persisted.updatedAt > this.sessionTtlMs) return false;
       if (!supportsResume) return false;
       if (typeof this.transport?.resumeSession !== "function") return false;
-      if (persisted.model && persisted.model !== this.model) return false;
       if (persisted.accountId && persisted.accountId !== this.account.id) return false;
       if (nextSensitiveFingerprint !== (persisted.sensitiveFilterFingerprint ?? "")) {
         return false;
@@ -1282,9 +1603,61 @@ export class AgySessionWorker {
       if (nextSysHash !== persisted.systemHash || nextToolsHash !== persisted.toolsHash) {
         return false;
       }
-      if (incoming.length <= persisted.committedHashes.length) return false;
-      for (let i = 0; i < persisted.committedHashes.length; i++) {
-        if (hashJson(incoming[i]) !== persisted.committedHashes[i]) {
+      if (incoming.length <= committedLen) return false;
+      if (persistedSummaries.length > 0) {
+        const { matchedCount } = findReusablePrefixLength(persistedSummaries, incoming);
+        if (matchedCount !== persistedSummaries.length) {
+          return false;
+        }
+      } else if (
+        Array.isArray(persisted.committedNormalized) &&
+        persisted.committedNormalized.length === persisted.committedHashes.length
+      ) {
+        for (let i = 0; i < persisted.committedHashes.length; i++) {
+          const incomingSummary = summarizeMessageForHistory(incoming[i]);
+          if (
+            incomingSummary.exactHash !== persisted.committedHashes[i] &&
+            incomingSummary.norm !== persisted.committedNormalized[i]
+          ) {
+            return false;
+          }
+        }
+      } else {
+        for (let i = 0; i < persisted.committedHashes.length; i++) {
+          if (hashJson(incoming[i]) !== persisted.committedHashes[i]) {
+            return false;
+          }
+        }
+      }
+
+      if (persisted.midTurn) {
+        const expectedCount = persisted.committedCount ?? committedLen;
+        if (expectedCount <= 0 || expectedCount !== committedLen || incoming.length <= expectedCount) {
+          return false;
+        }
+        const parkedTools = persisted.midTurnMeta?.awaitingTools ?? [];
+        if (parkedTools.length === 0) {
+          return false;
+        }
+        const parkedIds = new Set(parkedTools.map((t) => t.id));
+        const parkedNames = new Set(parkedTools.map((t) => t.name));
+        const tail = incoming.slice(expectedCount);
+        let matchedToolResponse = false;
+        for (const c of tail) {
+          for (const p of c.parts ?? []) {
+            if (!p.functionResponse) continue;
+            if (p.functionResponse.id && parkedIds.has(p.functionResponse.id)) {
+              matchedToolResponse = true;
+              break;
+            }
+            if (p.functionResponse.name && parkedNames.has(p.functionResponse.name)) {
+              matchedToolResponse = true;
+              break;
+            }
+          }
+          if (matchedToolResponse) break;
+        }
+        if (!matchedToolResponse) {
           return false;
         }
       }
@@ -1292,33 +1665,66 @@ export class AgySessionWorker {
     })();
 
     const sessionSetupStart = performance.now();
-    if (canTryResume && persisted && this.transport.resumeSession) {
+    if (canTryResume && persisted && this.transport!.resumeSession) {
       let resumed: Awaited<ReturnType<NonNullable<AcpTransport['resumeSession']>>> | undefined;
+      let resumedSessionId: string | null = null;
+      this.resumingSession = true;
       try {
-        resumed = await this.transport.resumeSession({
+        resumed = await this.transport!.resumeSession({
           sessionId: persisted.sessionId,
           ...sessionParams,
         }) ?? {};
+        if (signal?.aborted) {
+          await this.resetAndClose();
+          throw new WorkerError("Request cancelled", { code: "CANCELLED" });
+        }
+        resumedSessionId = resumed.sessionId || persisted.sessionId;
+        this.sessionId = resumedSessionId;
+        await this.selectModel(resumed, sessionParams);
+        if (signal?.aborted) {
+          await this.resetAndClose();
+          throw new WorkerError("Request cancelled", { code: "CANCELLED" });
+        }
       } catch (err) {
+        if (err instanceof WorkerError && err.code === "CANCELLED") {
+          throw err;
+        }
         const msg = err instanceof Error ? err.message : String(err);
         console.warn(
           `[acp-worker] session/resume failed for stickyKey=${this.stickyKey ?? "none"} sessionId=${persisted.sessionId}, falling back to session/new: ${msg}`,
         );
+        this.sessionId = null;
+        resumed = undefined;
         this.onSessionStateChange?.(null);
       } finally {
+        this.resumingSession = false;
         this.activeTurnTimings.sessionSetupMs = roundMs(performance.now() - sessionSetupStart);
       }
-      if (resumed) {
+      if (resumed && resumedSessionId) {
         this.activeTurnTimings.sessionResumed = true;
-        this.sessionId = resumed.sessionId || persisted.sessionId;
-        await this.selectModel(resumed, sessionParams);
+        this.sessionId = resumedSessionId;
         this.systemInstructionHash = nextSysHash;
         this.toolsHash = nextToolsHash;
         this.sensitiveFilterFingerprint = nextSensitiveFingerprint;
+        this.registeredTools = sanitized.tools;
+        const persistedSummaries = Array.isArray(persisted.committedSummaries)
+          ? persisted.committedSummaries
+          : [];
+        const committedLen =
+          persistedSummaries.length > 0
+            ? persistedSummaries.length
+            : persisted.committedHashes.length;
         this.committedHashes = [...persisted.committedHashes];
-        this.committedContents = incoming
-          .slice(0, persisted.committedHashes.length)
-          .map((c) => structuredClone(c));
+        this.committedSummaries =
+          persistedSummaries.length > 0
+            ? [...persistedSummaries]
+            : incoming.slice(0, committedLen).map((c) => summarizeMessageForHistory(c));
+        this.awaitingTools.clear();
+        if (persisted.midTurn && persisted.midTurnMeta?.awaitingTools?.length) {
+          for (const call of persisted.midTurnMeta.awaitingTools) {
+            this.awaitingTools.set(call.id, { ...call });
+          }
+        }
         return true;
       }
     } else if (persisted) {
@@ -1326,9 +1732,13 @@ export class AgySessionWorker {
     }
 
     const newSessionStart = performance.now();
-    const session = await this.transport.newSession(sessionParams).finally(() => {
+    const session = await this.transport!.newSession(sessionParams).finally(() => {
       this.activeTurnTimings.sessionSetupMs = roundMs(performance.now() - newSessionStart);
     });
+    if (signal?.aborted) {
+      await this.resetAndClose();
+      throw new WorkerError("Request cancelled", { code: "CANCELLED" });
+    }
 
     if (!session || typeof session.sessionId !== "string" || session.sessionId.trim().length === 0) {
       throw new Error(
@@ -1339,10 +1749,15 @@ export class AgySessionWorker {
     this.sessionId = session.sessionId;
     this.stepUsageCursorState = null;
     await this.selectModel(session, supportsResume ? sessionParams : undefined);
+    if (signal?.aborted) {
+      await this.resetAndClose();
+      throw new WorkerError("Request cancelled", { code: "CANCELLED" });
+    }
     this.systemInstructionHash = nextSysHash;
     this.toolsHash = nextToolsHash;
     this.sensitiveFilterFingerprint = nextSensitiveFingerprint;
-    this.committedContents = [];
+    this.registeredTools = sanitized.tools;
+    this.committedSummaries = [];
     this.committedHashes = [];
     this.lastAssistantText = null;
     return false;
@@ -1421,6 +1836,7 @@ export class AgySessionWorker {
     const type = typeof update.sessionUpdate === "string" ? update.sessionUpdate : "";
 
     if (type === "agent_message_chunk" || type === "agent_thought_chunk") {
+      if (this.resumingSession) return;
       const content = update.content as Record<string, unknown> | undefined;
       const text = typeof content?.text === "string" ? content.text : "";
       if (!text) return;
@@ -1430,6 +1846,7 @@ export class AgySessionWorker {
 
       // Antigravity CLI emits `⚠ API error (attempt N): ...` (or bare retry hints) when upstream
       // transport/API fails and retries locally. Never let this CLI warning leak into model output.
+      let emitText = text;
       if (type === "agent_message_chunk") {
         const isApiErrorNotice =
           CLI_API_ERROR_PREFIX_RE.test(text) || CLI_BARE_API_ERROR_PREFIX_RE.test(text);
@@ -1462,14 +1879,39 @@ export class AgySessionWorker {
             return;
           }
         }
+
+        if (this.streamGuard) {
+          const guarded = this.streamGuard.push(text);
+          if (guarded.quotaError) {
+            if (guarded.emit) {
+              const part: GeminiPart = { text: guarded.emit };
+              this.activeTurnParts.push(part);
+              this.activeTurnCallbacks?.onPart?.(part);
+            }
+            const retryAfterMs =
+              guarded.quotaError.retryAfterSec !== undefined
+                ? guarded.quotaError.retryAfterSec * 1000
+                : undefined;
+            this.abortTurnImmediately(guarded.quotaError.message, {
+              code: "QUOTA_EXHAUSTED",
+              upstreamStatus: 429,
+              ...(retryAfterMs !== undefined ? { retryAfterMs } : {}),
+            });
+            return;
+          }
+          if (!guarded.emit) {
+            return;
+          }
+          emitText = guarded.emit;
+        }
       }
 
       // Model output (including thoughts) is data, not an upstream error signal.
       // Only explicit error frames and transport failures enter error classification.
       const part: GeminiPart =
         type === "agent_thought_chunk"
-          ? { text, thought: true }
-          : { text };
+          ? { text: emitText, thought: true }
+          : { text: emitText };
       this.activeTurnParts.push(part);
       this.activeTurnCallbacks?.onPart?.(part);
       return;
@@ -1544,6 +1986,50 @@ export class AgySessionWorker {
     }
     abort?.(err);
     return true;
+  }
+
+  private pollPromptLog(): (() => void) | undefined {
+    const log = this.promptLog;
+    if (!log) return;
+
+    let stopped = false;
+    const buffer = Buffer.allocUnsafe(MAX_LOG_READ_BYTES);
+    const isCurrentTurn = () => !stopped && this.promptLog === log &&
+      this.activeTurnOpen && Boolean(this.activeSoftErrorAbort);
+    const timer = setInterval(async () => {
+      if (log.reading || !isCurrentTurn()) return;
+      log.reading = true;
+      try {
+        const file = await open(log.file, "r");
+        const { bytesRead } = await file.read(buffer, 0, buffer.length, log.offset)
+          .finally(() => file.close());
+        if (!isCurrentTurn()) return;
+
+        const complete = buffer.subarray(0, bytesRead);
+        const lastNewline = complete.lastIndexOf(0x0a);
+        if (lastNewline === -1) return;
+        log.offset += lastNewline + 1;
+
+        for (const line of complete.toString("utf8", 0, lastNewline).split("\n")) {
+          const detail = AGY_RETRY_LOG_RE.exec(line)?.[1];
+          if (detail && /code 429\b/i.test(detail) && /resource has been exhausted/i.test(detail)) {
+            this.abortTurnImmediately(`RESOURCE_EXHAUSTED: ${detail}`, {
+              code: "QUOTA_EXHAUSTED",
+              upstreamStatus: 429,
+            });
+            break;
+          }
+        }
+      } catch {
+        // The CLI may not have created the log yet, and mocks need not create it.
+      } finally {
+        log.reading = false;
+      }
+    }, this.logPollIntervalMs);
+    return () => {
+      stopped = true;
+      clearInterval(timer);
+    };
   }
 
   private handleStderrChunk(chunk: string): void {
@@ -1651,25 +2137,94 @@ export class AgySessionWorker {
     }
   }
 
-  async resetAndClose(): Promise<void> {
+  async recycleSession(): Promise<boolean> {
+    if (
+      this.busy ||
+      !this.transport ||
+      !this.transport.isAlive() ||
+      this.awaitingTools.size > 0 ||
+      this.unemittedToolCalls.length > 0 ||
+      (this.broker && this.broker.pendingCount > 0) ||
+      this.inFlightPromptPromise !== null
+    ) {
+      return false;
+    }
+
+    const sid = this.sessionId;
+    if (sid) {
+      if (typeof this.transport.closeSession !== "function") {
+        return false;
+      }
+      try {
+        await this.transport.closeSession(sid);
+      } catch {
+        return false;
+      }
+    }
+
+    this.sessionId = null;
+    this.promptLog = undefined;
     this.modelSelection = {};
     this.stepUsageCursorState = null;
     this.clearSoftErrorTimer();
     this.clearIdleTimer();
-    this.inFlightPromptPromise = null;
     this.activeTurnOpen = false;
+    this.resumingSession = false;
     this.internal429RetryCount = 0;
     this.stderrBuffer = "";
     this.stderrAbortTriggered = false;
     this.unemittedToolCalls = [];
     this.activeToolBatchResolve = undefined;
     this.awaitingTools.clear();
-    this.committedContents = [];
+    this.committedSummaries = [];
     this.committedHashes = [];
+    this.pendingRequestedModel = undefined;
     this.lastAssistantText = null;
     this.systemInstructionHash = "";
     this.toolsHash = "";
     this.sensitiveFilterFingerprint = "";
+    this.mcpToOriginal.clear();
+    this.registeredTools = [];
+    this.persistedSession = null;
+    this.stickyKey = undefined;
+    this.onSessionStateChange = undefined;
+
+    if (this.broker) {
+      this.broker.cancelAllPending("Session recycled");
+      this.broker = null;
+    }
+    if (this.registeredMcp) {
+      this.registeredMcp.unregister();
+      this.registeredMcp = null;
+    }
+
+    return true;
+  }
+
+  async resetAndClose(): Promise<void> {
+    this.modelSelection = {};
+    this.stepUsageCursorState = null;
+    this.initCaps = null;
+    this.clearSoftErrorTimer();
+    this.clearIdleTimer();
+    this.inFlightPromptPromise = null;
+    this.promptLog = undefined;
+    this.activeTurnOpen = false;
+    this.resumingSession = false;
+    this.internal429RetryCount = 0;
+    this.stderrBuffer = "";
+    this.stderrAbortTriggered = false;
+    this.unemittedToolCalls = [];
+    this.activeToolBatchResolve = undefined;
+    this.awaitingTools.clear();
+    this.committedSummaries = [];
+    this.committedHashes = [];
+    this.pendingRequestedModel = undefined;
+    this.lastAssistantText = null;
+    this.systemInstructionHash = "";
+    this.toolsHash = "";
+    this.sensitiveFilterFingerprint = "";
+    this.registeredTools = [];
 
     if (this.broker) {
       this.broker.cancelAllPending("Worker reset");
@@ -1682,17 +2237,19 @@ export class AgySessionWorker {
     if (this.prewarmedTransport) {
       const pw = this.prewarmedTransport;
       this.prewarmedTransport = null;
-      await pw.transport.close().catch(() => {});
+      await closeAgyTransport(pw.transport, pw.logFile).catch(() => {});
     }
     if (this.transport) {
       const t = this.transport;
+      const logFile = this.logFile;
       this.transport = null;
+      this.logFile = undefined;
       this.boundProxyUrl = undefined;
       const sid = this.sessionId;
       this.sessionId = null;
       try {
         if (sid) await t.cancel(sid).catch(() => {});
-        await t.close();
+        await closeAgyTransport(t, logFile);
       } catch {}
     }
     this.boundProxyUrl = undefined;

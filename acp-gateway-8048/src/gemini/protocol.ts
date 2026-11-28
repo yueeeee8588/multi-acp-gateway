@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { stripVolatileSystem, type VolatileSystemOptions } from '../acp/volatile-system';
 import type {
   GeminiContent,
   GeminiGenerateRequest,
@@ -179,8 +180,11 @@ function extractStableTextFromContent(content?: { parts?: GeminiPart[] }): strin
   return chunks.join('\n');
 }
 
-export function computeSessionHash(req: GeminiGenerateRequest): string {
-  const sysText = extractStableTextFromContent(req.systemInstruction);
+export function computeSessionHash(
+  req: GeminiGenerateRequest,
+  options?: VolatileSystemOptions
+): string {
+  const sysText = stripVolatileSystem(extractStableTextFromContent(req.systemInstruction), options);
   const firstUser = req.contents.find((c: GeminiContent) => !c.role || c.role === 'user') ?? req.contents[0];
   const userText = extractStableTextFromContent(firstUser);
 

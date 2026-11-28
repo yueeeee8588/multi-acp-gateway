@@ -2,7 +2,6 @@ import { describe, expect, it } from 'bun:test';
 import { LoopbackMcpServer } from '../src/acp/loopback-mcp';
 import {
   AgySessionWorker,
-  WorkerError,
   type AcpTransport,
 } from '../src/acp/worker';
 import type { AccountRecord, GeminiGenerateRequest } from '../src/types';
@@ -294,7 +293,7 @@ describe('worker tool batch race & state machine fixes', () => {
     }
   });
 
-  it('3. idleTimeout immediately cancels parked MCP calls so pendingCount drops to 0', async () => {
+  it('3. immediately resolves an omitted parallel tool result with an MCP error', async () => {
     const mcpServer = new LoopbackMcpServer();
     await mcpServer.start();
 
@@ -307,8 +306,8 @@ describe('worker tool batch race & state machine fixes', () => {
       model: 'gemini-4-hydrogen-medium',
       workspaceDir: 'unused',
       mcpServer,
-      idleTimeoutMs: 60,
-      transportFactory: (): AcpTransport => ({
+      idleTimeoutMs: 5000,
+      transportFactory: ({ onUpdate }): AcpTransport => ({
         initialize: async () => ({ ok: true }),
         newSession: async (params) => {
           const servers = (params.mcpServers ?? []) as Array<{ url?: string }>;
@@ -341,8 +340,14 @@ describe('worker tool batch race & state machine fixes', () => {
               params: { name: toolName, arguments: { path: 'b.txt' } },
             });
 
-            const [t1, t2] = await Promise.all([t1Promise, parkedMcp2Response]);
-            return { stopReason: 'end_turn', t1, t2 };
+            await Promise.all([t1Promise, parkedMcp2Response]);
+            onUpdate({
+              update: {
+                sessionUpdate: 'agent_message_chunk',
+                content: { type: 'text', text: 'continued after parallel tools' },
+              },
+            });
+            return { stopReason: 'end_turn' };
           })();
         },
         cancel: async () => {},
@@ -360,12 +365,13 @@ describe('worker tool batch race & state machine fixes', () => {
       const turn1Res = await withTimeout(worker.executePrompt(turn1Req), 2000, 'Turn 1');
       const fcs = turn1Res.parts.filter((p) => p.functionCall).map((p) => p.functionCall!);
       expect(fcs).toHaveLength(2);
-      const fc1 = fcs[0]!;
+      const fc1 = fcs.find((call) => call.args?.path === 'a.txt')!;
+      expect(fc1).toBeDefined();
 
       const brokerBefore = (worker as unknown as { broker: { pendingCount: number } | null }).broker;
       expect(brokerBefore?.pendingCount).toBe(2);
 
-      // Deliver only tool_1 result so tool_2 stays parked on broker when idleTimeout triggers
+      // The client returns only tool_1, so the worker must settle tool_2 in the same turn.
       const turn2Req: GeminiGenerateRequest = {
         tools: SAMPLE_TOOLS,
         contents: [
@@ -386,25 +392,21 @@ describe('worker tool batch race & state machine fixes', () => {
         ],
       };
 
-      let caughtError: unknown = null;
-      try {
-        await withTimeout(worker.executePrompt(turn2Req), 2000, 'Turn 2 idleTimeout');
-      } catch (err) {
-        caughtError = err;
-      }
-
-      expect(caughtError).toBeInstanceOf(WorkerError);
-      expect((caughtError as WorkerError).code).toBe('TIMEOUT');
+      const turn2Res = await withTimeout(worker.executePrompt(turn2Req), 2000, 'Turn 2');
+      expect(turn2Res.parts.map((p) => p.text).join('')).toBe('continued after parallel tools');
       expect(promptCalls).toBe(1);
 
       const brokerAfter = (worker as unknown as { broker: { pendingCount: number } | null }).broker;
-      expect(brokerAfter).toBeNull();
+      expect(brokerAfter).toBe(brokerBefore);
+      expect(brokerAfter?.pendingCount).toBe(0);
       expect((worker as unknown as { inFlightPromptPromise: unknown }).inFlightPromptPromise).toBeNull();
 
-      // The still-parked MCP HTTP request (tool_2) must have settled immediately with an error result
       expect(parkedMcp2Response).not.toBeNull();
-      const settledMcp = await withTimeout(parkedMcp2Response!, 500, 'parked MCP settle');
-      expect(settledMcp?.result?.isError).toBe(true);
+      const settledMcp = await withTimeout(parkedMcp2Response!, 500, 'omitted MCP result');
+      expect(settledMcp?.result).toEqual({
+        isError: true,
+        content: [{ type: 'text', text: JSON.stringify({ error: 'Client omitted tool result for this call' }) }],
+      });
     } finally {
       await worker.resetAndClose();
       await mcpServer.stop();

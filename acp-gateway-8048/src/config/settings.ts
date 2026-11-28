@@ -41,6 +41,68 @@ function normalizeBoolean(value: unknown, fallback: boolean): boolean {
   return typeof value === 'boolean' ? value : fallback;
 }
 
+function normalizeString(value: unknown, fallback: string): string {
+  return typeof value === 'string' ? value : fallback;
+}
+
+function normalizePositiveInt(value: unknown, fallback: number): number {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value < 1) {
+    return fallback;
+  }
+  return Math.max(1, Math.round(value));
+}
+
+function normalizeNonNegativeInt(value: unknown, fallback: number): number {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) {
+    return fallback;
+  }
+  return Math.max(0, Math.round(value));
+}
+
+function normalizeCooldownStepsMinutes(value: unknown, fallback: number[]): number[] {
+  if (!Array.isArray(value)) {
+    return [...fallback];
+  }
+  const filtered = value.filter(
+    (item): item is number => typeof item === 'number' && Number.isFinite(item) && item > 0,
+  );
+  return filtered.length > 0 ? filtered : [...fallback];
+}
+
+export function validateCoreConfigPatch(patch: Record<string, unknown>): void {
+  for (const field of ['host', 'agyPath'] as const) {
+    if (field in patch && patch[field] !== undefined && typeof patch[field] !== 'string') {
+      throw new Error(`${field} must be a string`);
+    }
+  }
+  for (const field of ['perAccountConcurrency', 'maxImagesPerRequest', 'maxLogsRetained'] as const) {
+    if (field in patch && patch[field] !== undefined) {
+      const value = patch[field];
+      if (typeof value !== 'number' || !Number.isInteger(value) || value < 1) {
+        throw new Error(`${field} must be a positive integer`);
+      }
+    }
+  }
+  for (const field of ['maxAccountSwitches', 'queueWaitTimeoutMs', 'softErrorCutoffMs'] as const) {
+    if (field in patch && patch[field] !== undefined) {
+      const value = patch[field];
+      if (typeof value !== 'number' || !Number.isInteger(value) || value < 0) {
+        throw new Error(`${field} must be a non-negative integer`);
+      }
+    }
+  }
+  if ('cooldownStepsMinutes' in patch && patch.cooldownStepsMinutes !== undefined) {
+    const value = patch.cooldownStepsMinutes;
+    if (
+      !Array.isArray(value) ||
+      value.length === 0 ||
+      !value.every((item) => typeof item === 'number' && Number.isFinite(item) && item > 0)
+    ) {
+      throw new Error('cooldownStepsMinutes must be a non-empty array of positive numbers');
+    }
+  }
+}
+
 function normalizeBoundedInt(
   value: unknown,
   min: number,
@@ -64,6 +126,7 @@ function normalizeQuotaCooldownScope(
 }
 
 export function validateRiskControlPatch(patch: Record<string, unknown>): void {
+  validateCoreConfigPatch(patch);
   for (const field of [
     'strictProxyBinding',
     'blockOnExitIpDrift',
@@ -214,6 +277,7 @@ export const DEFAULT_CONFIG: GatewayConfig = {
   maxInternal429RetriesBeforeCancel: 2,
   sensitiveFilterEnabled: false,
   sensitiveWords: [],
+  modelAccountBindings: [],
 };
 
 const CACHE_SETTLING_DELAY_MIN_MS = 0;
@@ -256,20 +320,57 @@ export function getConfig(): GatewayConfig {
   if (cachedConfig) {
     return {
       ...cachedConfig,
+      cooldownStepsMinutes: [...cachedConfig.cooldownStepsMinutes],
       sensitiveWords: cachedConfig.sensitiveWords.map((rule) => ({ ...rule })),
+      modelAccountBindings: (cachedConfig.modelAccountBindings ?? []).map((b) => ({
+        ...b,
+        accountIds: [...b.accountIds],
+      })),
     };
   }
   const saved = store.getConfigValue<Partial<GatewayConfig>>(CONFIG_KEY);
   const resolved: GatewayConfig = !saved
-    ? { ...DEFAULT_CONFIG, sensitiveWords: [] }
+    ? {
+        ...DEFAULT_CONFIG,
+        cooldownStepsMinutes: [...DEFAULT_CONFIG.cooldownStepsMinutes],
+        sensitiveWords: [],
+        modelAccountBindings: [],
+      }
     : {
         ...DEFAULT_CONFIG,
         ...saved,
         port: DEFAULT_CONFIG.port,
+        host: normalizeString(saved.host, DEFAULT_CONFIG.host),
+        agyPath: normalizeString(saved.agyPath, DEFAULT_CONFIG.agyPath),
         routingStrategy: normalizeRoutingStrategy(saved.routingStrategy, DEFAULT_CONFIG.routingStrategy),
-        cooldownStepsMinutes: Array.isArray(saved.cooldownStepsMinutes)
-          ? saved.cooldownStepsMinutes
-          : DEFAULT_CONFIG.cooldownStepsMinutes,
+        perAccountConcurrency: normalizePositiveInt(
+          saved.perAccountConcurrency,
+          DEFAULT_CONFIG.perAccountConcurrency,
+        ),
+        maxAccountSwitches: normalizeNonNegativeInt(
+          saved.maxAccountSwitches,
+          DEFAULT_CONFIG.maxAccountSwitches,
+        ),
+        queueWaitTimeoutMs: normalizeNonNegativeInt(
+          saved.queueWaitTimeoutMs,
+          DEFAULT_CONFIG.queueWaitTimeoutMs,
+        ),
+        softErrorCutoffMs: normalizeNonNegativeInt(
+          saved.softErrorCutoffMs,
+          DEFAULT_CONFIG.softErrorCutoffMs,
+        ),
+        cooldownStepsMinutes: normalizeCooldownStepsMinutes(
+          saved.cooldownStepsMinutes,
+          DEFAULT_CONFIG.cooldownStepsMinutes,
+        ),
+        maxImagesPerRequest: normalizePositiveInt(
+          saved.maxImagesPerRequest,
+          DEFAULT_CONFIG.maxImagesPerRequest,
+        ),
+        maxLogsRetained: normalizePositiveInt(
+          saved.maxLogsRetained,
+          DEFAULT_CONFIG.maxLogsRetained,
+        ),
         streamThoughtImmediately:
           typeof saved.streamThoughtImmediately === 'boolean'
             ? saved.streamThoughtImmediately
@@ -360,6 +461,9 @@ export function getConfig(): GatewayConfig {
           saved.sensitiveWords,
           DEFAULT_CONFIG.sensitiveWords,
         ),
+        modelAccountBindings: Array.isArray(saved.modelAccountBindings)
+          ? saved.modelAccountBindings
+          : DEFAULT_CONFIG.modelAccountBindings,
       };
   const envDelay = parseEnvCacheSettlingDelayMs();
   if (envDelay !== null) {
@@ -368,7 +472,12 @@ export function getConfig(): GatewayConfig {
   cachedConfig = resolved;
   return {
     ...resolved,
+    cooldownStepsMinutes: [...resolved.cooldownStepsMinutes],
     sensitiveWords: resolved.sensitiveWords.map((rule) => ({ ...rule })),
+    modelAccountBindings: (resolved.modelAccountBindings ?? []).map((b) => ({
+      ...b,
+      accountIds: [...b.accountIds],
+    })),
   };
 }
 
@@ -390,6 +499,14 @@ export function updateConfig(patch: Partial<GatewayConfig>): GatewayConfig {
     ...current,
     ...patch,
     port: DEFAULT_CONFIG.port,
+    host:
+      'host' in patch && patch.host !== undefined
+        ? normalizeString(patch.host, current.host)
+        : current.host,
+    agyPath:
+      'agyPath' in patch && patch.agyPath !== undefined
+        ? normalizeString(patch.agyPath, current.agyPath)
+        : current.agyPath,
     apiKey:
       typeof patch.apiKey === 'string' && !isMaskedApiKey(patch.apiKey)
         ? patch.apiKey
@@ -399,9 +516,34 @@ export function updateConfig(patch: Partial<GatewayConfig>): GatewayConfig {
         ? patch.defaultProxy
         : current.defaultProxy,
     routingStrategy: normalizeRoutingStrategy(patch.routingStrategy, current.routingStrategy),
-    cooldownStepsMinutes: Array.isArray(patch.cooldownStepsMinutes)
-      ? patch.cooldownStepsMinutes
-      : current.cooldownStepsMinutes,
+    perAccountConcurrency:
+      'perAccountConcurrency' in patch && patch.perAccountConcurrency !== undefined
+        ? normalizePositiveInt(patch.perAccountConcurrency, current.perAccountConcurrency)
+        : current.perAccountConcurrency,
+    maxAccountSwitches:
+      'maxAccountSwitches' in patch && patch.maxAccountSwitches !== undefined
+        ? normalizeNonNegativeInt(patch.maxAccountSwitches, current.maxAccountSwitches)
+        : current.maxAccountSwitches,
+    queueWaitTimeoutMs:
+      'queueWaitTimeoutMs' in patch && patch.queueWaitTimeoutMs !== undefined
+        ? normalizeNonNegativeInt(patch.queueWaitTimeoutMs, current.queueWaitTimeoutMs)
+        : current.queueWaitTimeoutMs,
+    softErrorCutoffMs:
+      'softErrorCutoffMs' in patch && patch.softErrorCutoffMs !== undefined
+        ? normalizeNonNegativeInt(patch.softErrorCutoffMs, current.softErrorCutoffMs)
+        : current.softErrorCutoffMs,
+    cooldownStepsMinutes:
+      'cooldownStepsMinutes' in patch && patch.cooldownStepsMinutes !== undefined
+        ? normalizeCooldownStepsMinutes(patch.cooldownStepsMinutes, current.cooldownStepsMinutes)
+        : [...current.cooldownStepsMinutes],
+    maxImagesPerRequest:
+      'maxImagesPerRequest' in patch && patch.maxImagesPerRequest !== undefined
+        ? normalizePositiveInt(patch.maxImagesPerRequest, current.maxImagesPerRequest)
+        : current.maxImagesPerRequest,
+    maxLogsRetained:
+      'maxLogsRetained' in patch && patch.maxLogsRetained !== undefined
+        ? normalizePositiveInt(patch.maxLogsRetained, current.maxLogsRetained)
+        : current.maxLogsRetained,
     streamThoughtImmediately:
       typeof patch.streamThoughtImmediately === 'boolean'
         ? patch.streamThoughtImmediately
@@ -507,6 +649,7 @@ export function updateConfig(patch: Partial<GatewayConfig>): GatewayConfig {
   cachedConfig = next;
   return {
     ...next,
+    cooldownStepsMinutes: [...next.cooldownStepsMinutes],
     sensitiveWords: next.sensitiveWords.map((rule) => ({ ...rule })),
   };
 }

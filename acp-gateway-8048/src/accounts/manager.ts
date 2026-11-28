@@ -10,8 +10,16 @@ import { store } from "../db/store";
 import { eventBus } from "../logs/events";
 import { checkProxyReachable, detectExitIpDrift, probeAccountExit } from "./exit-probe";
 import { authorizeSingleAccountOAuth } from "./chrome-scan";
-import { fetchAccountQuota } from "./quota";
-import type { AccountQuotaSnapshot, AccountRecord, AccountStatus, AccountTier } from "../types";
+import {
+  createUsageReader,
+  fetchAccountQuota,
+  isLegacyDirectQuotaEnabled,
+  mergeUsageSnapshotWithPreviousModels,
+  type Quota403Restriction,
+  type UsageReader,
+} from "./quota";
+import { normalizeModelAccessRule } from "./model-binding";
+import type { AccountQuotaSnapshot, AccountRecord, AccountStatus, AccountTier, ModelAccessRule } from "../types";
 
 export const GOOGLE_CLIENT_ID =
   process.env.AGY_GOOGLE_CLIENT_ID ||
@@ -53,6 +61,26 @@ let acpProbeDeps: AcpProbeDeps = {};
 /** 仅用于测试注入 ACP 探活依赖；生产不调用。 */
 export function __setAcpProbeDepsForTest(deps: AcpProbeDeps): void {
   acpProbeDeps = deps;
+}
+
+function formatQuotaRestrictionReason(restriction: Quota403Restriction): string {
+  const prefix =
+    restriction.kind === "validation_required"
+      ? "Account verification required"
+      : "Account restricted (ToS violation)";
+  const base = `${prefix}: ${restriction.message}`;
+  const withUrl =
+    restriction.validationUrl && !base.includes(restriction.validationUrl)
+      ? `${base} (${restriction.validationUrl})`
+      : base;
+  return withUrl.slice(0, 1000);
+}
+
+let testUsageReader: UsageReader | undefined;
+
+/** 仅用于测试注入配额读取器；生产不调用。 */
+export function __setUsageReaderForTest(reader?: UsageReader): void {
+  testUsageReader = reader;
 }
 
 /**
@@ -353,6 +381,7 @@ export interface UpdateAccountPatch {
   status?: AccountStatus;
   statusReason?: string;
   tier?: AccountTier;
+  modelAccessRule?: ModelAccessRule;
   concurrencyLimit?: number;
 }
 
@@ -509,6 +538,15 @@ export class AccountManager {
   private readonly quotaWaiters: Array<() => void> = [];
   private activeQuotaJobs = 0;
   private bulkQuotaJob?: Promise<{ refreshed: number; failed: number; accounts: AccountRecord[] }>;
+  private readonly defaultUsageReader: UsageReader = createUsageReader({
+    readCredentials: readOAuthCredentials,
+  });
+  private usageReaderOverride?: UsageReader;
+
+  /** 仅用于测试在实例级注入 UsageReader。 */
+  setUsageReaderForTest(reader?: UsageReader): void {
+    this.usageReaderOverride = reader;
+  }
 
   listAccounts(): AccountRecord[] {
     return store.listAccounts();
@@ -566,6 +604,9 @@ export class AccountManager {
       proxyUrl: patch.proxyUrl !== undefined ? patch.proxyUrl : existing.proxyUrl,
       status: patch.status !== undefined ? patch.status : existing.status,
       statusReason: nextStatusReason,
+      modelAccessRule: normalizeModelAccessRule(
+        patch.modelAccessRule === undefined ? existing.modelAccessRule : patch.modelAccessRule,
+      ),
       tier: patch.tier !== undefined ? (patch.tier === "pro" ? "pro" : "standard") : existing.tier,
       concurrencyLimit:
         patch.concurrencyLimit !== undefined ? patch.concurrencyLimit : existing.concurrencyLimit,
@@ -716,6 +757,7 @@ export class AccountManager {
       if (email && (email !== acc.email || email !== acc.label)) {
         store.upsertAccount({
           ...acc,
+          modelAccessRule: undefined,
           email,
           label: email,
           updatedAt: Date.now(),
@@ -834,12 +876,16 @@ export class AccountManager {
           const now = Date.now();
           store.upsertAccount({
             ...existing,
+            modelAccessRule: undefined,
             ...(detectedTier ? { tier: detectedTier } : {}),
             status: "ready",
             statusReason: "",
             lastVerifiedAt: now,
             updatedAt: now,
           });
+          if (store.deleteCooldown(existing.id, "*", "global")) {
+            eventBus.emit("cooldowns", store.listCooldowns(now));
+          }
           updated++;
           results.push({
             index,
@@ -920,6 +966,7 @@ export class AccountManager {
       const now = Date.now();
       store.upsertAccount({
         ...acc,
+        modelAccessRule: undefined,
         status: "ready",
         statusReason: "",
         lastVerifiedAt: now,
@@ -982,26 +1029,45 @@ export class AccountManager {
       detectedTier?: AccountTier | null,
       quotaSnapshot?: AccountQuotaSnapshot | null,
       preserveExitBaseline = false
-    ): AccountRecord => {
+    ): AccountRecord | null => {
+      const latest = store.getAccount(accountId);
+      if (!latest || latest.homeDir !== acc.homeDir) return null;
+
+      const preservedDisabled = latest.status === "disabled";
+      const effectiveStatus: AccountStatus = preservedDisabled ? "disabled" : status;
+      const rawReason = preservedDisabled ? latest.statusReason : statusReason;
       const effectiveReason =
-        !probeOk && status === "ready" && !statusReason
+        !probeOk && effectiveStatus === "ready" && !rawReason
           ? `Exit IP probe failed (keeping cached IP): ${probe.error ?? "unknown"}`
-          : statusReason;
+          : rawReason;
       const shouldUpdateExit = probeOk && !preserveExitBaseline;
+
+      const previousQuota = latest.quota;
+      const keepPreviousQuota =
+        Boolean(quotaSnapshot?.error) &&
+        Boolean(previousQuota) &&
+        Object.values(previousQuota!.pools).some(Boolean);
+      const nextQuota =
+        quotaSnapshot === undefined
+          ? undefined
+          : keepPreviousQuota
+            ? { ...previousQuota!, error: quotaSnapshot!.error }
+            : quotaSnapshot;
+
       const updated: AccountRecord = {
-        ...acc,
+        ...latest,
         ...(detectedTier ? { tier: detectedTier } : {}),
-        ...(quotaSnapshot !== undefined ? { quota: quotaSnapshot } : {}),
-        exitIp: shouldUpdateExit ? probe.exitIp : acc.exitIp,
-        exitCountry: shouldUpdateExit ? (probe.exitCountry || acc.exitCountry) : acc.exitCountry,
-        status,
+        ...(nextQuota !== undefined ? { quota: nextQuota } : {}),
+        exitIp: shouldUpdateExit ? probe.exitIp : latest.exitIp,
+        exitCountry: shouldUpdateExit ? (probe.exitCountry || latest.exitCountry) : latest.exitCountry,
+        status: effectiveStatus,
         statusReason: effectiveReason,
-        lastVerifiedAt: shouldUpdateExit ? now : acc.lastVerifiedAt,
+        lastVerifiedAt: shouldUpdateExit ? now : latest.lastVerifiedAt,
         updatedAt: now,
       };
       store.upsertAccount(updated);
-      if (status === "ready") {
-        const deleted = store.deleteCooldown(acc.id, "*", "global");
+      if (effectiveStatus === "ready") {
+        const deleted = store.deleteCooldown(latest.id, "*", "global");
         if (deleted) {
           eventBus.emit("cooldowns", store.listCooldowns(now));
         }
@@ -1029,27 +1095,38 @@ export class AccountManager {
     let quotaSnapshot: AccountQuotaSnapshot | undefined;
     try {
       const tokens = await exchangeOAuthRefreshToken(refreshToken, proxy);
+      if (store.getAccount(accountId)?.homeDir !== acc.homeDir) return null;
       writeIsolatedAgyOAuthToken(acc.homeDir, tokens);
 
-      // 拿到新 access_token 后顺带真实探测账号等级与三号池配额（配额失败不破坏 ready 状态）
+      // 拿到新 access_token 后顺带真实探测账号等级（仅在显式开启遗留直连开关时才拉取内部配额接口）
       detectedTier = await detectAccountTier(tokens.accessToken, proxy);
-      try {
-        const quotaRes = await fetchAccountQuota({
-          accessToken: tokens.accessToken,
-          proxyUrl: proxy,
-          projectId: acc.quota?.projectId,
-        });
-        quotaSnapshot = quotaRes.snapshot;
-        if (!detectedTier && quotaRes.detectedTier) {
-          detectedTier = quotaRes.detectedTier;
+      if (isLegacyDirectQuotaEnabled()) {
+        try {
+          const quotaRes = await fetchAccountQuota({
+            accessToken: tokens.accessToken,
+            proxyUrl: proxy,
+            projectId: acc.quota?.projectId,
+          });
+          quotaSnapshot = quotaRes.snapshot;
+          if (!detectedTier && quotaRes.detectedTier) {
+            detectedTier = quotaRes.detectedTier;
+          }
+          if (quotaRes.restriction) {
+            return saveResult(
+              "restricted",
+              formatQuotaRestrictionReason(quotaRes.restriction),
+              detectedTier,
+              quotaSnapshot
+            );
+          }
+        } catch (quotaErr) {
+          quotaSnapshot = {
+            fetchedAt: Date.now(),
+            ...(acc.quota?.projectId ? { projectId: acc.quota.projectId } : {}),
+            pools: { gemini_flagship: null, gemini_flash: null, third_party: null },
+            error: quotaErr instanceof Error ? quotaErr.message : String(quotaErr),
+          };
         }
-      } catch (quotaErr) {
-        quotaSnapshot = {
-          fetchedAt: Date.now(),
-          ...(acc.quota?.projectId ? { projectId: acc.quota.projectId } : {}),
-          pools: { gemini_flagship: null, gemini_flash: null, third_party: null },
-          error: quotaErr instanceof Error ? quotaErr.message : String(quotaErr),
-        };
       }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -1172,7 +1249,8 @@ export class AccountManager {
     let cursor = 0;
 
     const markAuthRequired = (acc: AccountRecord, statusReason: string): void => {
-      const latest = store.getAccount(acc.id) ?? acc;
+      const latest = store.getAccount(acc.id);
+      if (!latest || latest.homeDir !== acc.homeDir || latest.status === "disabled") return;
       store.upsertAccount({
         ...latest,
         status: "auth_required",
@@ -1287,7 +1365,8 @@ export class AccountManager {
           return;
         }
 
-        const latest = store.getAccount(acc.id) ?? acc;
+        const latest = store.getAccount(acc.id);
+        if (!latest || latest.homeDir !== acc.homeDir) return;
         store.upsertAccount({ ...latest, tier: detectedTier, updatedAt: Date.now() });
         updated++;
         if (detectedTier === "pro") pro++;
@@ -1366,15 +1445,24 @@ export class AccountManager {
 
     const persistQuota = (
       snapshot: AccountQuotaSnapshot,
-      detectedTier?: AccountTier | null
+      detectedTier?: AccountTier | null,
+      restriction?: Quota403Restriction
     ): AccountRecord | null => {
       const latest = store.getAccount(accountId);
       if (!latest || latest.homeDir !== acc.homeDir) return null;
       const previous = latest.quota;
       const keepPrevious = !!snapshot.error && previous && Object.values(previous.pools).some(Boolean);
+      const restrictionUpdate =
+        restriction && latest.status !== "disabled"
+          ? {
+              status: "restricted" as const,
+              statusReason: formatQuotaRestrictionReason(restriction),
+            }
+          : {};
       const updated: AccountRecord = {
         ...latest,
         ...(detectedTier ? { tier: detectedTier } : {}),
+        ...restrictionUpdate,
         quota: keepPrevious ? { ...previous, error: snapshot.error } : snapshot,
         updatedAt: Date.now(),
       };
@@ -1391,6 +1479,52 @@ export class AccountManager {
       error: message.slice(0, 200),
     });
     const credentials = readOAuthCredentials(acc.homeDir);
+
+    if (!isLegacyDirectQuotaEnabled()) {
+      const reader = testUsageReader ?? this.usageReaderOverride ?? this.defaultUsageReader;
+      const runUsage = (creds: ReturnType<typeof readOAuthCredentials>) =>
+        reader.readUsage({
+          accountId: acc.id,
+          homeDir: acc.homeDir,
+          proxyUrl: proxy,
+          projectId,
+          strictProxyBinding: cfg.strictProxyBinding,
+          agyPath: cfg.agyPath,
+          credentials: creds,
+        });
+      let usageResult = await runUsage(credentials);
+      if (usageResult.status === "DUE_FOR_RENEWAL" && credentials?.refreshToken) {
+        try {
+          const tokens = await exchangeOAuthRefreshToken(credentials.refreshToken, proxy);
+          if (store.getAccount(accountId)?.homeDir !== acc.homeDir) return null;
+          writeIsolatedAgyOAuthToken(acc.homeDir, tokens);
+          const renewed = readOAuthCredentials(acc.homeDir) ?? {
+            accessToken: tokens.accessToken,
+            refreshToken: tokens.refreshToken || credentials.refreshToken,
+            expiresAt: Date.now() + tokens.expiresIn * 1000,
+          };
+          usageResult = await runUsage(renewed);
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          return failure(`OAuth renewal failed before usage check: ${message}`);
+        }
+      }
+      if (usageResult.status === "ok" && usageResult.snapshot) {
+        const latestBeforeSave = store.getAccount(accountId);
+        const merged = mergeUsageSnapshotWithPreviousModels(latestBeforeSave?.quota, usageResult.snapshot);
+        return persistQuota(merged);
+      }
+      if (usageResult.status === "STILL_READING") {
+        return failure(usageResult.message ?? "STILL_READING: usage check continuing in background");
+      }
+      if (usageResult.status === "DUE_FOR_RENEWAL") {
+        return failure(
+          usageResult.message ?? "DUE_FOR_RENEWAL: access token expired or expiring within 2 minutes"
+        );
+      }
+      return failure(usageResult.error ?? "Usage check failed");
+    }
+
     if (!credentials) return failure("Missing OAuth token");
 
     const { refreshToken, expiresAt } = credentials;
@@ -1404,7 +1538,7 @@ export class AccountManager {
       if (canUseAccessToken) {
         result = await fetchQuota(credentials.accessToken);
         if (!result.accessTokenRejected || !refreshToken) {
-          return persistQuota(result.snapshot, result.detectedTier);
+          return persistQuota(result.snapshot, result.detectedTier, result.restriction);
         }
       }
       if (!refreshToken) return failure("Missing or expired OAuth access token");
@@ -1417,7 +1551,7 @@ export class AccountManager {
       const message = err instanceof Error ? err.message : String(err);
       return failure(message);
     }
-    return persistQuota(result.snapshot, result.detectedTier);
+    return persistQuota(result.snapshot, result.detectedTier, result.restriction);
   }
 
   /**

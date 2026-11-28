@@ -472,6 +472,50 @@ export function convertAnthropicToGeminiRequest(
     }
   }
 
+  let toolConfig: GeminiGenerateRequest['toolConfig'];
+  if (raw.tool_choice !== undefined && raw.tool_choice !== null) {
+    if (!isPlainObject(raw.tool_choice) || typeof raw.tool_choice.type !== 'string') {
+      throw new AnthropicProtocolError(
+        400,
+        'invalid_request_error',
+        'tool_choice must be an object with a type'
+      );
+    }
+    switch (raw.tool_choice.type) {
+      case 'none':
+        toolConfig = { functionCallingConfig: { mode: 'NONE' } };
+        break;
+      case 'auto':
+        toolConfig = { functionCallingConfig: { mode: 'AUTO' } };
+        break;
+      case 'any':
+        toolConfig = { functionCallingConfig: { mode: 'ANY' } };
+        break;
+      case 'tool': {
+        if (typeof raw.tool_choice.name !== 'string' || raw.tool_choice.name.trim() === '') {
+          throw new AnthropicProtocolError(
+            400,
+            'invalid_request_error',
+            'tool_choice.name must be a non-empty string when type="tool"'
+          );
+        }
+        toolConfig = {
+          functionCallingConfig: {
+            mode: 'ANY',
+            allowedFunctionNames: [raw.tool_choice.name.trim()],
+          },
+        };
+        break;
+      }
+      default:
+        throw new AnthropicProtocolError(
+          400,
+          'invalid_request_error',
+          `Unsupported tool_choice.type: ${raw.tool_choice.type}`
+        );
+    }
+  }
+
   const generationConfig: Record<string, unknown> = {};
   if (typeof raw.max_tokens === 'number') {
     generationConfig.maxOutputTokens = raw.max_tokens;
@@ -533,6 +577,7 @@ export function convertAnthropicToGeminiRequest(
     contents,
     ...(systemInstruction ? { systemInstruction } : {}),
     ...(tools ? { tools } : {}),
+    ...(toolConfig ? { toolConfig } : {}),
     ...(Object.keys(generationConfig).length > 0 ? { generationConfig } : {}),
   };
 

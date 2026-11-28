@@ -567,6 +567,56 @@ export function convertOpenAiToGeminiRequest(
     }
   }
 
+  let toolConfig: GeminiGenerateRequest['toolConfig'];
+  if (raw.tool_choice !== undefined && raw.tool_choice !== null) {
+    if (typeof raw.tool_choice === 'string') {
+      if (raw.tool_choice === 'none') {
+        toolConfig = { functionCallingConfig: { mode: 'NONE' } };
+      } else if (raw.tool_choice === 'auto') {
+        toolConfig = { functionCallingConfig: { mode: 'AUTO' } };
+      } else if (raw.tool_choice === 'required') {
+        toolConfig = { functionCallingConfig: { mode: 'ANY' } };
+      } else {
+        throw new OpenAiProtocolError(
+          400,
+          'invalid_request_error',
+          `Unsupported tool_choice: ${raw.tool_choice}`,
+          'invalid_request',
+          'tool_choice'
+        );
+      }
+    } else if (isPlainObject(raw.tool_choice)) {
+      if (
+        raw.tool_choice.type !== 'function' ||
+        !isPlainObject(raw.tool_choice.function) ||
+        typeof raw.tool_choice.function.name !== 'string' ||
+        raw.tool_choice.function.name.trim() === ''
+      ) {
+        throw new OpenAiProtocolError(
+          400,
+          'invalid_request_error',
+          'tool_choice object must have type="function" and a non-empty function.name',
+          'invalid_request',
+          'tool_choice'
+        );
+      }
+      toolConfig = {
+        functionCallingConfig: {
+          mode: 'ANY',
+          allowedFunctionNames: [raw.tool_choice.function.name.trim()],
+        },
+      };
+    } else {
+      throw new OpenAiProtocolError(
+        400,
+        'invalid_request_error',
+        'tool_choice must be a string or function object',
+        'invalid_request',
+        'tool_choice'
+      );
+    }
+  }
+
   const generationConfig: Record<string, unknown> = {};
   const maxTokensRaw = raw.max_completion_tokens ?? raw.max_tokens;
   if (maxTokensRaw !== undefined && maxTokensRaw !== null) {
@@ -659,6 +709,7 @@ export function convertOpenAiToGeminiRequest(
     contents,
     ...(systemParts.length > 0 ? { systemInstruction: { parts: systemParts } } : {}),
     ...(tools ? { tools } : {}),
+    ...(toolConfig ? { toolConfig } : {}),
     ...(Object.keys(generationConfig).length > 0 ? { generationConfig } : {}),
   };
 

@@ -144,6 +144,8 @@ export class SessionToolBroker {
   private readonly batchWindowMs: number;
   private readonly toolCallTimeoutMs: number;
   private readonly onBatchReady?: (calls: ExposedToolCall[]) => void;
+  private readonly notificationListeners = new Set<(msg: Record<string, unknown>) => void>();
+  private toolsVersion = 1;
   private batchQueue: ExposedToolCall[] = [];
   private batchTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -158,6 +160,49 @@ export class SessionToolBroker {
 
   get pendingCount(): number {
     return this.parked.size;
+  }
+
+  get currentToolsVersion(): number {
+    return this.toolsVersion;
+  }
+
+  subscribeNotifications(listener: (msg: Record<string, unknown>) => void): () => void {
+    this.notificationListeners.add(listener);
+    return () => {
+      this.notificationListeners.delete(listener);
+    };
+  }
+
+  private emitNotification(msg: Record<string, unknown>): void {
+    for (const listener of this.notificationListeners) {
+      try {
+        listener(msg);
+      } catch {
+        // Ignore broken SSE listeners; stream cleanup handles removal.
+      }
+    }
+  }
+
+  updateTools(tools: SanitizedToolDefinition[]): {
+    added: SanitizedToolDefinition[];
+    version: number;
+  } {
+    const added: SanitizedToolDefinition[] = [];
+    for (const tool of tools) {
+      if (!this.toolsByMcpName.has(tool.mcpName)) {
+        added.push(tool);
+      }
+    }
+    this.toolsByMcpName.clear();
+    for (const tool of tools) {
+      this.toolsByMcpName.set(tool.mcpName, tool);
+    }
+    this.toolsVersion += 1;
+    this.emitNotification({
+      jsonrpc: "2.0",
+      method: "notifications/tools/list_changed",
+    });
+    return { added, version: this.toolsVersion };
   }
 
   listMcpTools(): Array<Record<string, unknown>> {
@@ -205,7 +250,7 @@ export class SessionToolBroker {
           id,
           result: {
             protocolVersion: PROTOCOL_VERSION,
-            capabilities: { tools: {} },
+            capabilities: { tools: { listChanged: true } },
             serverInfo: SERVER_INFO,
           },
         },
@@ -426,6 +471,7 @@ export class SessionToolBroker {
 export class LoopbackMcpServer {
   private server: ReturnType<typeof Bun.serve> | null = null;
   private readonly sessions = new Map<string, SessionToolBroker>();
+  private readonly sseCleanups = new Map<string, Set<() => void>>();
   private readonly requestedPort: number;
 
   constructor(options: LoopbackMcpServerOptions = {}) {
@@ -463,6 +509,10 @@ export class LoopbackMcpServer {
     for (const broker of this.sessions.values()) {
       cancelledPending += broker.cancelAllPending(reason);
     }
+    for (const cleanups of this.sseCleanups.values()) {
+      for (const closeStream of cleanups) closeStream();
+    }
+    this.sseCleanups.clear();
     this.sessions.clear();
     server?.stop(true);
     return cancelledPending;
@@ -477,6 +527,11 @@ export class LoopbackMcpServer {
       url: `http://127.0.0.1:${this.port}/mcp/${token}`,
       unregister: () => {
         this.sessions.delete(token);
+        const cleanups = this.sseCleanups.get(token);
+        if (cleanups) {
+          this.sseCleanups.delete(token);
+          for (const closeStream of cleanups) closeStream();
+        }
       },
     };
   }
@@ -509,12 +564,20 @@ export class LoopbackMcpServer {
       return new Response("Forbidden", { status: 403 });
     }
 
-    if (request.method !== "POST") {
-      return new Response("Method Not Allowed", { status: 405, headers: { allow: "POST" } });
+    if (request.method !== "POST" && request.method !== "GET") {
+      return new Response("Method Not Allowed", { status: 405, headers: { allow: "GET, POST" } });
     }
 
     const broker = this.findSession(token);
     if (!broker) {
+      if (request.method === "GET") {
+        return jsonRpcError(
+          401,
+          null,
+          -32001,
+          "MCP session expired or invalidated (gateway restarted); please reconnect",
+        );
+      }
       let reqId: unknown = null;
       try {
         const raw = await request.text();
@@ -533,6 +596,63 @@ export class LoopbackMcpServer {
         -32001,
         "MCP session expired or invalidated (gateway restarted); please reconnect",
       );
+    }
+
+    if (request.method === "GET") {
+      const encoder = new TextEncoder();
+      let cleanupRef: (() => void) | null = null;
+      const stream = new ReadableStream<Uint8Array>({
+        start: (controller) => {
+          let closed = false;
+          let unsub: (() => void) | null = null;
+          const closeStream = () => {
+            if (closed) return;
+            closed = true;
+            unsub?.();
+            unsub = null;
+            request.signal.removeEventListener("abort", closeStream);
+            const set = this.sseCleanups.get(token);
+            if (set && cleanupRef) {
+              set.delete(cleanupRef);
+              if (set.size === 0) this.sseCleanups.delete(token);
+            }
+            try {
+              controller.close();
+            } catch {}
+          };
+          cleanupRef = closeStream;
+          let set = this.sseCleanups.get(token);
+          if (!set) {
+            set = new Set();
+            this.sseCleanups.set(token, set);
+          }
+          set.add(closeStream);
+          unsub = broker.subscribeNotifications((msg) => {
+            if (closed) return;
+            try {
+              controller.enqueue(encoder.encode(`event: message\ndata: ${JSON.stringify(msg)}\n\n`));
+            } catch {
+              closeStream();
+            }
+          });
+          if (request.signal.aborted) {
+            closeStream();
+          } else {
+            request.signal.addEventListener("abort", closeStream, { once: true });
+          }
+        },
+        cancel: () => {
+          cleanupRef?.();
+        },
+      });
+      return new Response(stream, {
+        status: 200,
+        headers: {
+          "content-type": "text/event-stream",
+          "cache-control": "no-cache",
+          connection: "keep-alive",
+        },
+      });
     }
 
     const declaredLength = request.headers.get("content-length");

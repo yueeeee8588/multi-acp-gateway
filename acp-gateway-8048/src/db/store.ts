@@ -1,6 +1,9 @@
 import { Database } from 'bun:sqlite';
 import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
+import { deflateSync, inflateSync } from 'node:zlib';
+import { normalizeModelAccessRule } from '../accounts/model-binding';
+import type { HistoryMessageSummary } from '../acp/history-matcher';
 import type {
   AccountQuotaSnapshot,
   AccountRecord,
@@ -27,6 +30,7 @@ interface AccountRow {
   active_workers: number;
   last_verified_at: number | null;
   quota_json: string | null;
+  model_access_json: string | null;
   created_at: number;
   updated_at: number;
 }
@@ -83,6 +87,15 @@ export interface StickyAffinityRecord {
 
 export const DEFAULT_ACP_SESSION_TTL_MS = 6 * 60 * 60 * 1000;
 
+export interface AcpSessionMidTurnMeta {
+  awaitingTools: Array<{
+    id: string;
+    name: string;
+    mcpName: string;
+    args: Record<string, unknown>;
+  }>;
+}
+
 interface AcpSessionRow {
   sticky_key: string;
   session_id: string;
@@ -92,6 +105,11 @@ interface AcpSessionRow {
   tools_hash: string;
   sensitive_filter_fingerprint: string;
   committed_hashes_json: string;
+  committed_normalized_json?: string | null;
+  committed_summaries_json?: string;
+  mid_turn?: number;
+  committed_count?: number;
+  mid_turn_meta_json?: string | null;
   updated_at: number;
 }
 
@@ -104,7 +122,23 @@ export interface AcpSessionRecord {
   toolsHash: string;
   sensitiveFilterFingerprint?: string;
   committedHashes: string[];
+  committedNormalized?: string[];
+  committedSummaries?: HistoryMessageSummary[];
+  midTurn?: boolean;
+  committedCount?: number;
+  midTurnMeta?: AcpSessionMidTurnMeta | null;
   updatedAt: number;
+}
+
+function encodeCompactText(text: string): string {
+  return `z1:${deflateSync(Buffer.from(text, 'utf8')).toString('base64')}`;
+}
+
+function decodeCompactText(value: string): string {
+  if (!value.startsWith('z1:')) {
+    return value;
+  }
+  return inflateSync(Buffer.from(value.slice(3), 'base64')).toString('utf8');
 }
 
 function rowToAcpSession(row: AcpSessionRow): AcpSessionRecord | null {
@@ -124,6 +158,88 @@ function rowToAcpSession(row: AcpSessionRow): AcpSessionRecord | null {
     );
     return null;
   }
+
+  let committedNormalized: string[] | null = null;
+  if (typeof row.committed_normalized_json === 'string' && row.committed_normalized_json.length > 0) {
+    try {
+      const rawJson = decodeCompactText(row.committed_normalized_json);
+      const parsed = JSON.parse(rawJson);
+      if (!Array.isArray(parsed) || !parsed.every((item) => typeof item === 'string')) {
+        console.warn(
+          `[store] corrupted acp_sessions.committed_normalized_json for sticky_key=${row.sticky_key}; deleting row`
+        );
+        return null;
+      }
+      committedNormalized = parsed.map((item) => decodeCompactText(item));
+    } catch (err) {
+      console.warn(
+        `[store] failed to parse acp_sessions.committed_normalized_json for sticky_key=${row.sticky_key}: ${err instanceof Error ? err.message : String(err)}`
+      );
+      return null;
+    }
+  }
+
+  let committedSummaries: HistoryMessageSummary[] = [];
+  if (typeof row.committed_summaries_json === 'string' && row.committed_summaries_json.length > 0) {
+    try {
+      const parsed = JSON.parse(row.committed_summaries_json);
+      if (!Array.isArray(parsed)) {
+        console.warn(
+          `[store] corrupted acp_sessions.committed_summaries_json for sticky_key=${row.sticky_key}; deleting row`
+        );
+        return null;
+      }
+      committedSummaries = parsed.map((item: unknown) => {
+        if (
+          !item ||
+          typeof item !== 'object' ||
+          typeof (item as HistoryMessageSummary).exactHash !== 'string' ||
+          typeof (item as HistoryMessageSummary).norm !== 'string' ||
+          typeof (item as HistoryMessageSummary).mediaCount !== 'number' ||
+          typeof (item as HistoryMessageSummary).hasRawMedia !== 'boolean'
+        ) {
+          throw new Error('Invalid HistoryMessageSummary item');
+        }
+        const s = item as HistoryMessageSummary;
+        return {
+          exactHash: s.exactHash,
+          norm: decodeCompactText(s.norm),
+          mediaCount: s.mediaCount,
+          hasRawMedia: s.hasRawMedia,
+        };
+      });
+    } catch (err) {
+      console.warn(
+        `[store] failed to parse acp_sessions.committed_summaries_json for sticky_key=${row.sticky_key}: ${err instanceof Error ? err.message : String(err)}`
+      );
+      return null;
+    }
+  }
+
+  let midTurnMeta: AcpSessionMidTurnMeta | null = null;
+  if (typeof row.mid_turn_meta_json === 'string' && row.mid_turn_meta_json.length > 0) {
+    try {
+      const rawJson = decodeCompactText(row.mid_turn_meta_json);
+      const parsed = JSON.parse(rawJson) as AcpSessionMidTurnMeta | null;
+      if (parsed !== null) {
+        if (!parsed || typeof parsed !== 'object' || !Array.isArray(parsed.awaitingTools)) {
+          throw new Error('Invalid mid_turn_meta_json');
+        }
+        midTurnMeta = parsed;
+      }
+    } catch (err) {
+      console.warn(
+        `[store] failed to parse acp_sessions.mid_turn_meta_json for sticky_key=${row.sticky_key}: ${err instanceof Error ? err.message : String(err)}`
+      );
+      return null;
+    }
+  }
+
+  const resolvedCommittedNormalized =
+    committedNormalized && committedNormalized.length > 0
+      ? committedNormalized
+      : committedSummaries.map((s) => s.norm);
+
   return {
     stickyKey: row.sticky_key,
     sessionId: row.session_id,
@@ -133,6 +249,14 @@ function rowToAcpSession(row: AcpSessionRow): AcpSessionRecord | null {
     toolsHash: row.tools_hash,
     sensitiveFilterFingerprint: row.sensitive_filter_fingerprint ?? '',
     committedHashes,
+    committedNormalized: resolvedCommittedNormalized,
+    committedSummaries,
+    midTurn: Boolean(row.mid_turn),
+    committedCount:
+      typeof row.committed_count === 'number' && row.committed_count > 0
+        ? row.committed_count
+        : committedHashes.length,
+    midTurnMeta,
     updatedAt: row.updated_at,
   };
 }
@@ -200,6 +324,9 @@ function rowToAccount(row: AccountRow): AccountRecord {
     activeWorkers: row.active_workers,
     lastVerifiedAt: row.last_verified_at,
     quota: parseAccountQuota(row),
+    modelAccessRule: normalizeModelAccessRule(
+      row.model_access_json === null ? undefined : JSON.parse(row.model_access_json),
+    ),
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
@@ -281,6 +408,7 @@ export class GatewayStore {
     this.db = new Database(resolved, { create: true });
     this.db.exec('PRAGMA journal_mode = WAL;');
     this.db.exec('PRAGMA synchronous = NORMAL;');
+    this.db.exec('PRAGMA busy_timeout = 5000;');
     this.initSchema();
   }
 
@@ -302,6 +430,7 @@ export class GatewayStore {
         active_workers INTEGER NOT NULL DEFAULT 0,
         last_verified_at INTEGER,
         quota_json TEXT DEFAULT NULL,
+        model_access_json TEXT DEFAULT NULL,
         created_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL
       );
@@ -364,6 +493,11 @@ export class GatewayStore {
         tools_hash TEXT NOT NULL,
         sensitive_filter_fingerprint TEXT NOT NULL DEFAULT '',
         committed_hashes_json TEXT NOT NULL,
+        committed_normalized_json TEXT NOT NULL DEFAULT '[]',
+        committed_summaries_json TEXT NOT NULL DEFAULT '[]',
+        mid_turn INTEGER NOT NULL DEFAULT 0,
+        committed_count INTEGER NOT NULL DEFAULT 0,
+        mid_turn_meta_json TEXT DEFAULT NULL,
         updated_at INTEGER NOT NULL
       );
 
@@ -379,6 +513,13 @@ export class GatewayStore {
     }
     if (!columns.some((c) => c.name === 'quota_json')) {
       this.db.exec(`ALTER TABLE accounts ADD COLUMN quota_json TEXT DEFAULT NULL;`);
+    }
+    if (!columns.some((c) => c.name === 'model_access_json')) {
+      try {
+        this.db.exec('ALTER TABLE accounts ADD COLUMN model_access_json TEXT DEFAULT NULL');
+      } catch (err) {
+        if (!(err instanceof Error) || !err.message.includes('duplicate column name: model_access_json')) throw err;
+      }
     }
 
     const requestLogColumns = this.db
@@ -397,6 +538,31 @@ export class GatewayStore {
     if (!acpSessionColumns.some((c) => c.name === 'sensitive_filter_fingerprint')) {
       this.db.exec(
         `ALTER TABLE acp_sessions ADD COLUMN sensitive_filter_fingerprint TEXT NOT NULL DEFAULT '';`
+      );
+    }
+    if (!acpSessionColumns.some((c) => c.name === 'committed_summaries_json')) {
+      this.db.exec(
+        `ALTER TABLE acp_sessions ADD COLUMN committed_summaries_json TEXT NOT NULL DEFAULT '[]';`
+      );
+    }
+    if (!acpSessionColumns.some((c) => c.name === 'committed_normalized_json')) {
+      this.db.exec(
+        `ALTER TABLE acp_sessions ADD COLUMN committed_normalized_json TEXT NOT NULL DEFAULT '[]';`
+      );
+    }
+    if (!acpSessionColumns.some((c) => c.name === 'mid_turn')) {
+      this.db.exec(
+        `ALTER TABLE acp_sessions ADD COLUMN mid_turn INTEGER NOT NULL DEFAULT 0;`
+      );
+    }
+    if (!acpSessionColumns.some((c) => c.name === 'committed_count')) {
+      this.db.exec(
+        `ALTER TABLE acp_sessions ADD COLUMN committed_count INTEGER NOT NULL DEFAULT 0;`
+      );
+    }
+    if (!acpSessionColumns.some((c) => c.name === 'mid_turn_meta_json')) {
+      this.db.exec(
+        `ALTER TABLE acp_sessions ADD COLUMN mid_turn_meta_json TEXT DEFAULT NULL;`
       );
     }
   }
@@ -421,13 +587,16 @@ export class GatewayStore {
 
   upsertAccount(account: AccountRecord): void {
     const quotaJson = account.quota ? JSON.stringify(account.quota) : null;
+    const modelAccessJson = account.modelAccessRule === undefined
+      ? null
+      : JSON.stringify(normalizeModelAccessRule(account.modelAccessRule));
     this.db
       .query(
         `INSERT INTO accounts (
           id, label, email, source, home_dir, proxy_url, status, status_reason,
           tier, exit_ip, exit_country, concurrency_limit, active_workers,
-          last_verified_at, quota_json, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          last_verified_at, quota_json, model_access_json, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
           label = excluded.label,
           email = excluded.email,
@@ -443,6 +612,7 @@ export class GatewayStore {
           active_workers = excluded.active_workers,
           last_verified_at = excluded.last_verified_at,
           quota_json = excluded.quota_json,
+          model_access_json = COALESCE(excluded.model_access_json, accounts.model_access_json),
           updated_at = excluded.updated_at`
       )
       .run(
@@ -461,6 +631,7 @@ export class GatewayStore {
         account.activeWorkers,
         account.lastVerifiedAt,
         quotaJson,
+        modelAccessJson,
         account.createdAt,
         account.updatedAt
       );
@@ -561,11 +732,15 @@ export class GatewayStore {
   }
 
   getRecentRequestLogs(limit = 100): RequestLog[] {
+    const safeLimit =
+      typeof limit === 'number' && Number.isFinite(limit) && limit >= 1
+        ? Math.min(Math.floor(limit), 10_000)
+        : 100;
     const rows = this.db
       .query<RequestLogRow, [number]>(
         'SELECT * FROM request_logs ORDER BY started_at DESC LIMIT ?'
       )
-      .all(limit);
+      .all(safeLimit);
     return rows.map(rowToRequestLog);
   }
 
@@ -722,11 +897,29 @@ export class GatewayStore {
   }
 
   upsertAcpSession(record: AcpSessionRecord): void {
+    const encodedSummaries = (record.committedSummaries ?? []).map((s) => ({
+      exactHash: s.exactHash,
+      norm: encodeCompactText(s.norm),
+      mediaCount: s.mediaCount,
+      hasRawMedia: s.hasRawMedia,
+    }));
+    const encodedMidTurnMeta = record.midTurnMeta
+      ? encodeCompactText(JSON.stringify(record.midTurnMeta))
+      : null;
+    const normalizedList =
+      record.committedNormalized ?? record.committedSummaries?.map((s) => s.norm) ?? [];
+    const encodedCommittedNormalized =
+      normalizedList.length === 0
+        ? '[]'
+        : encodeCompactText(JSON.stringify(normalizedList));
+
     this.db
       .query(
         `INSERT INTO acp_sessions (
-          sticky_key, session_id, account_id, model, system_hash, tools_hash, sensitive_filter_fingerprint, committed_hashes_json, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+          sticky_key, session_id, account_id, model, system_hash, tools_hash,
+          sensitive_filter_fingerprint, committed_hashes_json, committed_normalized_json,
+          committed_summaries_json, mid_turn, committed_count, mid_turn_meta_json, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(sticky_key) DO UPDATE SET
           session_id = excluded.session_id,
           account_id = excluded.account_id,
@@ -735,6 +928,11 @@ export class GatewayStore {
           tools_hash = excluded.tools_hash,
           sensitive_filter_fingerprint = excluded.sensitive_filter_fingerprint,
           committed_hashes_json = excluded.committed_hashes_json,
+          committed_normalized_json = excluded.committed_normalized_json,
+          committed_summaries_json = excluded.committed_summaries_json,
+          mid_turn = excluded.mid_turn,
+          committed_count = excluded.committed_count,
+          mid_turn_meta_json = excluded.mid_turn_meta_json,
           updated_at = excluded.updated_at`
       )
       .run(
@@ -746,6 +944,11 @@ export class GatewayStore {
         record.toolsHash,
         record.sensitiveFilterFingerprint ?? '',
         JSON.stringify(record.committedHashes),
+        encodedCommittedNormalized,
+        JSON.stringify(encodedSummaries),
+        record.midTurn ? 1 : 0,
+        record.committedCount ?? record.committedHashes.length,
+        encodedMidTurnMeta,
         record.updatedAt
       );
   }

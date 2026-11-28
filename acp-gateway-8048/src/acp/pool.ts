@@ -1,12 +1,14 @@
 import { createHash } from "node:crypto";
 import {
   AgySessionWorker,
+  type AcpSessionSnapshot,
+  closeAgyTransport,
   defaultTransportFactory,
   type AcpTransport,
   type AcpTransportFactory,
   type PrewarmedTransportOptions,
 } from "./worker";
-import { buildAgyWorkerArgs, buildIsolatedAgyEnv, getDataRoot, resolveAgyBinary } from "./env";
+import { buildAgyWorkerArgs, buildIsolatedAgyEnv, createAgyWorkerLogPath, getDataRoot, removeAgyWorkerLog, resolveAgyBinary } from "./env";
 import { ensureMinimalAgentDefinition } from "./minimal-agent";
 import { LoopbackMcpServer } from "./loopback-mcp";
 import { store } from "../db/store";
@@ -30,12 +32,45 @@ export interface AcpWorkerPoolOptions {
   tryAcquireWorkerSpawn?: (accountId: string) => boolean;
 }
 
+export interface AcpWorkerAcquireOptions {
+  /** Opt in only for independent single-turn requests. */
+  stateless?: boolean;
+}
+
+export type WorkerLease = { worker: AgySessionWorker; release: () => void };
+
+// Read-only bridge to the current worker's TS-private state. Unknown state is not recyclable.
+interface RecyclableWorker {
+  /** True only after session/close and a reset that preserves the process for session/new. */
+  recycleSession?: () => Promise<boolean>;
+  awaitingTools?: ReadonlyMap<string, unknown>;
+  unemittedToolCalls?: readonly unknown[];
+  broker?: { readonly pendingCount: number } | null;
+  inFlightPromptPromise?: Promise<unknown> | null;
+}
+
+interface SessionPersistence {
+  stickyKey: string;
+  enabled: boolean;
+  currentMirroredLegacyKey: string | null;
+}
+
 interface PoolEntry {
-  key: string;
   accountId: string;
-  sessionHash: string;
+  model: string;
+  homeDir: string;
+  proxyUrl?: string;
+  stateless: boolean;
+  isOverflow?: boolean;
+  persistence?: SessionPersistence;
   worker: AgySessionWorker;
   inUse: boolean;
+}
+
+interface StatelessDonor {
+  key: string;
+  entry: PoolEntry;
+  recycle: () => Promise<boolean>;
 }
 
 interface PrewarmEntry {
@@ -43,13 +78,28 @@ interface PrewarmEntry {
   homeDir: string;
   boundProxyUrl?: string;
   transport: AcpTransport;
+  logFile: string;
   initCaps: unknown;
   createdAt: number;
   adopted: boolean;
   bindHandlers: NonNullable<PrewarmedTransportOptions["bindHandlers"]>;
 }
 
-export function computeSessionPrefixHash(model: string, contents: GeminiContent[]): string {
+export function computeSessionPrefixHash(contents: GeminiContent[]): string {
+  const prefix = contents.slice(0, 2).map((c) => ({
+    role: c.role ?? "user",
+    parts: (c.parts ?? []).map((p) => ({
+      text: p.text ?? "",
+      hasImage: Boolean(p.inlineData),
+    })),
+  }));
+  return createHash("sha256")
+    .update(JSON.stringify({ prefix }))
+    .digest("hex")
+    .slice(0, 16);
+}
+
+function computeLegacySessionPrefixHash(model: string, contents: GeminiContent[]): string {
   const prefix = contents.slice(0, 2).map((c) => ({
     role: c.role ?? "user",
     parts: (c.parts ?? []).map((p) => ({
@@ -67,6 +117,8 @@ export const DEFAULT_WORKER_IDLE_TTL_MS = 30 * 60 * 1000;
 export const DEFAULT_PREWARM_PER_ACCOUNT = 1;
 export const DEFAULT_MAX_PREWARM_TOTAL = 9;
 export const DEFAULT_MAX_CONCURRENT_STARTS = 3;
+const MIN_STATEFUL_DONOR_IDLE_MS = 5 * 60_000;
+const RECYCLE_TIMEOUT_MS = 2_000;
 
 export class AcpWorkerPool {
   private readonly entries = new Map<string, PoolEntry>();
@@ -84,6 +136,7 @@ export class AcpWorkerPool {
   private readonly maxConcurrentStarts: number;
   private readonly tryAcquireWorkerSpawn: (accountId: string) => boolean;
   private activeStarts = 0;
+  private nextOverflowSlot = 0;
   private readonly startQueue: Array<() => void> = [];
   private shuttingDown = false;
   private cleanupTimer: ReturnType<typeof setInterval> | null = null;
@@ -126,39 +179,175 @@ export class AcpWorkerPool {
     account: AccountRecord,
     model: string,
     request: GeminiGenerateRequest,
+    sessionKey: string | undefined,
+    options: AcpWorkerAcquireOptions,
+  ): WorkerLease | Promise<WorkerLease>;
+  acquireWorker(
+    account: AccountRecord,
+    model: string,
+    request: GeminiGenerateRequest,
     sessionKey?: string,
-  ): { worker: AgySessionWorker; release: () => void } {
-    const resolvedSessionKey =
-      sessionKey && sessionKey.trim()
-        ? sessionKey.trim()
-        : computeSessionPrefixHash(model, request.contents ?? []);
-    const stickyKey = `${account.id}:${model}:${resolvedSessionKey}`;
+    options?: undefined,
+  ): WorkerLease;
+  acquireWorker(
+    account: AccountRecord,
+    model: string,
+    request: GeminiGenerateRequest,
+    sessionKey?: string,
+    options?: AcpWorkerAcquireOptions,
+  ): WorkerLease | Promise<WorkerLease> {
+    if (!options) return this.acquireLease(account, model, request, sessionKey, false);
+    return this.acquireWithOptions(account, model, request, sessionKey, options);
+  }
 
-    let entry = this.entries.get(stickyKey);
-    if (entry && !entry.inUse && entry.worker.canReuse(request, undefined, account)) {
-      entry.inUse = true;
-      this.syncActiveCount(account.id);
-      return {
-        worker: entry.worker,
-        release: () => this.releaseEntry(stickyKey),
-      };
+  private async acquireWithOptions(
+    account: AccountRecord, model: string, request: GeminiGenerateRequest,
+    sessionKey: string | undefined, options: AcpWorkerAcquireOptions,
+  ): Promise<WorkerLease> {
+    const turn = request.contents?.[0];
+    const stateless = options.stateless === true && request.contents?.length === 1 && !!turn &&
+      (turn.role ?? "user") === "user" && (turn.parts?.length ?? 0) > 0 &&
+      turn.parts.every((part) => !part.functionCall && !part.functionResponse);
+    return this.acquireLease(account, model, request, sessionKey, stateless);
+  }
+
+  private acquireLease(
+    account: AccountRecord, model: string, request: GeminiGenerateRequest,
+    sessionKey: string | undefined, stateless: false,
+  ): WorkerLease;
+  private acquireLease(
+    account: AccountRecord, model: string, request: GeminiGenerateRequest,
+    sessionKey: string | undefined, stateless: boolean,
+  ): WorkerLease | Promise<WorkerLease>;
+  private acquireLease(
+    account: AccountRecord, model: string, request: GeminiGenerateRequest,
+    sessionKey: string | undefined, stateless: boolean,
+  ): WorkerLease | Promise<WorkerLease> {
+    const trimmedSessionKey = sessionKey && sessionKey.trim() ? sessionKey.trim() : "";
+    const resolvedSessionKey = trimmedSessionKey || computeSessionPrefixHash(request.contents ?? []);
+    const legacySessionKey = trimmedSessionKey || computeLegacySessionPrefixHash(model, request.contents ?? []);
+    const stickyKey = `${account.id}:${resolvedSessionKey}`;
+    const legacyStickyKey = `${account.id}:${model}:${legacySessionKey}`;
+    // Separate one-shot leases from conversation entries (including on a sticky-key collision).
+    const primaryKey = JSON.stringify([stateless, stickyKey]);
+    const legacyPrimaryKey = JSON.stringify([stateless, legacyStickyKey]);
+
+    let matchedEntryKey = primaryKey;
+    let entry = this.entries.get(primaryKey);
+    if (!entry && !stateless) {
+      const legacyEntry = this.entries.get(legacyPrimaryKey);
+      if (legacyEntry) {
+        entry = legacyEntry;
+        matchedEntryKey = legacyPrimaryKey;
+      }
+    }
+    if (entry && !entry.inUse && (!stateless || this.isQuiescent(entry.worker)) &&
+      entry.worker.canReuse(request, undefined, account, model)) {
+      entry.worker.setRequestedModel(model);
+      if (matchedEntryKey !== primaryKey) {
+        this.entries.delete(matchedEntryKey);
+      }
+      entry.model = model;
+      return this.leaseEntry(primaryKey, entry);
     }
 
-    // 如果已有同 key 但正在忙或不可复用，创建新 worker 替换旧空闲条目
-    if (entry && !entry.inUse) {
-      void entry.worker.resetAndClose();
-      this.entries.delete(stickyKey);
+    if (!stateless) {
+      const existingPrimary = this.entries.get(primaryKey);
+      if (!existingPrimary?.inUse) {
+        for (const candidateKey of [
+          JSON.stringify([true, stickyKey]),
+          JSON.stringify([true, legacyStickyKey]),
+        ]) {
+          const candidate = this.entries.get(candidateKey);
+          if (
+            candidate &&
+            !candidate.inUse &&
+            this.isQuiescent(candidate.worker) &&
+            candidate.worker.canReuse(request, undefined, account, model)
+          ) {
+            if (existingPrimary) {
+              if (existingPrimary.persistence) existingPrimary.persistence.enabled = false;
+              this.entries.delete(primaryKey);
+              this.retireWorker(existingPrimary.worker);
+            }
+            this.entries.delete(candidateKey);
+            candidate.stateless = false;
+            candidate.model = model;
+            const persistence: SessionPersistence = { stickyKey, enabled: true, currentMirroredLegacyKey: null };
+            candidate.persistence = persistence;
+            candidate.worker.bindSessionPersistence(stickyKey, (snapshot) => {
+              this.persistSession(persistence, account.id, model, legacySessionKey, snapshot);
+            });
+            candidate.worker.setRequestedModel(model);
+            return this.leaseEntry(primaryKey, candidate);
+          }
+        }
+      }
     }
 
-    const isPrimarySlot = !entry || !entry.inUse;
-    const entryKey = isPrimarySlot
-      ? stickyKey
-      : `${stickyKey}:${Date.now()}:${Math.random().toString(36).slice(2, 6)}`;
-    const persistedSession = isPrimarySlot ? store.getAcpSession(stickyKey) : undefined;
+    if (entry && matchedEntryKey !== primaryKey && !entry.inUse) {
+      if (entry.persistence) entry.persistence.enabled = false;
+      this.entries.delete(matchedEntryKey);
+      this.retireWorker(entry.worker);
+    }
+
     const expectedProxy = resolveEffectiveProxy(account.proxyUrl);
     const prewarmed = this.takePrewarmedTransport(account.id, account.homeDir, expectedProxy);
+    if (stateless && !prewarmed && !this.shuttingDown && process.env.AGY_BRIDGE_STATELESS_REUSE !== "0") {
+      const donor = this.findStatelessDonor(account, model, expectedProxy);
+      if (donor) {
+        const homeDir = account.homeDir;
+        return this.recycleDonor(donor, (recycled) => {
+          const currentProxy = resolveEffectiveProxy(account.proxyUrl);
+          if (recycled && (account.homeDir !== homeDir || currentProxy !== expectedProxy ||
+            process.env.AGY_BRIDGE_STATELESS_REUSE === "0")) {
+            this.retireWorker(recycled);
+            recycled = undefined;
+          }
+          // A failed recycle takes the cold path even if prewarm finished during the attempt.
+          return this.installLease(
+            account, model, stickyKey, legacyStickyKey, legacySessionKey,
+            primaryKey, true, currentProxy, null, recycled,
+          );
+        });
+      }
+    }
+    return this.installLease(
+      account, model, stickyKey, legacyStickyKey, legacySessionKey,
+      primaryKey, stateless, expectedProxy, prewarmed,
+    );
+  }
 
-    const worker = new AgySessionWorker({
+  private installLease(
+    account: AccountRecord, model: string, stickyKey: string,
+    legacyStickyKey: string, legacySessionKey: string, primaryKey: string,
+    stateless: boolean, expectedProxy: string | undefined, prewarmed: PrewarmEntry | null,
+    recycled?: AgySessionWorker,
+  ): WorkerLease {
+    const old = this.entries.get(primaryKey);
+    // Stateless callers may have a same-key worker awaiting tool results. Do not
+    // replace that entry, even when it cannot satisfy an independent request.
+    const useOverflow = Boolean(
+      old && (old.inUse || (stateless && old.worker.isAlive && !this.isQuiescent(old.worker))),
+    );
+    const entryKey = useOverflow ? JSON.stringify([primaryKey, ++this.nextOverflowSlot]) : primaryKey;
+    if (old && !useOverflow) {
+      if (old.persistence) old.persistence.enabled = false;
+      this.entries.delete(primaryKey);
+      this.retireWorker(old.worker);
+    }
+    const isPrimarySlot = !stateless && !useOverflow;
+    const persistence: SessionPersistence | undefined = isPrimarySlot
+      ? { stickyKey, enabled: true, currentMirroredLegacyKey: null }
+      : undefined;
+    const persistedSession = persistence
+      ? (store.getAcpSession(stickyKey) ?? store.getAcpSession(legacyStickyKey) ?? undefined)
+      : undefined;
+    if (persistence && persistedSession?.stickyKey === legacyStickyKey) {
+      persistence.currentMirroredLegacyKey = legacyStickyKey;
+    }
+
+    const worker = recycled ?? new AgySessionWorker({
       account,
       model,
       agyPath: this.agyPath,
@@ -166,7 +355,7 @@ export class AcpWorkerPool {
       mcpServer: this.mcpServer,
       workspaceDir: this.workspaceDir,
       transportFactory: this.transportFactory,
-      stickyKey,
+      stickyKey: stateless ? undefined : stickyKey,
       persistedSession,
       tryAcquireWorkerSpawn: this.tryAcquireWorkerSpawn,
       prewarmedTransport: prewarmed
@@ -174,57 +363,196 @@ export class AcpWorkerPool {
             transport: prewarmed.transport,
             envHomeDir: prewarmed.homeDir,
             boundProxyUrl: prewarmed.boundProxyUrl,
+            logFile: prewarmed.logFile,
             initCaps: prewarmed.initCaps,
             bindHandlers: prewarmed.bindHandlers,
           }
         : undefined,
-      onSessionStateChange: isPrimarySlot
-        ? (snapshot) => {
-            if (snapshot) {
-              store.upsertAcpSession({
-                stickyKey,
-                sessionId: snapshot.sessionId,
-                accountId: account.id,
-                model,
-                systemHash: snapshot.systemHash,
-                toolsHash: snapshot.toolsHash,
-                sensitiveFilterFingerprint: snapshot.sensitiveFilterFingerprint ?? "",
-                committedHashes: snapshot.committedHashes,
-                updatedAt: snapshot.updatedAt,
-              });
-            } else {
-              store.deleteAcpSession(stickyKey);
-            }
-          }
+      onSessionStateChange: persistence
+        ? (snapshot) => this.persistSession(persistence, account.id, model, legacySessionKey, snapshot)
         : undefined,
     });
 
-    entry = {
-      key: entryKey,
+    const lease = this.leaseEntry(entryKey, {
       accountId: account.id,
-      sessionHash: resolvedSessionKey,
+      model,
+      homeDir: account.homeDir,
+      proxyUrl: expectedProxy,
+      stateless,
+      isOverflow: useOverflow,
+      persistence,
       worker,
       inUse: true,
-    };
-    this.entries.set(entryKey, entry);
-    this.syncActiveCount(account.id);
-
+    });
     if (this.prewarmPerAccount > 0 && !this.shuttingDown && account.status === "ready") {
       void this.prewarmAccount(account);
     }
+    return lease;
+  }
 
+  private persistSession(
+    persistence: SessionPersistence, accountId: string, model: string, legacySessionKey: string,
+    snapshot: AcpSessionSnapshot | null,
+  ): void {
+    const { stickyKey } = persistence;
+    const legacyStickyKey = `${accountId}:${model}:${legacySessionKey}`;
+    if (!persistence.enabled) return;
+    if (snapshot) {
+      const activeModel = snapshot.model ?? model;
+      const record = {
+        stickyKey,
+        sessionId: snapshot.sessionId,
+        accountId,
+        model: activeModel,
+        systemHash: snapshot.systemHash,
+        toolsHash: snapshot.toolsHash,
+        sensitiveFilterFingerprint: snapshot.sensitiveFilterFingerprint ?? "",
+        committedHashes: snapshot.committedHashes,
+        committedNormalized: snapshot.committedNormalized ?? [],
+        committedSummaries: snapshot.committedSummaries ?? [],
+        midTurn: snapshot.midTurn ?? false,
+        committedCount: snapshot.committedCount ?? snapshot.committedHashes.length,
+        midTurnMeta: snapshot.midTurnMeta ?? null,
+        updatedAt: snapshot.updatedAt,
+      };
+      store.upsertAcpSession(record);
+      const compatLegacyKey = `${accountId}:${activeModel}:${legacySessionKey}`;
+      store.upsertAcpSession({
+        ...record,
+        stickyKey: compatLegacyKey,
+      });
+      persistence.currentMirroredLegacyKey = compatLegacyKey;
+    } else {
+      store.deleteAcpSession(stickyKey);
+      store.deleteAcpSession(legacyStickyKey);
+      if (
+        persistence.currentMirroredLegacyKey &&
+        persistence.currentMirroredLegacyKey !== legacyStickyKey
+      ) {
+        store.deleteAcpSession(persistence.currentMirroredLegacyKey);
+      }
+      persistence.currentMirroredLegacyKey = null;
+    }
+  }
+
+  private leaseEntry(key: string, entry: PoolEntry): WorkerLease {
+    entry.inUse = true;
+    this.entries.set(key, entry);
+    this.syncActiveCount(entry.accountId);
+    let released = false;
     return {
-      worker,
-      release: () => this.releaseEntry(entryKey),
+      worker: entry.worker,
+      release: () => {
+        if (released || this.entries.get(key) !== entry) return;
+        released = true;
+        entry.inUse = false;
+        entry.worker.lastUsedAt = Date.now();
+        if (entry.isOverflow && (this.isQuiescent(entry.worker) || !entry.worker.isAlive)) {
+          this.entries.delete(key);
+          this.syncActiveCount(entry.accountId);
+          this.retireWorker(entry.worker);
+          return;
+        }
+        this.syncActiveCount(entry.accountId);
+      },
     };
   }
 
-  private releaseEntry(key: string): void {
-    const entry = this.entries.get(key);
-    if (!entry) return;
-    entry.inUse = false;
-    entry.worker.lastUsedAt = Date.now();
+  private isQuiescent(worker: AgySessionWorker): boolean {
+    const state = worker as unknown as RecyclableWorker;
+    return !worker.isBusy && state.awaitingTools?.size === 0 &&
+      state.unemittedToolCalls?.length === 0 && state.inFlightPromptPromise === null &&
+      (state.broker === null || state.broker?.pendingCount === 0);
+  }
+
+  private findStatelessDonor(account: AccountRecord, model: string, proxyUrl?: string): StatelessDonor | undefined {
+    const now = Date.now();
+    const statefulIdleMs = Math.max(this.idleTtlMs, MIN_STATEFUL_DONOR_IDLE_MS);
+    let best: StatelessDonor | undefined;
+    for (const [key, entry] of this.entries) {
+      const worker = entry.worker;
+      const state = worker as unknown as RecyclableWorker;
+      if (
+        entry.accountId !== account.id || entry.model !== model || entry.homeDir !== account.homeDir ||
+        entry.proxyUrl !== proxyUrl || worker.getBoundProxyUrl() !== proxyUrl ||
+        entry.inUse || !worker.isAlive ||
+        (!entry.stateless && !(now - worker.lastUsedAt > statefulIdleMs)) ||
+        typeof state.recycleSession !== "function" || !this.isQuiescent(worker)
+      ) continue;
+      if (!best || (entry.stateless !== best.entry.stateless
+        ? entry.stateless
+        : worker.lastUsedAt < best.entry.worker.lastUsedAt)) {
+        best = { key, entry, recycle: state.recycleSession.bind(worker) };
+      }
+    }
+    return best;
+  }
+
+  private async recycleDonor(
+    { key, entry, recycle }: StatelessDonor,
+    install: (worker?: AgySessionWorker) => WorkerLease,
+  ): Promise<WorkerLease> {
+    // Reserve synchronously; sticky acquisitions, cleanup and other borrowers cannot take it.
+    entry.inUse = true;
     this.syncActiveCount(entry.accountId);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let recycled = false;
+    let timedOut = false;
+    try {
+      if (entry.persistence) {
+        entry.persistence.enabled = false;
+        store.deleteAcpSession(entry.persistence.stickyKey);
+        if (entry.persistence.currentMirroredLegacyKey) {
+          store.deleteAcpSession(entry.persistence.currentMirroredLegacyKey);
+          entry.persistence.currentMirroredLegacyKey = null;
+        }
+      }
+      recycled = (await Promise.race([
+        recycle(),
+        new Promise<false>((resolve) => {
+          timer = setTimeout(() => {
+            timedOut = true;
+            resolve(false);
+          }, RECYCLE_TIMEOUT_MS);
+        }),
+      ])) === true;
+      if (!recycled) {
+        console.warn(
+          `[acp-pool] donor recycle ${timedOut ? `timed out after ${RECYCLE_TIMEOUT_MS}ms` : "returned false"} for account=${entry.accountId} model=${entry.model} key=${key}; retiring worker`
+        );
+      }
+    } catch (err) {
+      // A partially reset worker can't safely go back into circulation.
+      const msg = err instanceof Error ? err.message : String(err);
+      console.warn(
+        `[acp-pool] donor recycle threw for account=${entry.accountId} model=${entry.model} key=${key}; retiring worker: ${msg}`
+      );
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
+    if (this.entries.get(key) !== entry) {
+      this.syncActiveCount(entry.accountId);
+      if (recycled) this.retireWorker(entry.worker);
+      if (this.shuttingDown) {
+        throw new Error("ACP recycle interrupted by pool eviction");
+      }
+      return install(undefined);
+    }
+    this.entries.delete(key);
+    this.syncActiveCount(entry.accountId);
+    if (!recycled) this.retireWorker(entry.worker);
+    // Install in the same turn as removing the reservation, so eviction can never miss both.
+    return install(recycled ? entry.worker : undefined);
+  }
+
+  private retireWorker(worker: AgySessionWorker): void {
+    // Do not make fallback wait for a broken worker to acknowledge shutdown.
+    void Promise.resolve()
+      .then(() => worker.resetAndClose())
+      .catch((err) => {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.warn(`[acp-pool] retired worker resetAndClose failed: ${msg}`);
+      });
   }
 
   getActiveCount(accountId: string): number {
@@ -275,7 +603,7 @@ export class AcpWorkerPool {
         if (!entry.adopted && entry.transport.isAlive()) {
           alive.push(entry);
         } else if (!entry.adopted) {
-          void entry.transport.close().catch(() => {});
+          void closeAgyTransport(entry.transport, entry.logFile).catch(() => {});
         }
       }
       if (alive.length > 0) {
@@ -319,7 +647,7 @@ export class AcpWorkerPool {
         candidate.adopted = true;
         return candidate;
       }
-      void candidate.transport.close().catch(() => {});
+      void closeAgyTransport(candidate.transport, candidate.logFile).catch(() => {});
     }
     return null;
   }
@@ -362,6 +690,7 @@ export class AcpWorkerPool {
 
     this.prewarmInFlight.set(account.id, inFlightForAccount + 1);
     let transport: AcpTransport | null = null;
+    let logFile: string | undefined;
     try {
       return await this.withStartLimit(async () => {
         if (this.shuttingDown) return false;
@@ -384,9 +713,12 @@ export class AcpWorkerPool {
           proxyUrl: effectiveProxy,
           agyPath: binaryPath,
         });
+        const workerLogFile = createAgyWorkerLogPath(account.homeDir);
+        logFile = workerLogFile;
         const args = buildAgyWorkerArgs({
           homeDir: account.homeDir,
           workspaceDir,
+          logFile: workerLogFile,
         });
 
         let boundHandlers: {
@@ -405,6 +737,7 @@ export class AcpWorkerPool {
           env,
           onUpdate: (params) => boundHandlers.onUpdate?.(params),
           onExit: (code, stderr) => {
+            void removeAgyWorkerLog(workerLogFile);
             if (entryRef && !entryRef.adopted) {
               this.removePrewarmEntry(account.id, entryRef);
             }
@@ -414,7 +747,7 @@ export class AcpWorkerPool {
 
         const initCaps = await transport.initialize();
         if (this.shuttingDown || !transport.isAlive()) {
-          await transport.close().catch(() => {});
+          await closeAgyTransport(transport, workerLogFile).catch(() => {});
           transport = null;
           return false;
         }
@@ -426,7 +759,7 @@ export class AcpWorkerPool {
           currentTotal += list.length;
         }
         if (currentForAccount >= this.prewarmPerAccount || currentTotal >= this.maxPrewarmTotal) {
-          await transport.close().catch(() => {});
+          await closeAgyTransport(transport, workerLogFile).catch(() => {});
           transport = null;
           return false;
         }
@@ -436,6 +769,7 @@ export class AcpWorkerPool {
           homeDir: account.homeDir,
           boundProxyUrl: effectiveProxy,
           transport,
+          logFile: workerLogFile,
           initCaps,
           createdAt: Date.now(),
           adopted: false,
@@ -453,7 +787,9 @@ export class AcpWorkerPool {
       });
     } catch {
       if (transport) {
-        await (transport as AcpTransport).close().catch(() => {});
+        await closeAgyTransport(transport, logFile).catch(() => {});
+      } else {
+        await removeAgyWorkerLog(logFile);
       }
       return false;
     } finally {
@@ -479,6 +815,7 @@ export class AcpWorkerPool {
     for (const [key, entry] of this.entries.entries()) {
       if (entry.accountId === accountId) {
         this.entries.delete(key);
+        if (entry.persistence) entry.persistence.enabled = false;
         toClose.push(entry);
       }
     }
@@ -486,7 +823,7 @@ export class AcpWorkerPool {
     this.prewarmed.delete(accountId);
     await Promise.allSettled([
       ...toClose.map((e) => e.worker.resetAndClose()),
-      ...prewarmList.map((p) => p.transport.close()),
+      ...prewarmList.map((p) => closeAgyTransport(p.transport, p.logFile)),
     ]);
     this.syncActiveCount(accountId);
   }
@@ -497,6 +834,7 @@ export class AcpWorkerPool {
     for (const [key, entry] of this.entries.entries()) {
       if (!entry.inUse && nowMs - entry.worker.lastUsedAt > this.idleTtlMs) {
         this.entries.delete(key);
+        if (entry.persistence) entry.persistence.enabled = false;
         expired.push(entry);
       }
     }
@@ -512,6 +850,7 @@ export class AcpWorkerPool {
       this.cleanupTimer = null;
     }
     const all = Array.from(this.entries.values());
+    for (const entry of all) if (entry.persistence) entry.persistence.enabled = false;
     this.entries.clear();
     this.activeCounts.clear();
 
@@ -523,7 +862,7 @@ export class AcpWorkerPool {
 
     await Promise.allSettled([
       ...all.map((e) => e.worker.resetAndClose()),
-      ...allPrewarmed.map((p) => p.transport.close()),
+      ...allPrewarmed.map((p) => closeAgyTransport(p.transport, p.logFile)),
     ]);
   }
 }

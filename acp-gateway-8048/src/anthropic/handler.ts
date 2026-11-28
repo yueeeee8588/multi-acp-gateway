@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { isSuggestionModeRequest } from '../acp/suggestion-guard';
 import { WorkerError } from '../acp/worker';
 import { getConfig } from '../config/settings';
 import { eventBus } from '../logs/events';
@@ -107,6 +108,29 @@ function hasEffectiveContent(chunk: GeminiGenerateResponse, includeThought: bool
   return false;
 }
 
+function isLocationUnsupportedError(reasonCode?: string, reasonText?: string): boolean {
+  if (reasonCode === 'LOCATION_UNSUPPORTED') return true;
+  if (!reasonText) return false;
+  return /location[_ ]is[_ ]not[_ ]supported|location[_ ]unsupported/i.test(reasonText);
+}
+
+function getNoRetryHeaders(
+  status: number,
+  reasonCode?: string,
+  reasonText?: string
+): Record<string, string> | undefined {
+  if (isLocationUnsupportedError(reasonCode, reasonText)) return undefined;
+  if (
+    status === 403 ||
+    reasonCode === 'VALIDATION_REQUIRED' ||
+    reasonCode === 'RESTRICTED' ||
+    reasonCode === 'ACCOUNT_DISABLED_REFUSED'
+  ) {
+    return { 'x-should-retry': 'false' };
+  }
+  return undefined;
+}
+
 function classifyError(err: unknown): {
   status: number;
   reasonCode: string;
@@ -125,7 +149,9 @@ function classifyError(err: unknown): {
           ? 503
           : err.code === 'AUTH_REQUIRED'
             ? 401
-            : err.code === 'VALIDATION_REQUIRED' || err.code === 'RESTRICTED'
+            : err.code === 'VALIDATION_REQUIRED' ||
+                err.code === 'RESTRICTED' ||
+                (err.code as string) === 'ACCOUNT_DISABLED_REFUSED'
               ? 403
               : err.code === 'CANCELLED'
                 ? 499
@@ -143,9 +169,13 @@ function classifyError(err: unknown): {
       (isQuotaError ||
         err.code === 'CAPACITY_UNAVAILABLE' ||
         err.code === 'AUTH_REQUIRED' ||
+        err.code === 'VALIDATION_REQUIRED' ||
+        err.code === 'RESTRICTED' ||
+        (err.code as string) === 'ACCOUNT_DISABLED_REFUSED' ||
         err.code === 'SOFT_ERROR' ||
         err.code === 'TRANSPORT_ERROR' ||
         err.code === 'TIMEOUT' ||
+        status === 403 ||
         status === 502 ||
         status === 503 ||
         status === 504);
@@ -280,6 +310,52 @@ export function createAnthropicHandler(deps: AnthropicHandlerDeps = {}) {
       thinkingConfig: parsedReq.generationConfig?.thinkingConfig as Record<string, unknown> | undefined,
     });
     applyGenerationConfigGuardrails(parsedReq, getModelLimitsMap()[model]?.outputTokenLimit);
+
+    if (isSuggestionModeRequest(parsedReq.contents)) {
+      const guardMessageId = `msg_${randomUUID().replace(/-/g, '').slice(0, 24)}`;
+      const guardSessionHash = resolveAnthropicSessionKey(
+        parsedReq,
+        req.headers,
+        converted.metadataUserId
+      );
+      if (!converted.stream) {
+        const anthropicResp = convertGeminiToAnthropicResponse(
+          {
+            candidates: [
+              {
+                content: { role: 'model', parts: [{ text: '' }] },
+                finishReason: 'STOP',
+              },
+            ],
+          },
+          parsedReq,
+          requestedModel,
+          guardMessageId
+        );
+        return Response.json(anthropicResp, {
+          headers: {
+            'X-Accel-Buffering': 'no',
+            'X-Mapped-Model': model,
+            'X-Session-Id': guardSessionHash,
+          },
+        });
+      }
+      const guardSerializer = new AnthropicStreamSerializer(guardMessageId, requestedModel);
+      const ssePayload =
+        guardSerializer.startMessage(estimateTokens(parsedReq)) +
+        guardSerializer.finishMessage(parsedReq, 'STOP');
+      return new Response(ssePayload, {
+        status: 200,
+        headers: {
+          'Content-Type': 'text/event-stream; charset=utf-8',
+          'Cache-Control': 'no-cache, no-transform',
+          Connection: 'keep-alive',
+          'X-Accel-Buffering': 'no',
+          'X-Mapped-Model': model,
+          'X-Session-Id': guardSessionHash,
+        },
+      });
+    }
 
     if (!deps.scheduler || !deps.workerPool) {
       return anthropicJsonError(
@@ -435,7 +511,13 @@ export function createAnthropicHandler(deps: AnthropicHandlerDeps = {}) {
                   return {
                     errorResponse: anthropicJsonError(
                       lastClassifiedFailure.status,
-                      lastClassifiedFailure.reasonText
+                      lastClassifiedFailure.reasonText,
+                      undefined,
+                      getNoRetryHeaders(
+                        lastClassifiedFailure.status,
+                        lastClassifiedFailure.reasonCode,
+                        lastClassifiedFailure.reasonText
+                      )
                     ),
                   };
                 }
@@ -463,10 +545,37 @@ export function createAnthropicHandler(deps: AnthropicHandlerDeps = {}) {
             return {
               errorResponse: anthropicJsonError(
                 lastClassifiedFailure.status,
-                lastClassifiedFailure.reasonText
+                lastClassifiedFailure.reasonText,
+                undefined,
+                getNoRetryHeaders(
+                  lastClassifiedFailure.status,
+                  lastClassifiedFailure.reasonCode,
+                  lastClassifiedFailure.reasonText
+                )
               ),
             };
           } else {
+            if (lastClassifiedFailure) {
+              const noRetryHeaders = getNoRetryHeaders(
+                lastClassifiedFailure.status,
+                lastClassifiedFailure.reasonCode,
+                lastClassifiedFailure.reasonText
+              );
+              if (noRetryHeaders) {
+                eventBus.finishRequest(requestId, {
+                  state: 'failed',
+                  httpStatus: lastClassifiedFailure.status,
+                });
+                return {
+                  errorResponse: anthropicJsonError(
+                    lastClassifiedFailure.status,
+                    lastClassifiedFailure.reasonText,
+                    undefined,
+                    noRetryHeaders
+                  ),
+                };
+              }
+            }
             const attemptedRetryAfter =
               earliestRetryAt === undefined
                 ? Infinity
@@ -516,11 +625,16 @@ export function createAnthropicHandler(deps: AnthropicHandlerDeps = {}) {
         let worker: WorkerHandle | null = null;
         const acquireStart = Date.now();
         try {
+          const isStateless =
+            (!parsedReq.tools || parsedReq.tools.length === 0) &&
+            parsedReq.contents?.length === 1 &&
+            (parsedReq.contents[0]?.role ?? 'user') === 'user';
           worker = await deps.workerPool!.acquire({
             account,
             sessionHash,
             model,
             request: parsedReq,
+            ...(isStateless ? { stateless: true } : {}),
           });
           onWorkerAcquired?.();
           phaseTimingsMs.workerAcquire = Date.now() - acquireStart;
@@ -634,10 +748,17 @@ export function createAnthropicHandler(deps: AnthropicHandlerDeps = {}) {
             classified.status === 429 ||
             classified.status === 403 ||
             classified.reasonCode === 'VALIDATION_REQUIRED' ||
-            classified.reasonCode === 'RESTRICTED'
+            classified.reasonCode === 'RESTRICTED' ||
+            classified.reasonCode === 'ACCOUNT_DISABLED_REFUSED'
           ) {
             deps.scheduler!.abandonSession?.(sessionHash, model);
           }
+
+          const noRetryHeaders = getNoRetryHeaders(
+            classified.status,
+            classified.reasonCode,
+            classified.reasonText
+          );
 
           if (abortController.signal.aborted || classified.reasonCode === 'CANCELLED') {
             return cancelRequest();
@@ -645,7 +766,12 @@ export function createAnthropicHandler(deps: AnthropicHandlerDeps = {}) {
           if (classified.reasonCode === 'MODEL_SELECTION_FAILED' && !classified.retryable) {
             eventBus.finishRequest(requestId, { state: 'failed', httpStatus: classified.status });
             return {
-              errorResponse: anthropicJsonError(classified.status, classified.reasonText),
+              errorResponse: anthropicJsonError(
+                classified.status,
+                classified.reasonText,
+                undefined,
+                noRetryHeaders
+              ),
             };
           }
 
@@ -654,7 +780,12 @@ export function createAnthropicHandler(deps: AnthropicHandlerDeps = {}) {
             if (modelSelectionSwitches > 1) {
               eventBus.finishRequest(requestId, { state: 'failed', httpStatus: classified.status });
               return {
-                errorResponse: anthropicJsonError(classified.status, classified.reasonText),
+                errorResponse: anthropicJsonError(
+                  classified.status,
+                  classified.reasonText,
+                  undefined,
+                  noRetryHeaders
+                ),
               };
             }
           }
@@ -687,7 +818,12 @@ export function createAnthropicHandler(deps: AnthropicHandlerDeps = {}) {
               httpStatus: classified.status,
             });
             return {
-              errorResponse: anthropicJsonError(classified.status, classified.reasonText),
+              errorResponse: anthropicJsonError(
+                classified.status,
+                classified.reasonText,
+                undefined,
+                noRetryHeaders
+              ),
             };
           }
 
@@ -701,7 +837,12 @@ export function createAnthropicHandler(deps: AnthropicHandlerDeps = {}) {
           if (!classified.retryable) {
             eventBus.finishRequest(requestId, { state: 'failed', httpStatus: classified.status });
             return {
-              errorResponse: anthropicJsonError(classified.status, classified.reasonText),
+              errorResponse: anthropicJsonError(
+                classified.status,
+                classified.reasonText,
+                undefined,
+                noRetryHeaders
+              ),
             };
           }
 
@@ -715,7 +856,8 @@ export function createAnthropicHandler(deps: AnthropicHandlerDeps = {}) {
             classified.reasonCode === 'RESOURCE_EXHAUSTED' ||
             classified.reasonCode === 'AUTH_REQUIRED' ||
             classified.reasonCode === 'RESTRICTED' ||
-            classified.reasonCode === 'VALIDATION_REQUIRED';
+            classified.reasonCode === 'VALIDATION_REQUIRED' ||
+            classified.reasonCode === 'ACCOUNT_DISABLED_REFUSED';
 
           const getQuotaRetryHeaders = (): Record<string, string> | undefined => {
             if (classified.status !== 429 && !classified.isQuotaError) {
@@ -734,12 +876,16 @@ export function createAnthropicHandler(deps: AnthropicHandlerDeps = {}) {
 
           if (!config.accountFailover && isAccountFailoverError) {
             eventBus.finishRequest(requestId, { state: 'failed', httpStatus: classified.status });
+            const mergedHeaders =
+              getQuotaRetryHeaders() || noRetryHeaders
+                ? { ...getQuotaRetryHeaders(), ...noRetryHeaders }
+                : undefined;
             return {
               errorResponse: anthropicJsonError(
                 classified.status,
                 classified.reasonText,
                 undefined,
-                getQuotaRetryHeaders(),
+                mergedHeaders,
               ),
             };
           }
@@ -766,7 +912,12 @@ export function createAnthropicHandler(deps: AnthropicHandlerDeps = {}) {
             if (nonQuotaSwitches > config.maxAccountSwitches) {
               eventBus.finishRequest(requestId, { state: 'failed', httpStatus: classified.status });
               return {
-                errorResponse: anthropicJsonError(classified.status, classified.reasonText),
+                errorResponse: anthropicJsonError(
+                  classified.status,
+                  classified.reasonText,
+                  undefined,
+                  noRetryHeaders
+                ),
               };
             }
           }
@@ -844,8 +995,12 @@ export function createAnthropicHandler(deps: AnthropicHandlerDeps = {}) {
 
     const writeSse = (payload: string) => {
       if (!streamController || streamClosed || !payload) return;
-      streamController.enqueue(encoder.encode(payload));
-      lastWriteAt = Date.now();
+      try {
+        streamController.enqueue(encoder.encode(payload));
+        lastWriteAt = Date.now();
+      } catch {
+        streamClosed = true;
+      }
     };
 
     const writeChunkToStream = (chunk: GeminiGenerateResponse) => {
@@ -874,6 +1029,7 @@ export function createAnthropicHandler(deps: AnthropicHandlerDeps = {}) {
     let earlyReleased = false;
     let earlyReleaseReason = '';
     let contentSettledByChunk = false;
+    let bufferedFlushed = false;
     let earlyReleaseTimer: ReturnType<typeof setTimeout> | null = null;
     let contentOrDoneSettled = false;
     let resolveContentOrDone!: () => void;
@@ -964,7 +1120,7 @@ export function createAnthropicHandler(deps: AnthropicHandlerDeps = {}) {
             // 但 sentAnyChunk / firstSettled 保持 false —— 换号重试依旧无感。
             releaseStreamHeadersEarly('thought');
           }
-        } else if (streamController) {
+        } else if (streamController && bufferedFlushed) {
           writeChunkToStream(chunk);
         } else {
           bufferedChunks.push(chunk);
@@ -1078,14 +1234,15 @@ export function createAnthropicHandler(deps: AnthropicHandlerDeps = {}) {
           }
           if (streamClosed) return;
 
-          // 整个 turn 从未出现有效正文（执行已结束）→ 缓冲的 thinking 块作废，改由 executionResult.response 整体下发。
-          if (!contentSettledByChunk && executionResult?.response && !sentAnyChunk) {
+          // 整个 turn 从未出现有效正文（执行已结束）→ 缓冲的 thinking 块作废。
+          if (!contentSettledByChunk && !sentAnyChunk) {
             bufferedChunks.length = 0;
           }
           while (bufferedChunks.length > 0 && !streamClosed) {
             const c = bufferedChunks.shift()!;
             writeChunkToStream(c);
           }
+          bufferedFlushed = true;
 
           if (!executionFinished) {
             await runPromise;

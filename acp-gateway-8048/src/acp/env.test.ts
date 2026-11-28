@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -18,6 +18,22 @@ function touchBinary(dir: string, name = process.platform === "win32" ? "agy.exe
   const filePath = path.join(dir, name);
   fs.writeFileSync(filePath, "stub");
   return filePath;
+}
+
+function resolveFromFixture(root: string): string {
+  const existsSync = fs.existsSync;
+  // Auto-detection also probes the captured host PATH and system install directories.
+  const fixturePrefix = path.resolve(root) + path.sep;
+  const exists = spyOn(fs, "existsSync").mockImplementation((candidate) =>
+    typeof candidate === "string" &&
+    path.resolve(candidate).startsWith(fixturePrefix) &&
+    existsSync(candidate),
+  );
+  try {
+    return resolveOfficialAgyBinary("");
+  } finally {
+    exists.mockRestore();
+  }
 }
 
 const originalEnv = {
@@ -106,7 +122,7 @@ describe("resolveOfficialAgyBinary", () => {
     process.env.ProgramFiles = path.join(root, "ProgramFiles");
 
     if (process.platform === "win32") {
-      expect(resolveOfficialAgyBinary("")).toBe(stdBin);
+      expect(resolveFromFixture(root)).toBe(stdBin);
     }
   });
 
@@ -120,7 +136,7 @@ describe("resolveOfficialAgyBinary", () => {
     process.env.ProgramFiles = path.join(root, "ProgramFiles");
     process.env["ProgramFiles(x86)"] = path.join(root, "ProgramFilesX86");
 
-    expect(() => resolveOfficialAgyBinary("")).toThrow(/AGY_PATH/);
+    expect(() => resolveFromFixture(root)).toThrow(/AGY_PATH/);
   });
 
   test("discovers binary in ProgramFiles(x86) antigravity* and portable Desktop paths on Windows", () => {
@@ -138,11 +154,11 @@ describe("resolveOfficialAgyBinary", () => {
     process.env.ProgramFiles = path.join(root, "ProgramFiles");
     process.env["ProgramFiles(x86)"] = pfX86;
 
-    expect(resolveOfficialAgyBinary("")).toBe(x86Bin);
+    expect(resolveFromFixture(root)).toBe(x86Bin);
 
     fs.rmSync(pfX86, { recursive: true, force: true });
     const portableBin = touchBinary(path.join(process.env.HOME, "Desktop", "agy", "bin"));
-    expect(resolveOfficialAgyBinary("")).toBe(portableBin);
+    expect(resolveFromFixture(root)).toBe(portableBin);
   });
 });
 

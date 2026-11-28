@@ -4,6 +4,14 @@ import type { AccountRecord, RequestAttempt, RequestLog, SseEventPayload, SseEve
 
 const encoder = new TextEncoder();
 
+function getMaxLogsRetained(): number {
+  const raw = getConfig().maxLogsRetained;
+  if (typeof raw === 'number' && Number.isFinite(raw) && raw >= 1) {
+    return Math.floor(raw);
+  }
+  return 500;
+}
+
 export class EventBus {
   private subscribers = new Set<ReadableStreamDefaultController<Uint8Array>>();
   private recentRequests = new Map<string, RequestLog>();
@@ -26,7 +34,7 @@ export class EventBus {
   private ensureInitialized(): void {
     if (this.initialized) return;
     this.initialized = true;
-    const limit = getConfig().maxLogsRetained || 500;
+    const limit = getMaxLogsRetained();
     const rows = store.getRecentRequestLogs(limit);
     // Insert oldest-first so Map iteration order is chronological, or keep newest-first
     for (const row of rows.reverse()) {
@@ -172,20 +180,24 @@ export class EventBus {
     if (update.cachedTokens !== undefined) log.cachedTokens = update.cachedTokens;
 
     store.upsertRequestLog(log);
-    store.pruneOldRequestLogs(getConfig().maxLogsRetained || 500);
+    store.pruneOldRequestLogs(getMaxLogsRetained());
     this.emit('request:finish', log);
     return log;
   }
 
   getRecentRequests(limit = 100): RequestLog[] {
     this.ensureInitialized();
+    const safeLimit =
+      typeof limit === 'number' && Number.isFinite(limit) && limit >= 1
+        ? Math.min(Math.floor(limit), 10_000)
+        : 100;
     const all = Array.from(this.recentRequests.values());
     all.sort((a, b) => b.startedAt - a.startedAt);
-    return all.slice(0, limit);
+    return all.slice(0, safeLimit);
   }
 
   private trimMemoryCache(): void {
-    const max = getConfig().maxLogsRetained || 500;
+    const max = getMaxLogsRetained();
     while (this.recentRequests.size > max) {
       const oldestKey = this.recentRequests.keys().next().value;
       if (!oldestKey) break;

@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, it } from 'bun:test';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
@@ -533,6 +533,21 @@ afterEach(() => {
 });
 
 describe('account quota refresh', () => {
+  let previousLegacyDirectQuota: string | undefined;
+
+  beforeEach(() => {
+    previousLegacyDirectQuota = process.env.AGY_LEGACY_DIRECT_QUOTA;
+    process.env.AGY_LEGACY_DIRECT_QUOTA = 'true';
+  });
+
+  afterEach(() => {
+    if (previousLegacyDirectQuota === undefined) {
+      delete process.env.AGY_LEGACY_DIRECT_QUOTA;
+    } else {
+      process.env.AGY_LEGACY_DIRECT_QUOTA = previousLegacyDirectQuota;
+    }
+  });
+
   for (const scenario of ['valid', 'expired', 'missing', 'rejected'] as const) {
     it(`handles a ${scenario} access token via the single-account API`, async () => {
       const expiry = new Date(Date.now() + (scenario === 'expired' ? -60_000 : 600_000)).toISOString();

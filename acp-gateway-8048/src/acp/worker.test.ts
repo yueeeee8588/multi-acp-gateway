@@ -1,4 +1,7 @@
 import { describe, expect, spyOn, test } from "bun:test";
+import { appendFileSync, existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { AgySessionWorker, classifyUpstreamError, type AcpTransport, type WorkerOptions } from "./worker";
 import { LoopbackMcpServer } from "./loopback-mcp";
 import type { AccountRecord, GeminiGenerateRequest, GeminiPart } from "../types";
@@ -638,6 +641,89 @@ describe("AgySessionWorker slot B optimizations", () => {
       updatedAt: 0,
     };
   }
+
+  const retryLogLine = "[WARN] Run: attempt 1 failed (received code 429: resource has been exhausted), retrying in 30s";
+
+  test.each(["incremental log", "unterminated line", "after streaming output"] as const)(
+    "aborts a silent bare 429 from the worker log (%s)", async (scenario) => {
+      const workspaceDir = mkdtempSync(join(tmpdir(), "agy-worker-log-test-"));
+      const account = makeTestAccount(join(workspaceDir, "home"));
+      const started = Promise.withResolvers<void>();
+      const closed = Promise.withResolvers<void>();
+      const streamed: GeminiPart[] = [];
+      let logFile = "";
+      let settled = false;
+      const worker = new AgySessionWorker({
+        account,
+        model: "test-model",
+        agyPath: process.execPath,
+        workspaceDir,
+        mcpServer: new LoopbackMcpServer(),
+        tryAcquireWorkerSpawn: () => true,
+        idleTimeoutMs: 2_000,
+        logPollIntervalMs: 50,
+        transportFactory: ({ args, onUpdate }) => {
+          expect(args).toContain("--log-file");
+          logFile = args[args.indexOf("--log-file") + 1]!;
+          writeFileSync(logFile, `旧日志\n${retryLogLine}\n`);
+          return {
+            initialize: async () => ({}),
+            newSession: async () => ({ sessionId: "log-test", models: { currentModelId: "test-model" } }),
+            prompt: () => {
+              if (scenario === "after streaming output") {
+                onUpdate({ sessionId: "log-test", update: {
+                  sessionUpdate: "agent_message_chunk", content: { text: "partial reply" },
+                } });
+              }
+              started.resolve();
+              return new Promise(() => {});
+            },
+            cancel: async () => {},
+            close: async () => closed.resolve(),
+            isAlive: () => true,
+          };
+        },
+      });
+
+      try {
+        const result = worker.executePrompt({ contents: [{ role: "user", parts: [{ text: "hello" }] }] }, {
+          onPart: (part) => streamed.push(part),
+        });
+        const outcome = result.then(
+          (value) => { settled = true; return value; },
+          (error: unknown) => { settled = true; return error; },
+        );
+        await Promise.race([started.promise, result]);
+        appendFileSync(logFile, "[INFO] 新行\r\n[WARN] Run: attempt 2 failed (received code 429: another error), retrying in 30s\n");
+        if (scenario === "unterminated line") {
+          appendFileSync(logFile, retryLogLine);
+        } else if (scenario === "incremental log") {
+          appendFileSync(logFile, "[WARN] CallWithRetry: attempt 1 failed (received code 429: resource has");
+        }
+        await new Promise((resolve) => setTimeout(resolve, 130));
+        expect(settled).toBe(false);
+
+        const startedWaiting = performance.now();
+        appendFileSync(logFile, scenario === "unterminated line" ? "\r\n"
+          : scenario === "incremental log" ? " been exhausted), retrying in 30s\n"
+          : `${retryLogLine}\n`);
+        expect(await outcome).toMatchObject({
+          code: "QUOTA_EXHAUSTED", upstreamStatus: 429, message: expect.stringContaining("RESOURCE_EXHAUSTED"),
+        });
+        expect(performance.now() - startedWaiting).toBeLessThan(1_000);
+        expect(streamed).toEqual(scenario === "after streaming output" ? [{ text: "partial reply" }] : []);
+        expect(worker.isAlive).toBe(false);
+        await closed.promise;
+        for (let i = 0; i < 20 && existsSync(logFile); i++) {
+          await new Promise((resolve) => setTimeout(resolve, 10));
+        }
+        expect(existsSync(logFile)).toBe(false);
+      } finally {
+        await worker.resetAndClose();
+        rmSync(workspaceDir, { recursive: true, force: true });
+      }
+    },
+  );
 
   test("skips MCP registration and passes mcpServers: [] when request has no tools", async () => {
     const mcpServer = new LoopbackMcpServer();

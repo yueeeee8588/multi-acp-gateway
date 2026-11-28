@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { existsSync, statSync } from 'node:fs';
 import { extname, join, resolve } from 'node:path';
 import { AccountManager } from './accounts/manager';
+import { normalizeModelAccessRule, normalizeModelAccountBindings } from './accounts/model-binding';
 import {
   authorizeChromeProfiles,
   openUrlInAccountChrome,
@@ -13,12 +14,14 @@ import {
   AccountScheduler,
   accountScheduler as globalAccountScheduler,
   AllAccountsCooldownError,
+  ExclusiveModelBindingError,
   NoReadyAccountsError,
   isFullProAccount,
 } from './accounts/scheduler';
 import { aggregateExits } from './accounts/exit-probe';
 import { LoopbackMcpServer } from './acp/loopback-mcp';
 import { AcpWorkerPool } from './acp/pool';
+import { WorkerError } from './acp/worker';
 import {
   getConfig,
   getPublicConfig,
@@ -42,7 +45,51 @@ import {
   type WorkerPoolLike,
 } from './gemini/handler';
 import { eventBus } from './logs/events';
-import type { AccountRecord, GatewayConfig } from './types';
+import type { AccountRecord, AccountStatus, AccountTier, GatewayConfig } from './types';
+
+const VALID_ACCOUNT_STATUSES = new Set<AccountStatus>([
+  'ready',
+  'disabled',
+  'auth_required',
+  'restricted',
+]);
+
+function safeDecodeParam(
+  raw: string,
+): { ok: true; value: string } | { ok: false; response: Response } {
+  try {
+    return { ok: true, value: decodeURIComponent(raw) };
+  } catch (err) {
+    if (err instanceof URIError) {
+      return {
+        ok: false,
+        response: Response.json({ error: 'Bad Request: malformed URL parameter' }, { status: 400 }),
+      };
+    }
+    throw err;
+  }
+}
+
+async function parseJsonObject(
+  req: Request,
+): Promise<{ ok: true; data: Record<string, unknown> } | { ok: false; response: Response }> {
+  let body: unknown;
+  try {
+    body = await req.json();
+  } catch {
+    return {
+      ok: false,
+      response: Response.json({ error: 'Invalid JSON request body' }, { status: 400 }),
+    };
+  }
+  if (!body || typeof body !== 'object' || Array.isArray(body)) {
+    return {
+      ok: false,
+      response: Response.json({ error: 'Request body must be a JSON object' }, { status: 400 }),
+    };
+  }
+  return { ok: true, data: body as Record<string, unknown> };
+}
 
 function mapSchedulerError(err: unknown): SchedulerSelectResult {
   if (err instanceof AccountQueueTimeoutError) {
@@ -51,13 +98,26 @@ function mapSchedulerError(err: unknown): SchedulerSelectResult {
   if (err instanceof AllAccountsCooldownError) {
     return { account: null, retryAfterSeconds: err.retryAfterSeconds };
   }
-  if (err instanceof NoReadyAccountsError) {
+  if (err instanceof NoReadyAccountsError && !(err instanceof ExclusiveModelBindingError)) {
     return { account: null };
   }
   throw err;
 }
 
-function adaptScheduler(scheduler: AccountScheduler): SchedulerLike {
+function getManagementConfig() {
+  const config = getPublicConfig();
+  return { ...config, modelAccountBindings: config.modelAccountBindings ?? [] };
+}
+
+interface ThoughtFallbackState {
+  accountId: string;
+  attempted: boolean;
+}
+
+function adaptScheduler(
+  scheduler: AccountScheduler,
+  thoughtFallbacks: WeakMap<AbortSignal, ThoughtFallbackState>,
+): SchedulerLike {
   return {
     async selectAccount({ family, sessionHash, excludeAccountIds, signal }) {
       try {
@@ -69,10 +129,18 @@ function adaptScheduler(scheduler: AccountScheduler): SchedulerLike {
         );
         return { account, release, onWorkerAcquired };
       } catch (err) {
+        const fallback = signal && thoughtFallbacks.get(signal);
+        // Let the protocol handler request its one same-account retry after an empty turn.
+        if (err instanceof ExclusiveModelBindingError && fallback && !fallback.attempted &&
+            excludeAccountIds.includes(fallback.accountId)) {
+          return { account: null };
+        }
         return mapSchedulerError(err);
       }
     },
     async selectFallbackAccount({ accountId, family, sessionHash, signal }) {
+      const fallback = signal && thoughtFallbacks.get(signal);
+      if (fallback) fallback.attempted = true;
       try {
         const { account, release, onWorkerAcquired } = await scheduler.acquireFallbackAccountLease(
           accountId,
@@ -109,11 +177,14 @@ export function adaptWorkerPool(
   pool: AcpWorkerPool,
   onRelease?: (accountId: string) => void,
   onAcquire?: (accountId: string) => void,
+  onThoughtOnly?: (signal: AbortSignal, accountId: string) => void,
 ): WorkerPoolLike {
   const releaseMap = new WeakMap<WorkerHandle, () => void>();
   return {
-    async acquire({ account, sessionHash, model, request }) {
-      const { worker, release } = pool.acquireWorker(account, model, request, sessionHash);
+    async acquire({ account, sessionHash, model, request, stateless }) {
+      const { worker, release } = stateless
+        ? await pool.acquireWorker(account, model, request, sessionHash, { stateless: true })
+        : pool.acquireWorker(account, model, request, sessionHash);
       onAcquire?.(account.id);
       const handle: WorkerHandle = {
         id: `${account.id}:${sessionHash}`,
@@ -131,7 +202,12 @@ export function adaptWorkerPool(
                 : undefined,
             },
             params.signal,
-          );
+          ).catch((err: unknown) => {
+            if (params.signal && err instanceof WorkerError && err.rawError === 'EMPTY_OR_THOUGHT_ONLY_RESPONSE') {
+              onThoughtOnly?.(params.signal, account.id);
+            }
+            throw err;
+          });
           return {
             candidates: [
               {
@@ -227,7 +303,8 @@ export function createApp(options: AppOptions = {}) {
     : new AccountScheduler({
         getActiveCount: acpPool ? (id) => acpPool.getActiveCount(id) : undefined,
       });
-  const scheduler = options.geminiDeps?.scheduler ?? adaptScheduler(accountScheduler!);
+  const thoughtFallbacks = new WeakMap<AbortSignal, ThoughtFallbackState>();
+  const scheduler = options.geminiDeps?.scheduler ?? adaptScheduler(accountScheduler!, thoughtFallbacks);
   eventBus.setActiveCountProvider(acpPool ? (id) => acpPool.getActiveCount(id) : undefined);
   const enrichAccount = (account: AccountRecord): AccountRecord =>
     acpPool ? { ...account, activeWorkers: acpPool.getActiveCount(account.id) } : account;
@@ -244,6 +321,11 @@ export function createApp(options: AppOptions = {}) {
       acpPool!,
       () => emitAccountsIfSubscribed(),
       () => emitAccountsIfSubscribed(),
+      (signal, accountId) => {
+        if (!thoughtFallbacks.get(signal)?.attempted) {
+          thoughtFallbacks.set(signal, { accountId, attempted: false });
+        }
+      },
     );
 
   const prewarm = async (): Promise<void> => {
@@ -304,28 +386,47 @@ export function createApp(options: AppOptions = {}) {
   const webDistDir = resolve(options.webDistDir ?? join(process.cwd(), 'web', 'dist'));
 
   async function fetch(req: Request): Promise<Response> {
+    try {
+      return await routeRequest(req);
+    } catch (err) {
+      console.error('[agy-gemini-8048] unhandled error in fetch:', err);
+      return Response.json(
+        {
+          error: 'Internal Server Error',
+          message: err instanceof Error ? err.message : String(err),
+        },
+        { status: 500 },
+      );
+    }
+  }
+
+  async function routeRequest(req: Request): Promise<Response> {
     const url = new URL(req.url);
 
-    // 1. Gemini /v1beta protocol routes
-    if (url.pathname.startsWith('/v1beta')) {
-      const res = await handleGemini(req, url);
-      if (res) return res;
-    }
-
-    // 1b. Anthropic /v1 protocol routes
-    if (
-      url.pathname === '/v1/messages' ||
-      url.pathname === '/v1/messages/count_tokens' ||
-      url.pathname === '/v1/models'
-    ) {
-      const res = await handleAnthropic(req, url);
-      if (res) return res;
-    }
-
-    // 1c. OpenAI /v1/chat/completions protocol route
-    if (url.pathname === '/v1/chat/completions') {
-      const res = await handleOpenAi(req, url);
-      if (res) return res;
+    try {
+      if (url.pathname.startsWith('/v1beta')) {
+        const res = await handleGemini(req, url);
+        if (res) return res;
+      }
+      if (url.pathname === '/v1/messages' || url.pathname === '/v1/messages/count_tokens' ||
+          url.pathname === '/v1/models') {
+        const res = await handleAnthropic(req, url);
+        if (res) return res;
+      }
+      if (url.pathname === '/v1/chat/completions') {
+        const res = await handleOpenAi(req, url);
+        if (res) return res;
+      }
+    } catch (err) {
+      if (!(err instanceof ExclusiveModelBindingError)) throw err;
+      const message = err.message;
+      if (url.pathname.startsWith('/v1beta')) {
+        return Response.json({ error: { code: 503, status: 'UNAVAILABLE', message } }, { status: 503 });
+      }
+      if (url.pathname === '/v1/chat/completions') {
+        return Response.json({ error: { type: 'server_error', code: 'service_unavailable', message } }, { status: 503 });
+      }
+      return Response.json({ type: 'error', error: { type: 'overloaded_error', message } }, { status: 503 });
     }
 
     // 2. Management /api routes
@@ -410,17 +511,60 @@ export function createApp(options: AppOptions = {}) {
 
       // POST /api/accounts
       if (req.method === 'POST' && url.pathname === '/api/accounts') {
-        const body = (await req.json().catch(() => ({}))) as Partial<AccountRecord>;
+        const parsed = await parseJsonObject(req);
+        if (!parsed.ok) return parsed.response;
+        const body = parsed.data;
+
+        for (const field of ['id', 'label', 'email', 'source', 'homeDir', 'proxyUrl'] as const) {
+          if (field in body && body[field] !== undefined && typeof body[field] !== 'string') {
+            return Response.json({ error: `${field} must be a string` }, { status: 400 });
+          }
+        }
+        if ('status' in body && body.status !== undefined) {
+          if (
+            typeof body.status !== 'string' ||
+            !VALID_ACCOUNT_STATUSES.has(body.status as AccountStatus)
+          ) {
+            return Response.json(
+              { error: 'status must be one of ready, disabled, auth_required, restricted' },
+              { status: 400 },
+            );
+          }
+        }
+        if ('tier' in body && body.tier !== undefined && body.tier !== 'pro' && body.tier !== 'standard') {
+          return Response.json({ error: "tier must be 'pro' or 'standard'" }, { status: 400 });
+        }
+        if ('concurrencyLimit' in body && body.concurrencyLimit !== undefined) {
+          if (
+            typeof body.concurrencyLimit !== 'number' ||
+            !Number.isInteger(body.concurrencyLimit) ||
+            body.concurrencyLimit < 1 ||
+            body.concurrencyLimit > 64
+          ) {
+            return Response.json(
+              { error: 'concurrencyLimit must be an integer between 1 and 64' },
+              { status: 400 },
+            );
+          }
+        }
+
+        const label =
+          typeof body.label === 'string' && body.label.length > 0
+            ? body.label
+            : typeof body.email === 'string' && body.email.length > 0
+              ? body.email
+              : `account-${randomUUID().slice(0, 6)}`;
+
         const account = accountManager.createAccount({
-          id: body.id,
-          label: body.label || body.email || `account-${randomUUID().slice(0, 6)}`,
-          email: body.email,
-          source: body.source,
-          homeDir: body.homeDir,
-          proxyUrl: body.proxyUrl,
-          status: body.status ?? 'ready',
-          tier: body.tier === 'pro' ? 'pro' : 'standard',
-          concurrencyLimit: body.concurrencyLimit,
+          id: body.id as string | undefined,
+          label,
+          email: body.email as string | undefined,
+          source: body.source as string | undefined,
+          homeDir: body.homeDir as string | undefined,
+          proxyUrl: body.proxyUrl as string | undefined,
+          status: (body.status as AccountStatus | undefined) ?? 'ready',
+          tier: (body.tier as AccountTier | undefined) ?? 'standard',
+          concurrencyLimit: body.concurrencyLimit as number | undefined,
         });
         eventBus.emit('accounts', accountManager.listAccounts());
         return Response.json(enrichAccount(account), { status: 201 });
@@ -489,29 +633,100 @@ export function createApp(options: AppOptions = {}) {
       // Account-specific routes: /api/accounts/:id/...
       const accMatch = url.pathname.match(/^\/api\/accounts\/([^/]+)(?:\/(.*))?$/);
       if (accMatch) {
-        const accountId = decodeURIComponent(accMatch[1]);
+        const decodedAccountId = safeDecodeParam(accMatch[1]);
+        if (!decodedAccountId.ok) return decodedAccountId.response;
+        const accountId = decodedAccountId.value;
         const subPath = accMatch[2] || '';
 
         if (req.method === 'PUT' && !subPath) {
           const existing = accountManager.getAccount(accountId);
           if (!existing) return Response.json({ error: 'Account not found' }, { status: 404 });
-          const patch = (await req.json().catch(() => ({}))) as Partial<AccountRecord>;
+          const parsed = await parseJsonObject(req);
+          if (!parsed.ok) return parsed.response;
+          const patch = parsed.data;
+
+          for (const field of [
+            'label',
+            'email',
+            'source',
+            'homeDir',
+            'proxyUrl',
+            'statusReason',
+          ] as const) {
+            if (field in patch && patch[field] !== undefined && typeof patch[field] !== 'string') {
+              return Response.json({ error: `${field} must be a string` }, { status: 400 });
+            }
+          }
+          if ('status' in patch && patch.status !== undefined) {
+            if (
+              typeof patch.status !== 'string' ||
+              !VALID_ACCOUNT_STATUSES.has(patch.status as AccountStatus)
+            ) {
+              return Response.json(
+                { error: 'status must be one of ready, disabled, auth_required, restricted' },
+                { status: 400 },
+              );
+            }
+          }
+          if (
+            'tier' in patch &&
+            patch.tier !== undefined &&
+            patch.tier !== 'pro' &&
+            patch.tier !== 'standard'
+          ) {
+            return Response.json({ error: "tier must be 'pro' or 'standard'" }, { status: 400 });
+          }
+          if ('concurrencyLimit' in patch && patch.concurrencyLimit !== undefined) {
+            if (
+              typeof patch.concurrencyLimit !== 'number' ||
+              !Number.isInteger(patch.concurrencyLimit) ||
+              patch.concurrencyLimit < 1 ||
+              patch.concurrencyLimit > 64
+            ) {
+              return Response.json(
+                { error: 'concurrencyLimit must be an integer between 1 and 64' },
+                { status: 400 },
+              );
+            }
+          }
+
+          let modelAccessRule = existing.modelAccessRule;
+          if ('modelAccessRule' in patch) {
+            try {
+              modelAccessRule = normalizeModelAccessRule(patch.modelAccessRule);
+            } catch (err) {
+              return Response.json({ error: err instanceof Error ? err.message : String(err) }, { status: 400 });
+            }
+          }
+
+          const nextStatus =
+            patch.status !== undefined ? (patch.status as AccountStatus) : existing.status;
           const nextStatusReason =
             patch.statusReason !== undefined
-              ? patch.statusReason
-              : patch.status === 'ready'
+              ? (patch.statusReason as string)
+              : nextStatus === 'ready' && patch.status === 'ready'
                 ? ''
                 : existing.statusReason;
           const updated: AccountRecord = {
             ...existing,
-            ...patch,
-            id: existing.id,
+            label: patch.label !== undefined ? (patch.label as string) : existing.label,
+            email: patch.email !== undefined ? (patch.email as string) : existing.email,
+            source: patch.source !== undefined ? (patch.source as string) : existing.source,
+            homeDir: patch.homeDir !== undefined ? (patch.homeDir as string) : existing.homeDir,
+            proxyUrl: patch.proxyUrl !== undefined ? (patch.proxyUrl as string) : existing.proxyUrl,
+            status: nextStatus,
             statusReason: nextStatusReason,
-            tier: patch.tier === 'pro' ? 'pro' : patch.tier === 'standard' ? 'standard' : existing.tier,
+            modelAccessRule,
+            tier: patch.tier !== undefined ? (patch.tier as AccountTier) : existing.tier,
+            concurrencyLimit:
+              patch.concurrencyLimit !== undefined
+                ? (patch.concurrencyLimit as number)
+                : existing.concurrencyLimit,
+            id: existing.id,
             updatedAt: Date.now(),
           };
           store.upsertAccount(updated);
-          if (updated.status === 'ready') {
+          if (updated.status === 'ready' && (patch.status === 'ready' || !('modelAccessRule' in patch))) {
             if (accountScheduler) {
               accountScheduler.clearCooldown(accountId, '*', 'global');
             } else {
@@ -579,7 +794,9 @@ export function createApp(options: AppOptions = {}) {
 
         const cdMatch = subPath.match(/^cooldowns\/(.+)$/);
         if (req.method === 'DELETE' && cdMatch) {
-          const scope = decodeURIComponent(cdMatch[1]);
+          const decodedScope = safeDecodeParam(cdMatch[1]);
+          if (!decodedScope.ok) return decodedScope.response;
+          const scope = decodedScope.value;
           const colonIdx = scope.lastIndexOf(':');
           const family = colonIdx >= 0 ? scope.slice(0, colonIdx) : scope;
           const scopeType =
@@ -618,14 +835,24 @@ export function createApp(options: AppOptions = {}) {
 
       // GET /api/requests
       if (req.method === 'GET' && url.pathname === '/api/requests') {
-        const limit = Number(url.searchParams.get('limit') || 100);
+        const rawLimit = url.searchParams.get('limit');
+        let limit = 100;
+        if (rawLimit !== null && rawLimit !== '') {
+          const parsed = Number(rawLimit);
+          if (!Number.isInteger(parsed) || parsed < 1) {
+            return Response.json({ error: 'limit must be a positive integer' }, { status: 400 });
+          }
+          limit = Math.min(parsed, 1000);
+        }
         return Response.json(eventBus.getRecentRequests(limit));
       }
 
       // POST /api/requests/:id/cancel
       const cancelMatch = url.pathname.match(/^\/api\/requests\/([^/]+)\/cancel$/);
       if (req.method === 'POST' && cancelMatch) {
-        const requestId = decodeURIComponent(cancelMatch[1]);
+        const decodedRequestId = safeDecodeParam(cancelMatch[1]);
+        if (!decodedRequestId.ok) return decodedRequestId.response;
+        const requestId = decodedRequestId.value;
         const controller = inFlightControllers.get(requestId);
         if (controller) {
           controller.abort();
@@ -649,7 +876,9 @@ export function createApp(options: AppOptions = {}) {
       // PUT /api/models/:id/limits
       const modelLimitsMatch = url.pathname.match(/^\/api\/models\/([^/]+)\/limits$/);
       if (req.method === 'PUT' && modelLimitsMatch) {
-        const modelId = decodeURIComponent(modelLimitsMatch[1]);
+        const decodedModelId = safeDecodeParam(modelLimitsMatch[1]);
+        if (!decodedModelId.ok) return decodedModelId.response;
+        const modelId = decodedModelId.value;
         let body: unknown;
         try {
           body = await req.json();
@@ -710,31 +939,34 @@ export function createApp(options: AppOptions = {}) {
 
       // GET /api/config
       if (req.method === 'GET' && url.pathname === '/api/config') {
-        return Response.json(getPublicConfig());
+        return Response.json(getManagementConfig());
       }
 
       // PUT /api/config
       if (req.method === 'PUT' && url.pathname === '/api/config') {
-        const body: unknown = await req.json().catch(() => null);
-        if (!body || typeof body !== 'object' || Array.isArray(body)) {
-          return Response.json({ error: 'Expected a JSON object' }, { status: 400 });
-        }
+        const parsed = await parseJsonObject(req);
+        if (!parsed.ok) return parsed.response;
+        const body = parsed.data;
         for (const field of ['apiKey', 'defaultProxy'] as const) {
           if (field in body && typeof (body as Record<string, unknown>)[field] !== 'string') {
             return Response.json({ error: `${field} must be a string` }, { status: 400 });
           }
         }
+        const patch = body as Partial<GatewayConfig>;
         try {
           validateSensitiveFilterPatch(body as Record<string, unknown>);
           validateRiskControlPatch(body as Record<string, unknown>);
+          if ('modelAccountBindings' in patch) {
+            patch.modelAccountBindings = normalizeModelAccountBindings(patch.modelAccountBindings);
+          }
         } catch (err) {
           return Response.json(
             { error: err instanceof Error ? err.message : String(err) },
             { status: 400 },
           );
         }
-        updateConfig(body as Partial<GatewayConfig>);
-        const pub = getPublicConfig();
+        updateConfig(patch);
+        const pub = getManagementConfig();
         eventBus.emit('config', pub);
         return Response.json(pub);
       }
@@ -866,9 +1098,14 @@ export function installProcessErrorGuards(): void {
 
 if (import.meta.main) {
   installProcessErrorGuards();
-  void new AccountManager().syncMissingAccountEmails().then((n: number) => {
-    if (n > 0) console.log(`[agy-gemini-8048] synced missing emails for ${n} account(s)`);
-  });
+  void new AccountManager()
+    .syncMissingAccountEmails()
+    .then((n: number) => {
+      if (n > 0) console.log(`[agy-gemini-8048] synced missing emails for ${n} account(s)`);
+    })
+    .catch((err) => {
+      console.error('[agy-gemini-8048] failed to sync missing account emails:', err);
+    });
   const config = getConfig();
   const app = createApp();
   const server = Bun.serve({
@@ -878,7 +1115,9 @@ if (import.meta.main) {
     fetch: app.fetch,
   });
   console.log(`[agy-gemini-8048] listening on http://${server.hostname}:${server.port}`);
-  void app.prewarm();
+  void app.prewarm().catch((err) => {
+    console.error('[agy-gemini-8048] prewarm failed:', err);
+  });
 
   // 认证自愈：出口网络恢复后，把因认证失败被下线的账号重新拉回可用池，
   // 避免网络抖动一次就把整池账号留在 auth_required。
@@ -918,6 +1157,11 @@ if (import.meta.main) {
       })
       .finally(() => {
         server.stop(true);
+        try {
+          store.close();
+        } catch (err) {
+          console.error('[agy-gemini-8048] error closing store:', err);
+        }
         clearTimeout(forceExitTimer);
         process.exit(0);
       });

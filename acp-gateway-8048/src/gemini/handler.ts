@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { checkProxyReachable } from '../accounts/exit-probe';
 import { buildIsolatedAgyEnv, resolveAgyBinary } from '../acp/env';
+import { isSuggestionModeRequest } from '../acp/suggestion-guard';
 import { WorkerError, type WorkerModelSelection } from '../acp/worker';
 import { getConfig, resolveEffectiveProxy } from '../config/settings';
 import { store } from '../db/store';
@@ -53,6 +54,7 @@ export interface WorkerPoolLike {
     sessionHash: string;
     model: string;
     request: GeminiGenerateRequest;
+    stateless?: boolean;
   }): Promise<WorkerHandle>;
   release(worker: WorkerHandle): void;
 }
@@ -501,6 +503,29 @@ function buildUsageMetadata(
   };
 }
 
+function isLocationUnsupportedError(reasonCode?: string, reasonText?: string): boolean {
+  if (reasonCode === 'LOCATION_UNSUPPORTED') return true;
+  if (!reasonText) return false;
+  return /location[_ ]is[_ ]not[_ ]supported|location[_ ]unsupported/i.test(reasonText);
+}
+
+function getNoRetryHeaders(
+  status: number,
+  reasonCode?: string,
+  reasonText?: string
+): Record<string, string> | undefined {
+  if (isLocationUnsupportedError(reasonCode, reasonText)) return undefined;
+  if (
+    status === 403 ||
+    reasonCode === 'VALIDATION_REQUIRED' ||
+    reasonCode === 'RESTRICTED' ||
+    reasonCode === 'ACCOUNT_DISABLED_REFUSED'
+  ) {
+    return { 'x-should-retry': 'false' };
+  }
+  return undefined;
+}
+
 function classifyError(err: unknown): {
   status: number;
   reasonCode: string;
@@ -519,7 +544,9 @@ function classifyError(err: unknown): {
           ? 503
           : err.code === 'AUTH_REQUIRED'
             ? 401
-            : err.code === 'VALIDATION_REQUIRED' || err.code === 'RESTRICTED'
+            : err.code === 'VALIDATION_REQUIRED' ||
+                err.code === 'RESTRICTED' ||
+                (err.code as string) === 'ACCOUNT_DISABLED_REFUSED'
               ? 403
               : err.code === 'CANCELLED'
                 ? 499
@@ -537,9 +564,13 @@ function classifyError(err: unknown): {
       (isQuotaError ||
       err.code === 'CAPACITY_UNAVAILABLE' ||
       err.code === 'AUTH_REQUIRED' ||
+      err.code === 'VALIDATION_REQUIRED' ||
+      err.code === 'RESTRICTED' ||
+      (err.code as string) === 'ACCOUNT_DISABLED_REFUSED' ||
       err.code === 'SOFT_ERROR' ||
       err.code === 'TRANSPORT_ERROR' ||
       err.code === 'TIMEOUT' ||
+      status === 403 ||
       status === 502 ||
       status === 503 ||
       status === 504
@@ -713,6 +744,47 @@ export function createGeminiHandler(deps: GeminiHandlerDeps = {}) {
 
       applyGenerationConfigGuardrails(parsedReq, getModelLimitsMap()[model]?.outputTokenLimit);
 
+      if (isSuggestionModeRequest(parsedReq.contents)) {
+        const guardResponseId = `resp_${randomUUID()}`;
+        const guardSessionHash = resolveSessionKey(parsedReq, req.headers);
+        const emptyResp = enrichChunk(
+          {
+            candidates: [
+              {
+                content: { role: 'model', parts: [{ text: '' }] },
+                finishReason: 'STOP',
+                index: 0,
+              },
+            ],
+          },
+          model,
+          guardResponseId
+        );
+        emptyResp.usageMetadata = buildUsageMetadata(parsedReq, undefined, 0, 0);
+        if (action !== 'streamGenerateContent') {
+          return Response.json(emptyResp, {
+            headers: {
+              'X-Accel-Buffering': 'no',
+              'X-Mapped-Model': model,
+              'X-Session-Id': guardSessionHash,
+            },
+          });
+        }
+        const altSse = url.searchParams.get('alt') === 'sse';
+        const body = altSse ? formatSseChunk(emptyResp) : `[${JSON.stringify(emptyResp)}]`;
+        return new Response(body, {
+          status: 200,
+          headers: {
+            'Content-Type': altSse ? 'text/event-stream; charset=utf-8' : 'application/json; charset=utf-8',
+            'Cache-Control': 'no-cache, no-transform',
+            Connection: 'keep-alive',
+            'X-Accel-Buffering': 'no',
+            'X-Mapped-Model': model,
+            'X-Session-Id': guardSessionHash,
+          },
+        });
+      }
+
       if (!deps.scheduler || !deps.workerPool) {
         return jsonError(503, 'Gateway scheduler or worker pool is not initialized', 'UNAVAILABLE');
       }
@@ -843,7 +915,12 @@ export function createGeminiHandler(deps: GeminiHandlerDeps = {}) {
                       errorResponse: jsonError(
                         lastClassifiedFailure.status,
                         lastClassifiedFailure.reasonText,
-                        lastClassifiedFailure.reasonCode
+                        lastClassifiedFailure.reasonCode,
+                        getNoRetryHeaders(
+                          lastClassifiedFailure.status,
+                          lastClassifiedFailure.reasonCode,
+                          lastClassifiedFailure.reasonText
+                        )
                       ),
                     };
                   }
@@ -869,10 +946,33 @@ export function createGeminiHandler(deps: GeminiHandlerDeps = {}) {
                 errorResponse: jsonError(
                   lastClassifiedFailure.status,
                   lastClassifiedFailure.reasonText,
-                  lastClassifiedFailure.reasonCode
+                  lastClassifiedFailure.reasonCode,
+                  getNoRetryHeaders(
+                    lastClassifiedFailure.status,
+                    lastClassifiedFailure.reasonCode,
+                    lastClassifiedFailure.reasonText
+                  )
                 ),
               };
             } else {
+              if (lastClassifiedFailure) {
+                const noRetryHeaders = getNoRetryHeaders(
+                  lastClassifiedFailure.status,
+                  lastClassifiedFailure.reasonCode,
+                  lastClassifiedFailure.reasonText
+                );
+                if (noRetryHeaders) {
+                  eventBus.finishRequest(requestId, { state: 'failed', httpStatus: lastClassifiedFailure.status });
+                  return {
+                    errorResponse: jsonError(
+                      lastClassifiedFailure.status,
+                      lastClassifiedFailure.reasonText,
+                      lastClassifiedFailure.reasonCode,
+                      noRetryHeaders
+                    ),
+                  };
+                }
+              }
               const attemptedRetryAfter = earliestRetryAt === undefined
                 ? Infinity
                 : Math.max(0, Math.ceil((earliestRetryAt - Date.now()) / 1000));
@@ -918,11 +1018,16 @@ export function createGeminiHandler(deps: GeminiHandlerDeps = {}) {
           let worker: WorkerHandle | null = null;
           const acquireStart = Date.now();
           try {
+            const isStateless =
+              (!parsedReq.tools || parsedReq.tools.length === 0) &&
+              parsedReq.contents?.length === 1 &&
+              (parsedReq.contents[0]?.role ?? 'user') === 'user';
             worker = await deps.workerPool!.acquire({
               account,
               sessionHash,
               model,
               request: parsedReq,
+              ...(isStateless ? { stateless: true } : {}),
             });
             onWorkerAcquired?.();
             phaseTimingsMs.workerAcquire = Date.now() - acquireStart;
@@ -1024,24 +1129,45 @@ export function createGeminiHandler(deps: GeminiHandlerDeps = {}) {
               classified.status === 429 ||
               classified.status === 403 ||
               classified.reasonCode === 'VALIDATION_REQUIRED' ||
-              classified.reasonCode === 'RESTRICTED'
+              classified.reasonCode === 'RESTRICTED' ||
+              classified.reasonCode === 'ACCOUNT_DISABLED_REFUSED'
             ) {
               deps.scheduler!.abandonSession?.(sessionHash, model);
             }
+
+            const noRetryHeaders = getNoRetryHeaders(
+              classified.status,
+              classified.reasonCode,
+              classified.reasonText
+            );
 
             if (abortController.signal.aborted || classified.reasonCode === 'CANCELLED') {
               return cancelRequest();
             }
             if (classified.reasonCode === 'MODEL_SELECTION_FAILED' && !classified.retryable) {
               eventBus.finishRequest(requestId, { state: 'failed', httpStatus: classified.status });
-              return { errorResponse: jsonError(classified.status, classified.reasonText, classified.reasonCode) };
+              return {
+                errorResponse: jsonError(
+                  classified.status,
+                  classified.reasonText,
+                  classified.reasonCode,
+                  noRetryHeaders
+                ),
+              };
             }
 
             if (classified.reasonCode === 'MODEL_SELECTION_FAILED') {
               modelSelectionSwitches += 1;
               if (modelSelectionSwitches > 1) {
                 eventBus.finishRequest(requestId, { state: 'failed', httpStatus: classified.status });
-                return { errorResponse: jsonError(classified.status, classified.reasonText, classified.reasonCode) };
+                return {
+                  errorResponse: jsonError(
+                    classified.status,
+                    classified.reasonText,
+                    classified.reasonCode,
+                    noRetryHeaders
+                  ),
+                };
               }
             }
 
@@ -1072,7 +1198,14 @@ export function createGeminiHandler(deps: GeminiHandlerDeps = {}) {
                 state: abortController.signal.aborted ? 'cancelled' : 'failed',
                 httpStatus: classified.status,
               });
-              return { errorResponse: jsonError(classified.status, classified.reasonText, classified.reasonCode) };
+              return {
+                errorResponse: jsonError(
+                  classified.status,
+                  classified.reasonText,
+                  classified.reasonCode,
+                  noRetryHeaders
+                ),
+              };
             }
 
             // Do not replay across accounts on pre-first-chunk TIMEOUT to avoid repeated prefill of large contexts.
@@ -1083,7 +1216,14 @@ export function createGeminiHandler(deps: GeminiHandlerDeps = {}) {
 
             if (!classified.retryable) {
               eventBus.finishRequest(requestId, { state: 'failed', httpStatus: classified.status });
-              return { errorResponse: jsonError(classified.status, classified.reasonText, classified.reasonCode) };
+              return {
+                errorResponse: jsonError(
+                  classified.status,
+                  classified.reasonText,
+                  classified.reasonCode,
+                  noRetryHeaders
+                ),
+              };
             }
 
             const isAccountFailoverError =
@@ -1096,7 +1236,8 @@ export function createGeminiHandler(deps: GeminiHandlerDeps = {}) {
               classified.reasonCode === 'RESOURCE_EXHAUSTED' ||
               classified.reasonCode === 'AUTH_REQUIRED' ||
               classified.reasonCode === 'RESTRICTED' ||
-              classified.reasonCode === 'VALIDATION_REQUIRED';
+              classified.reasonCode === 'VALIDATION_REQUIRED' ||
+              classified.reasonCode === 'ACCOUNT_DISABLED_REFUSED';
 
             const getQuotaRetryHeaders = (): Record<string, string> | undefined => {
               if (classified.status !== 429 && !classified.isQuotaError) {
@@ -1115,12 +1256,16 @@ export function createGeminiHandler(deps: GeminiHandlerDeps = {}) {
 
             if (!config.accountFailover && isAccountFailoverError) {
               eventBus.finishRequest(requestId, { state: 'failed', httpStatus: classified.status });
+              const mergedHeaders =
+                getQuotaRetryHeaders() || noRetryHeaders
+                  ? { ...getQuotaRetryHeaders(), ...noRetryHeaders }
+                  : undefined;
               return {
                 errorResponse: jsonError(
                   classified.status,
                   classified.reasonText,
                   classified.reasonCode,
-                  getQuotaRetryHeaders(),
+                  mergedHeaders,
                 ),
               };
             }
@@ -1146,7 +1291,14 @@ export function createGeminiHandler(deps: GeminiHandlerDeps = {}) {
               nonQuotaSwitches += 1;
               if (nonQuotaSwitches > config.maxAccountSwitches) {
                 eventBus.finishRequest(requestId, { state: 'failed', httpStatus: classified.status });
-                return { errorResponse: jsonError(classified.status, classified.reasonText, classified.reasonCode) };
+                return {
+                  errorResponse: jsonError(
+                    classified.status,
+                    classified.reasonText,
+                    classified.reasonCode,
+                    noRetryHeaders
+                  ),
+                };
               }
             }
           } finally {
@@ -1230,12 +1382,16 @@ export function createGeminiHandler(deps: GeminiHandlerDeps = {}) {
         }
         sentAnyChunk = true;
         lastWriteAt = Date.now();
-        if (altSse) {
-          streamController.enqueue(encoder.encode(formatSseChunk(enriched)));
-        } else {
-          const prefix = jsonArrayFirst ? '[' : ',';
-          jsonArrayFirst = false;
-          streamController.enqueue(encoder.encode(`${prefix}${JSON.stringify(enriched)}`));
+        try {
+          if (altSse) {
+            streamController.enqueue(encoder.encode(formatSseChunk(enriched)));
+          } else {
+            const prefix = jsonArrayFirst ? '[' : ',';
+            jsonArrayFirst = false;
+            streamController.enqueue(encoder.encode(`${prefix}${JSON.stringify(enriched)}`));
+          }
+        } catch {
+          streamClosed = true;
         }
       };
 
@@ -1262,6 +1418,7 @@ export function createGeminiHandler(deps: GeminiHandlerDeps = {}) {
       let earlyReleased = false;
       let earlyReleaseReason = '';
       let contentSettledByChunk = false;
+      let bufferedFlushed = false;
       let earlyReleaseTimer: ReturnType<typeof setTimeout> | null = null;
       let contentOrDoneSettled = false;
       let resolveContentOrDone!: () => void;
@@ -1304,17 +1461,21 @@ export function createGeminiHandler(deps: GeminiHandlerDeps = {}) {
           ],
           usageMetadata: buildUsageMetadata(parsedReq, undefined, outputTextLength, thoughtTextLength),
         };
-        if (altSse) {
-          // 先给 Gemini 系客户端一个标准终止帧，再补一个显式错误事件：两类客户端都能拿到明确失败。
-          streamController.enqueue(encoder.encode(formatSseChunk(enrichChunk(finishFrame, model, responseId))));
-          sawFinishReason = true;
-          streamController.enqueue(
-            encoder.encode(`event: error\ndata: ${JSON.stringify({ error: { code, message, status } })}\n\n`),
-          );
-        } else {
-          streamController.enqueue(encoder.encode(JSON.stringify({ error: { code, message, status } })));
+        try {
+          if (altSse) {
+            // 先给 Gemini 系客户端一个标准终止帧，再补一个显式错误事件：两类客户端都能拿到明确失败。
+            streamController.enqueue(encoder.encode(formatSseChunk(enrichChunk(finishFrame, model, responseId))));
+            sawFinishReason = true;
+            streamController.enqueue(
+              encoder.encode(`event: error\ndata: ${JSON.stringify({ error: { code, message, status } })}\n\n`),
+            );
+          } else {
+            streamController.enqueue(encoder.encode(JSON.stringify({ error: { code, message, status } })));
+          }
+          lastWriteAt = Date.now();
+        } catch {
+          streamClosed = true;
         }
-        lastWriteAt = Date.now();
       };
       const writeStreamErrorFrame = async (errorResponse: Response) => {
         let code = errorResponse.status || 502;
@@ -1362,7 +1523,7 @@ export function createGeminiHandler(deps: GeminiHandlerDeps = {}) {
               // 但 sentAnyChunk / firstSettled 保持 false —— 换号重试依旧无感。
               releaseStreamHeadersEarly('thought');
             }
-          } else if (streamController) {
+          } else if (streamController && bufferedFlushed) {
             writeChunkToStream(chunk);
           } else {
             bufferedChunks.push(chunk);
@@ -1468,8 +1629,8 @@ export function createGeminiHandler(deps: GeminiHandlerDeps = {}) {
             }
             if (streamClosed) return;
 
-            // 整个 turn 从未出现有效正文（执行已结束）→ 缓冲的思考块作废，改由 executionResult.response 整体下发。
-            if (!contentSettledByChunk && executionResult?.response && !sentAnyChunk) {
+            // 整个 turn 从未出现有效正文（执行已结束）→ 缓冲的思考块作废。
+            if (!contentSettledByChunk && !sentAnyChunk) {
               bufferedChunks.length = 0;
             }
             // Flush any chunks buffered before stream started
@@ -1477,6 +1638,7 @@ export function createGeminiHandler(deps: GeminiHandlerDeps = {}) {
               const c = bufferedChunks.shift()!;
               writeChunkToStream(c);
             }
+            bufferedFlushed = true;
 
             if (!executionFinished) {
               await runPromise;

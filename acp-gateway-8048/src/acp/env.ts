@@ -1,6 +1,9 @@
+import { randomUUID } from "node:crypto";
 import fs from "node:fs";
+import { unlink } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { getContextUnlockDir, selectAgyBinary } from "./context-unlock";
 import { AGY_BRIDGE_AGENT_NAME, ensureMinimalAgentDefinition } from "./minimal-agent";
 
 export const HOST_HOME = process.env.HOME;
@@ -180,6 +183,7 @@ export function resolveOfficialAgyBinary(agyPath?: string): string {
     );
   }
 
+  const managedDir = path.resolve(getContextUnlockDir()) + path.sep;
   const seenDirs = new Set<string>();
 
   for (const dir of pathsToSearch) {
@@ -190,7 +194,11 @@ export function resolveOfficialAgyBinary(agyPath?: string): string {
     for (const name of names) {
       const candidate = path.join(dir, name);
       if (isExistingFile(candidate)) {
-        return candidate;
+        const resolved = path.resolve(candidate);
+        const isManaged = windows
+          ? resolved.toLowerCase().startsWith(managedDir.toLowerCase())
+          : resolved.startsWith(managedDir);
+        if (!isManaged) return candidate;
       }
     }
   }
@@ -201,7 +209,8 @@ export function resolveOfficialAgyBinary(agyPath?: string): string {
 }
 
 export function resolveAgyBinary(agyPath?: string): string {
-  return resolveOfficialAgyBinary(agyPath);
+  const officialPath = resolveOfficialAgyBinary(agyPath);
+  return selectAgyBinary(officialPath);
 }
 
 function mergeNoProxy(existing?: string): string {
@@ -296,6 +305,14 @@ export function buildAgyLoginArgs(homeDir: string): string[] {
     "--app-data-dir",
     "antigravity-cli",
   ];
+}
+
+export function createAgyWorkerLogPath(homeDir: string): string {
+  return path.resolve(homeDir, ".gemini", "antigravity-cli", `worker-${process.pid}-${randomUUID()}.log`);
+}
+
+export async function removeAgyWorkerLog(logFile?: string): Promise<void> {
+  if (logFile) await unlink(logFile).catch(() => {});
 }
 
 export function buildAgyWorkerArgs(opts: BuildAgyWorkerArgsOptions): string[] {

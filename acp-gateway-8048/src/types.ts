@@ -122,7 +122,22 @@ export interface AccountQuotaSnapshot {
   error?: string;
 }
 
+export interface ModelAccessRule {
+  mode: 'all' | 'allow' | 'deny';
+  patterns: string[];
+}
+
+export interface ModelAccountBinding {
+  id: string;
+  modelPattern: string;
+  mode: 'exclusive' | 'priority';
+  accountIds: string[];
+  enabled: boolean;
+  note?: string;
+}
+
 export interface AccountRecord {
+  modelAccessRule?: ModelAccessRule;
   id: string;
   label: string;
   email: string;
@@ -179,6 +194,8 @@ export interface SensitiveWordRule {
 }
 
 export interface GatewayConfig {
+  /** Omitted by legacy configuration. The effective default is an empty list. */
+  modelAccountBindings?: ModelAccountBinding[];
   port: number;
   host: string;
   agyPath: string;

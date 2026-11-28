@@ -327,12 +327,23 @@ function resolveProxyUrl(explicitProxy?: string): string | undefined {
   return resolveEffectiveProxy(explicitProxy);
 }
 
+function escapeHtml(value: string): string {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
 function renderCallbackHtml(title: string, message: string): Response {
+  const safeTitle = escapeHtml(title);
+  const safeMessage = escapeHtml(message);
   const html = `<!doctype html>
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8" />
-  <title>${title}</title>
+  <title>${safeTitle}</title>
   <style>
     body { font-family: system-ui, sans-serif; display: grid; place-items: center; min-height: 100vh; margin: 0; background: #111827; color: #f9fafb; }
     .card { padding: 24px 32px; border-radius: 12px; background: #1f2937; text-align: center; box-shadow: 0 10px 30px rgba(0,0,0,.35); }
@@ -340,8 +351,8 @@ function renderCallbackHtml(title: string, message: string): Response {
 </head>
 <body>
   <div class="card">
-    <h2>${title}</h2>
-    <p>${message}</p>
+    <h2>${safeTitle}</h2>
+    <p>${safeMessage}</p>
   </div>
   <script>setTimeout(function () { window.close(); }, 300);</script>
 </body>
