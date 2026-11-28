@@ -102,13 +102,27 @@ function collectAntigravityProgramDirs(baseProgramsDir: string): string[] {
   return dirs;
 }
 
+const warnedInvalidAgyPaths = new Set<string>();
+
+function warnInvalidAgyPathOnce(source: "env" | "config", candidate: string, message: string): void {
+  const key = `${source}:${candidate}`;
+  if (warnedInvalidAgyPaths.has(key)) {
+    return;
+  }
+  warnedInvalidAgyPaths.add(key);
+  console.warn(message);
+}
+
 export function resolveOfficialAgyBinary(agyPath?: string): string {
   const envAgyPath = process.env.AGY_PATH?.trim();
   if (envAgyPath) {
     if (isExistingFile(envAgyPath)) {
+      warnedInvalidAgyPaths.delete(`env:${envAgyPath}`);
       return envAgyPath;
     }
-    console.warn(
+    warnInvalidAgyPathOnce(
+      "env",
+      envAgyPath,
       `[acp-8048] AGY_PATH is set to '${envAgyPath}', but file does not exist; falling back to config/auto-detection.`,
     );
   }
@@ -116,9 +130,12 @@ export function resolveOfficialAgyBinary(agyPath?: string): string {
   const configAgyPath = agyPath?.trim();
   if (configAgyPath) {
     if (isExistingFile(configAgyPath)) {
+      warnedInvalidAgyPaths.delete(`config:${configAgyPath}`);
       return configAgyPath;
     }
-    console.warn(
+    warnInvalidAgyPathOnce(
+      "config",
+      configAgyPath,
       `[acp-8048] Configured agyPath '${configAgyPath}' does not exist; falling back to auto-detection.`,
     );
   }

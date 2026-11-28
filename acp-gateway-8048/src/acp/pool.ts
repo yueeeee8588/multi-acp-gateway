@@ -20,7 +20,7 @@ import type { AccountRecord, GeminiContent, GeminiGenerateRequest } from "../typ
 export interface AcpWorkerPoolOptions {
   mcpServer: LoopbackMcpServer;
   agyPath?: string;
-  softErrorCutoffMs?: number;
+  softErrorCutoffMs?: number | (() => number);
   idleTtlMs?: number;
   cleanupIntervalMs?: number;
   transportFactory?: AcpTransportFactory;
@@ -127,7 +127,7 @@ export class AcpWorkerPool {
   private readonly prewarmInFlight = new Map<string, number>();
   private readonly mcpServer: LoopbackMcpServer;
   private readonly agyPath?: string;
-  private readonly softErrorCutoffMs?: number;
+  private readonly softErrorCutoffMs: AcpWorkerPoolOptions["softErrorCutoffMs"];
   private readonly idleTtlMs: number;
   private readonly transportFactory?: AcpTransportFactory;
   private readonly workspaceDir?: string;
@@ -223,6 +223,8 @@ export class AcpWorkerPool {
     account: AccountRecord, model: string, request: GeminiGenerateRequest,
     sessionKey: string | undefined, stateless: boolean,
   ): WorkerLease | Promise<WorkerLease> {
+    if (this.shuttingDown) throw new Error("ACP worker pool is shutting down");
+
     const trimmedSessionKey = sessionKey && sessionKey.trim() ? sessionKey.trim() : "";
     const resolvedSessionKey = trimmedSessionKey || computeSessionPrefixHash(request.contents ?? []);
     const legacySessionKey = trimmedSessionKey || computeLegacySessionPrefixHash(model, request.contents ?? []);
@@ -293,7 +295,7 @@ export class AcpWorkerPool {
 
     const expectedProxy = resolveEffectiveProxy(account.proxyUrl);
     const prewarmed = this.takePrewarmedTransport(account.id, account.homeDir, expectedProxy);
-    if (stateless && !prewarmed && !this.shuttingDown && process.env.AGY_BRIDGE_STATELESS_REUSE !== "0") {
+    if (stateless && !prewarmed && process.env.AGY_BRIDGE_STATELESS_REUSE !== "0") {
       const donor = this.findStatelessDonor(account, model, expectedProxy);
       if (donor) {
         const homeDir = account.homeDir;
@@ -351,7 +353,9 @@ export class AcpWorkerPool {
       account,
       model,
       agyPath: this.agyPath,
-      softErrorCutoffMs: this.softErrorCutoffMs,
+      softErrorCutoffMs: typeof this.softErrorCutoffMs === "function"
+        ? this.softErrorCutoffMs()
+        : this.softErrorCutoffMs,
       mcpServer: this.mcpServer,
       workspaceDir: this.workspaceDir,
       transportFactory: this.transportFactory,

@@ -109,6 +109,45 @@ describe("resolveOfficialAgyBinary", () => {
     }
   });
 
+  test("warns once per invalid AGY_PATH value, warns separately for different values, and uses file once it recovers", () => {
+    const root = makeTempDir("agy-env-warn-dedup-");
+    const fallbackDir = path.join(root, "fallback-bin");
+    const fallbackBin = touchBinary(fallbackDir);
+    const missingA = path.join(root, "missing-a", "agy.exe");
+    const missingB = path.join(root, "missing-b", "agy.exe");
+
+    process.env.PATH = fallbackDir;
+
+    const warnings: string[] = [];
+    const origWarn = console.warn;
+    console.warn = (...args: unknown[]) => {
+      warnings.push(args.map(String).join(" "));
+    };
+
+    try {
+      process.env.AGY_PATH = missingA;
+      expect(resolveOfficialAgyBinary("")).toBe(fallbackBin);
+      expect(resolveOfficialAgyBinary("")).toBe(fallbackBin);
+      expect(warnings).toHaveLength(1);
+      expect(warnings[0]).toContain(missingA);
+
+      process.env.AGY_PATH = missingB;
+      expect(resolveOfficialAgyBinary("")).toBe(fallbackBin);
+      expect(resolveOfficialAgyBinary("")).toBe(fallbackBin);
+      expect(warnings).toHaveLength(2);
+      expect(warnings[1]).toContain(missingB);
+
+      // Recover missingA on disk; it should be selected without warning.
+      fs.mkdirSync(path.dirname(missingA), { recursive: true });
+      fs.writeFileSync(missingA, "stub");
+      process.env.AGY_PATH = missingA;
+      expect(resolveOfficialAgyBinary("")).toBe(missingA);
+      expect(warnings).toHaveLength(2);
+    } finally {
+      console.warn = origWarn;
+    }
+  });
+
   test("discovers binary in standard Antigravity* install dir when PATH is empty", () => {
     const root = makeTempDir("agy-std-");
     const localAppData = path.join(root, "LocalAppData");

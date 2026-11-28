@@ -470,6 +470,7 @@ export class SessionToolBroker {
 
 export class LoopbackMcpServer {
   private server: ReturnType<typeof Bun.serve> | null = null;
+  private stopped = false;
   private readonly sessions = new Map<string, SessionToolBroker>();
   private readonly sseCleanups = new Map<string, Set<() => void>>();
   private readonly requestedPort: number;
@@ -484,7 +485,7 @@ export class LoopbackMcpServer {
   }
 
   start(): void {
-    if (this.server) return;
+    if (this.server || this.stopped) return;
     this.server = Bun.serve({
       hostname: "127.0.0.1",
       port: this.requestedPort,
@@ -503,6 +504,7 @@ export class LoopbackMcpServer {
   }
 
   stop(reason = "Loopback MCP server stopped"): number {
+    this.stopped = true;
     const server = this.server;
     this.server = null;
     let cancelledPending = 0;
@@ -519,7 +521,7 @@ export class LoopbackMcpServer {
   }
 
   registerSession(broker: SessionToolBroker): RegisteredSession {
-    this.start();
+    if (this.stopped) throw new Error("Loopback MCP server stopped");
     const token = randomBytes(TOKEN_BYTES).toString("hex");
     this.sessions.set(token, broker);
     return {

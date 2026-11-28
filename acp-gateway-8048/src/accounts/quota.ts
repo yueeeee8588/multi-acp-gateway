@@ -1014,6 +1014,8 @@ export interface UsageReadResult {
   error?: string;
   message?: string;
   fromLateCache?: boolean;
+  /** Present on a foreground timeout while the underlying usage check is still running. */
+  backgroundCompletion?: Promise<UsageReadResult>;
 }
 
 export interface UsageOAuthCredentials {
@@ -1372,11 +1374,9 @@ export async function defaultUsageExecutor(opts: UsageExecOptions): Promise<Usag
     windowsHide: true,
   });
 
-  let timedOut = false;
   let timer: ReturnType<typeof setTimeout> | undefined;
   const timeoutPromise = new Promise<'timeout'>((resolve) => {
     timer = setTimeout(() => {
-      timedOut = true;
       try {
         proc.kill();
       } catch {}
@@ -1387,7 +1387,10 @@ export async function defaultUsageExecutor(opts: UsageExecOptions): Promise<Usag
   try {
     const stdoutPromise = new Response(proc.stdout).text().catch(() => '');
     const stderrPromise = new Response(proc.stderr).text().catch(() => '');
-    const settled = await Promise.race([proc.exited.then(() => 'exited' as const), timeoutPromise]);
+    const settled = await Promise.race([
+      Promise.all([proc.exited, stdoutPromise, stderrPromise]),
+      timeoutPromise,
+    ]);
 
     if (settled === 'timeout') {
       try {
@@ -1400,8 +1403,8 @@ export async function defaultUsageExecutor(opts: UsageExecOptions): Promise<Usag
       return { exitCode: null, stdout, stderr, timedOut: true };
     }
 
-    const [stdout, stderr] = await Promise.all([stdoutPromise, stderrPromise]);
-    return { exitCode: proc.exitCode ?? 0, stdout, stderr, timedOut: false };
+    const [exitCode, stdout, stderr] = settled;
+    return { exitCode, stdout, stderr, timedOut: false };
   } finally {
     if (timer) clearTimeout(timer);
   }
@@ -1575,6 +1578,7 @@ export function createUsageReader(options: CreateUsageReaderOptions = {}): Usage
           return {
             status: 'STILL_READING',
             message: 'STILL_READING: usage check continuing in background',
+            backgroundCompletion: entry.promise,
           };
         }
         return raceResult.res;

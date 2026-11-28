@@ -18,6 +18,15 @@ const MAX_CACHE_SETTLING_ENTRIES = 4096;
 const WORKER_SPAWN_WINDOW_MS = 60_000;
 const ACCOUNT_QUOTA_BACKOFF_DEFAULT_MS = 30_000;
 const ACCOUNT_QUOTA_BACKOFF_MAX_MS = 60_000;
+const HIGH_SEVERITY_COOLDOWN_REASONS = new Set([
+  "RESTRICTED",
+  "AUTH_REQUIRED",
+  "VALIDATION_REQUIRED",
+  "ACCOUNT_DISABLED_REFUSED",
+  "QUOTA_EXHAUSTED",
+  "RESOURCE_EXHAUSTED",
+  "POLICY_BLOCKED",
+]);
 
 const LOCATION_UNSUPPORTED_RE =
   /\b(?:user\s+)?location\s+(?:is\s+)?not\s+supported\b|\bnot\s+available\s+in\s+your\s+(?:country|region|location)\b|\b(?:country|region)\s+(?:is\s+)?not\s+supported\b|\bunsupported\s+(?:country|region|location)\b|地区不支持|当前地区不可用|所在地区不受支持/i;
@@ -166,6 +175,10 @@ export class AccountScheduler {
   private readonly waiters = new Set<() => void>();
   private readonly lastAccountDispatchAt = new Map<string, number>();
   private readonly lastExitIpDispatchAt = new Map<string, number>();
+  private readonly familyCooldownWrites = new Map<
+    string,
+    { writtenAtMs: number; untilMs: number; reason: string }
+  >();
   private readonly workerSpawnTimestamps = new Map<string, number[]>();
   private readonly dbStore: GatewayStore;
   private readonly getActiveCount?: (accountId: string) => number;
@@ -351,26 +364,20 @@ export class AccountScheduler {
     const prevAcc = this.lastAccountDispatchAt.get(accountId);
     const prevIp = ip ? this.lastExitIpDispatchAt.get(ip) : undefined;
 
-    const accWait =
-      minAccInterval > 0 && prevAcc !== undefined
-        ? Math.max(0, prevAcc + minAccInterval - now)
-        : 0;
-    const ipWait =
-      ip && minIpInterval > 0 && prevIp !== undefined
-        ? Math.max(0, prevIp + minIpInterval - now)
-        : 0;
+    const accountSlot = minAccInterval > 0 && prevAcc !== undefined
+      ? prevAcc + minAccInterval
+      : now;
+    const ipSlot = minIpInterval > 0 && prevIp !== undefined
+      ? prevIp + minIpInterval
+      : now;
+    const slot = Math.max(now, accountSlot, ipSlot);
+    const jitter = maxJitter > 0 && slot > now
+      ? Math.floor(this.randomFn() * (maxJitter + 1))
+      : 0;
+    const plannedAt = slot + jitter;
+    const totalWait = plannedAt - now;
 
-    const baseWait = Math.max(accWait, ipWait);
-    const isHotAccount =
-      minAccInterval > 0 && prevAcc !== undefined && prevAcc + minAccInterval > now;
-    const isHotIp = Boolean(
-      ip && minIpInterval > 0 && prevIp !== undefined && prevIp + minIpInterval > now,
-    );
-    const shouldJitter = maxJitter > 0 && (baseWait > 0 || isHotAccount || isHotIp);
-    const jitter = shouldJitter ? Math.floor(this.randomFn() * (maxJitter + 1)) : 0;
-    const totalWait = baseWait + jitter;
-    const plannedAt = now + totalWait;
-
+    // Reserve both pacing slots before yielding so concurrent calls see this reservation.
     this.lastAccountDispatchAt.set(accountId, plannedAt);
     if (ip) {
       this.lastExitIpDispatchAt.set(ip, plannedAt);
@@ -389,13 +396,6 @@ export class AccountScheduler {
           else this.lastExitIpDispatchAt.set(ip, prevIp);
         }
         throw err;
-      }
-      const actualAt = this.nowFn();
-      if (actualAt > plannedAt) {
-        this.lastAccountDispatchAt.set(accountId, actualAt);
-        if (ip) {
-          this.lastExitIpDispatchAt.set(ip, actualAt);
-        }
       }
     }
 
@@ -484,6 +484,9 @@ export class AccountScheduler {
     const now = Date.now();
     const family = scopeType === "global" ? "*" : normalizeModelFamily(model);
     const deleted = this.dbStore.deleteCooldown(accountId, family, scopeType);
+    if (scopeType === "family") {
+      this.familyCooldownWrites.delete(`${accountId}:${family}`);
+    }
     if (deleted) {
       eventBus.emit("cooldowns", this.dbStore.listCooldowns(now));
       this.notifyWaiters();
@@ -550,6 +553,20 @@ export class AccountScheduler {
     }
   }
 
+  private upsertFamilyCooldown(record: CooldownRecord, now: number): void {
+    this.dbStore.upsertCooldown(record);
+    for (const [key, write] of this.familyCooldownWrites) {
+      if (write.untilMs <= now) this.familyCooldownWrites.delete(key);
+    }
+    if (record.untilMs > now) {
+      this.familyCooldownWrites.set(`${record.accountId}:${record.family}`, {
+        writtenAtMs: now,
+        untilMs: record.untilMs,
+        reason: record.reason,
+      });
+    }
+  }
+
   /**
    * 失败冷却策略：
    * - 配额/限流（429 / RESOURCE_EXHAUSTED / QUOTA_EXHAUSTED）走 cooldownStepsMinutes 递进长冷却；
@@ -577,6 +594,7 @@ export class AccountScheduler {
       const tokenStillValid = tokenExpiryMs !== null && tokenExpiryMs > now + 60_000;
 
       if (acc && !tokenStillValid) {
+        if (acc.status === "disabled") return;
         this.dbStore.upsertAccount({
           ...acc,
           status: "auth_required",
@@ -588,22 +606,31 @@ export class AccountScheduler {
       }
 
       // token 仍在有效期内：只做 5 分钟短避让，账号留在 ready 池内，网络恢复后自动回归。
-      this.dbStore.upsertCooldown({
+      const untilMs = now + 5 * 60_000;
+      const existing = this.dbStore.listCooldowns(now).find(
+        (c) => c.accountId === accountId && c.family === family && c.scopeType === "family",
+      );
+      if (existing && (
+        existing.untilMs > untilMs || HIGH_SEVERITY_COOLDOWN_REASONS.has(existing.reason)
+      )) {
+        return;
+      }
+      this.upsertFamilyCooldown({
         accountId,
         family,
         scopeType: "family",
         reason: "AUTH_TRANSIENT",
-        untilMs: now + 5 * 60_000,
+        untilMs,
         consecutiveFailures: 1,
         lastError: opts.rawError || "Authentication required (access token still valid)",
-      });
+      }, now);
       eventBus.emit("cooldowns", this.dbStore.listCooldowns(now));
       return;
     }
 
     if (opts.reasonCode === "VALIDATION_REQUIRED") {
       const acc = this.dbStore.getAccount(accountId);
-      if (acc) {
+      if (acc && acc.status !== "disabled") {
         this.dbStore.upsertAccount({
           ...acc,
           status: "restricted",
@@ -613,7 +640,7 @@ export class AccountScheduler {
         eventBus.emit("accounts", this.dbStore.listAccounts());
       }
       const cooldownMs = hasRetryHint ? retryAfterMs : 10 * 60_000;
-      this.dbStore.upsertCooldown({
+      this.upsertFamilyCooldown({
         accountId,
         family,
         scopeType: "family",
@@ -621,7 +648,7 @@ export class AccountScheduler {
         untilMs: now + cooldownMs,
         consecutiveFailures: 1,
         lastError: opts.rawError || "Account verification required",
-      });
+      }, now);
       eventBus.emit("cooldowns", this.dbStore.listCooldowns(now));
       return;
     }
@@ -658,7 +685,7 @@ export class AccountScheduler {
       const cooldownMs = cfg.policyBlockCooldownMs ?? 21_600_000;
       const untilMs = now + cooldownMs;
       const acc = this.dbStore.getAccount(accountId);
-      if (acc) {
+      if (acc && acc.status !== "disabled") {
         this.dbStore.upsertAccount({
           ...acc,
           status: "restricted",
@@ -729,7 +756,7 @@ export class AccountScheduler {
     const preserveLongerCooling =
       stillCooling && !isQuotaError && existing!.untilMs > candidateUntilMs;
     if (!preserveLongerCooling) {
-      this.dbStore.upsertCooldown(record);
+      this.upsertFamilyCooldown(record, now);
     }
     if (isQuotaError && cfg.quotaCooldownScope === "account") {
       const accountBackoffMs = Math.min(
@@ -761,19 +788,37 @@ export class AccountScheduler {
   }
 
   /**
-   * 单次请求成功后重置连续失败计数，并记录缓存粘性热度（含首轮 cacheWorth 保护）
+   * 单次请求成功后按冷却级别及写入时间重置失败计数，并记录缓存粘性热度。
+   * requestStartedAtMs 使用请求开始时的 Date.now()。
    */
   recordSuccess(
     accountId: string,
     model: string,
     sessionKey?: string,
     usage?: SuccessUsageOptions,
+    requestStartedAtMs?: number,
   ): void {
     const now = Date.now();
     const family = normalizeModelFamily(model);
-    const deleted = this.dbStore.deleteCooldown(accountId, family, "family");
-    if (deleted) {
-      eventBus.emit("cooldowns", this.dbStore.listCooldowns(now));
+    const existingCooldown = this.dbStore.listCooldowns(now).find(
+      (c) => c.accountId === accountId && c.family === family && c.scopeType === "family",
+    );
+    const key = `${accountId}:${family}`;
+    const write = this.familyCooldownWrites.get(key);
+    const canClear = !existingCooldown || (
+      requestStartedAtMs === undefined
+        ? !HIGH_SEVERITY_COOLDOWN_REASONS.has(existingCooldown.reason)
+        : write !== undefined &&
+          write.untilMs === existingCooldown.untilMs &&
+          write.reason === existingCooldown.reason &&
+          write.writtenAtMs < requestStartedAtMs
+    );
+    if (canClear) {
+      const deleted = this.dbStore.deleteCooldown(accountId, family, "family");
+      this.familyCooldownWrites.delete(key);
+      if (deleted) {
+        eventBus.emit("cooldowns", this.dbStore.listCooldowns(now));
+      }
     }
 
     if (sessionKey) {

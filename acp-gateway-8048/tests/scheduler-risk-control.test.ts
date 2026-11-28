@@ -1,6 +1,7 @@
-import { afterEach, describe, expect, it, spyOn } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, it, spyOn } from 'bun:test';
+import fs from 'node:fs';
 import * as settings from '../src/config/settings';
-import { store } from '../src/db/store';
+import { GatewayStore, store } from '../src/db/store';
 import {
   AccountQueueTimeoutError,
   AccountScheduler,
@@ -49,6 +50,109 @@ describe('wp3_scheduler_risk_control', () => {
       spies.pop()?.mockRestore();
     }
     settings.invalidateConfigCache();
+  });
+
+  describe('Failure and success cooldown transitions', () => {
+    const model = 'gemini-4-hydrogen';
+    const account = makeAccount('acc-risk');
+    let db: GatewayStore;
+    let scheduler: AccountScheduler;
+
+    beforeEach(() => {
+      db = new GatewayStore(':memory:');
+      db.upsertAccount(account);
+      scheduler = new AccountScheduler({ dbStore: db });
+      spies.push(spyOn(settings, 'getConfig').mockReturnValue(makeConfig()));
+    });
+
+    afterEach(() => db.close());
+
+    it.each([
+      { upstreamStatus: 401 },
+      { reasonCode: 'VALIDATION_REQUIRED' },
+      { upstreamStatus: 403 },
+      { reasonCode: 'ACCOUNT_DISABLED_REFUSED' },
+    ])('preserves the manual disable when recording %o', (failure) => {
+      db.upsertAccount({ ...account, status: 'disabled', statusReason: 'Manually disabled' });
+      const disabled = db.getAccount(account.id);
+
+      scheduler.recordFailure(account.id, model, failure);
+
+      expect(db.getAccount(account.id)).toEqual(disabled);
+    });
+
+    it.each([
+      'RESTRICTED',
+      'AUTH_REQUIRED',
+      'VALIDATION_REQUIRED',
+      'QUOTA_EXHAUSTED',
+      'RESOURCE_EXHAUSTED',
+      'POLICY_BLOCKED',
+    ])('keeps an active %s family cooldown when a success has no start time', (reason) => {
+      const cooldown: CooldownRecord = {
+        accountId: account.id,
+        family: model,
+        scopeType: 'family',
+        reason,
+        untilMs: Date.now() + 60_000,
+        consecutiveFailures: 2,
+        lastError: 'newer failure',
+      };
+      db.upsertCooldown(cooldown);
+
+      scheduler.recordSuccess(account.id, model);
+
+      expect(db.listCooldowns()).toEqual([cooldown]);
+    });
+
+    it('preserves a transient cooldown written after a request started and clears it for a later request', () => {
+      let now = 100_000;
+      spies.push(spyOn(Date, 'now').mockImplementation(() => now));
+      const requestStartedAt = now++;
+      scheduler.recordFailure(account.id, model, { reasonCode: 'SOFT_ERROR' });
+      const cooldowns = db.listCooldowns();
+      expect(cooldowns).toHaveLength(1);
+
+      scheduler.recordSuccess(account.id, model, undefined, undefined, requestStartedAt);
+      expect(db.listCooldowns()).toEqual(cooldowns);
+
+      scheduler.recordSuccess(account.id, model, undefined, undefined, ++now);
+      expect(db.listCooldowns()).toEqual([]);
+    });
+
+    it.each([
+      ['SOFT_ERROR', 10 * 60_000],
+      ['RESTRICTED', 60_000],
+    ] as const)('keeps an existing %s family cooldown after a transient 401', (reason, durationMs) => {
+      const now = Date.now();
+      const fakeHome = 'risk-control-test-home';
+      const readFileSync = fs.readFileSync;
+      spies.push(spyOn(fs, 'readFileSync').mockImplementation((file, options) => {
+        if (typeof file === 'string' && file.startsWith(fakeHome)) {
+          return JSON.stringify({ token: { expiry: new Date(now + 60 * 60_000).toISOString() } });
+        }
+        return readFileSync(file, options);
+      }));
+      db.upsertAccount({ ...account, homeDir: fakeHome });
+      const cooldown: CooldownRecord = {
+        accountId: account.id,
+        family: model,
+        scopeType: 'family',
+        reason,
+        untilMs: now + durationMs,
+        consecutiveFailures: 2,
+        lastError: 'existing failure',
+      };
+      db.upsertCooldown(cooldown);
+
+      scheduler.recordFailure(account.id, model, { upstreamStatus: 401 });
+      expect(db.getAccount(account.id)?.status).toBe('ready');
+      expect(db.listCooldowns()).toEqual([cooldown]);
+
+      db.deleteCooldown(account.id, model, 'family');
+      scheduler.recordFailure(account.id, model, { upstreamStatus: 401 });
+      expect(db.listCooldowns()[0]?.reason).toBe('AUTH_TRANSIENT');
+    });
   });
 
   describe('Guardrail 1: maxConcurrencyPerExitIp', () => {
@@ -201,6 +305,32 @@ describe('wp3_scheduler_risk_control', () => {
       // Different account on DIFFERENT exitIp -> 0ms
       const w4 = await scheduler.awaitDispatchPacing('acc-3', '2.2.2.2');
       expect(w4).toBe(0);
+    });
+
+    it('keeps newer account and exit IP reservations when an earlier wait wakes late', async () => {
+      let now = 1_000;
+      spies.push(spyOn(settings, 'getConfig').mockReturnValue(makeConfig({
+        minAccountRequestIntervalMs: 10,
+        minExitIpRequestIntervalMs: 10,
+      })));
+      const scheduler = new AccountScheduler({ now: () => now });
+      const pendingSleeps: Array<() => void> = [];
+      const pacing = scheduler as unknown as { sleepWithAbort(ms: number): Promise<void> };
+      spies.push(spyOn(pacing, 'sleepWithAbort').mockImplementation(
+        () => new Promise<void>((resolve) => pendingSleeps.push(resolve)),
+      ));
+
+      expect(await scheduler.awaitDispatchPacing('acc-1', '1.1.1.1')).toBe(0);
+      const earlier = scheduler.awaitDispatchPacing('acc-1', '1.1.1.1');
+      const later = scheduler.awaitDispatchPacing('acc-1', '1.1.1.1');
+      now = 1_015;
+      pendingSleeps[0]!();
+      expect(await earlier).toBe(10);
+
+      const sameAccount = scheduler.awaitDispatchPacing('acc-1', '2.2.2.2');
+      const sameIp = scheduler.awaitDispatchPacing('acc-2', '1.1.1.1');
+      for (const resolve of pendingSleeps.slice(1)) resolve();
+      expect(await Promise.all([later, sameAccount, sameIp])).toEqual([20, 15, 15]);
     });
 
     it('applies dispatch pacing during acquireAccountLease and rolls back on abort', async () => {

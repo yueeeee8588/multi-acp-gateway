@@ -19,7 +19,7 @@ import {
   type UsageReader,
 } from "./quota";
 import { normalizeModelAccessRule } from "./model-binding";
-import type { AccountQuotaSnapshot, AccountRecord, AccountStatus, AccountTier, ModelAccessRule } from "../types";
+import type { AccountQuotaSnapshot, AccountRecord, AccountStatus, AccountTier, CooldownRecord, ModelAccessRule } from "../types";
 
 export const GOOGLE_CLIENT_ID =
   process.env.AGY_GOOGLE_CLIENT_ID ||
@@ -220,6 +220,29 @@ export interface DetectAllTiersResult {
 const MAX_QUOTA_CONCURRENCY = 4;
 const ACCESS_TOKEN_EXPIRY_BUFFER_MS = 30_000;
 
+// The cooldown row has no write timestamp and an upsert can leave every field unchanged.
+interface CooldownProbe {
+  before: CooldownRecord | undefined;
+  rewritten: boolean;
+}
+const activeCooldownProbes = new Map<string, CooldownProbe>();
+const upsertCooldown = store.upsertCooldown.bind(store);
+store.upsertCooldown = (cooldown) => {
+  upsertCooldown(cooldown);
+  if (cooldown.family === "*" && cooldown.scopeType === "global") {
+    const probe = activeCooldownProbes.get(cooldown.accountId);
+    if (probe) probe.rewritten = true;
+  }
+};
+
+function findGlobalCooldown(accountId: string, now?: number): CooldownRecord | undefined {
+  return store.listCooldowns(now).find((entry) =>
+    entry.accountId === accountId && entry.family === "*" && entry.scopeType === "global");
+}
+
+const quotaWaiters: Array<() => void> = [];
+let activeQuotaJobs = 0;
+
 function readOAuthCredentials(homeDir: string) {
   if (!homeDir.trim()) return null;
   const tokenFile = path.join(homeDir, ".gemini", "antigravity-cli", "antigravity-oauth-token");
@@ -245,6 +268,12 @@ function readOAuthRefreshToken(homeDir: string): string | null {
   return readOAuthCredentials(homeDir)?.refreshToken || null;
 }
 
+class OAuthRefreshError extends Error {
+  constructor(message: string, readonly kind: "permanent" | "transient" | "other", options?: ErrorOptions) {
+    super(message, options);
+  }
+}
+
 async function exchangeOAuthRefreshToken(refreshToken: string, proxy?: string) {
   const init: RequestInit & { proxy?: string } = {
     method: "POST",
@@ -259,12 +288,24 @@ async function exchangeOAuthRefreshToken(refreshToken: string, proxy?: string) {
   };
   if (proxy) init.proxy = proxy;
 
-  const response = await fetch(GOOGLE_TOKEN_URL, init);
+  let response: Response;
+  try {
+    response = await fetch(GOOGLE_TOKEN_URL, init);
+  } catch (cause) {
+    const message = cause instanceof Error ? cause.message : String(cause);
+    throw new OAuthRefreshError(message, "transient", { cause });
+  }
   const data = (await response.json().catch(() => null)) as Record<string, unknown> | null;
   const accessToken = typeof data?.access_token === "string" ? data.access_token.trim() : "";
   if (!response.ok || !accessToken) {
-    const detail = data?.error_description ?? data?.error;
-    throw new Error(`OAuth refresh failed: ${typeof detail === "string" ? detail : `HTTP ${response.status}`}`);
+    const code = typeof data?.error === "string" ? data.error.trim() : "";
+    const description = typeof data?.error_description === "string" ? data.error_description.trim() : "";
+    const detail = [code, description].filter(Boolean).join(": ") || `HTTP ${response.status}`;
+    const permanent = response.status === 401 || response.status === 403 ||
+      (response.status === 400 && code === "invalid_grant");
+    const transient = response.status === 408 || response.status === 429 || response.status >= 500;
+    const kind = permanent ? "permanent" : transient ? "transient" : "other";
+    throw new OAuthRefreshError(`OAuth refresh failed (${detail})`, kind);
   }
 
   return {
@@ -533,10 +574,65 @@ async function readEmailFromOAuthToken(dirPath: string, proxyUrl?: string): Prom
   return "";
 }
 
+type OAuthTokens = Awaited<ReturnType<typeof exchangeOAuthRefreshToken>>;
+interface AccountAuthQueue {
+  tail: Promise<void>;
+  renewal?: {
+    homeDir: string;
+    proxy?: string;
+    refreshToken: string;
+    result: Promise<OAuthTokens | null>;
+  };
+}
+
+// The API and the background recovery job use different AccountManager instances.
+const accountAuthQueues = new Map<string, AccountAuthQueue>();
+
+async function withAccountAuthLock<T>(accountId: string, work: (queue: AccountAuthQueue) => Promise<T>): Promise<T> {
+  const queue = accountAuthQueues.get(accountId) ?? { tail: Promise.resolve() };
+  const previous = queue.tail;
+  let release!: () => void;
+  const turn = new Promise<void>((resolve) => { release = resolve; });
+  queue.tail = turn;
+  accountAuthQueues.set(accountId, queue);
+  await previous;
+  try {
+    return await work(queue);
+  } finally {
+    if (queue.tail === turn) accountAuthQueues.delete(accountId);
+    release();
+  }
+}
+
+function renewAccountOAuth(
+  queue: AccountAuthQueue,
+  account: AccountRecord,
+  refreshToken: string,
+  proxy?: string,
+): Promise<OAuthTokens | null> {
+  const existing = queue.renewal;
+  if (existing?.homeDir === account.homeDir && existing.proxy === proxy && existing.refreshToken === refreshToken) {
+    return existing.result;
+  }
+
+  // Share the result with queued callers, including token rotation or a failed exchange.
+  const renewal: NonNullable<AccountAuthQueue["renewal"]> = {
+    homeDir: account.homeDir,
+    proxy,
+    refreshToken,
+    result: exchangeOAuthRefreshToken(refreshToken, proxy).then((tokens) => {
+      if (store.getAccount(account.id)?.homeDir !== account.homeDir) return null;
+      writeIsolatedAgyOAuthToken(account.homeDir, tokens);
+      renewal.refreshToken = tokens.refreshToken;
+      return tokens;
+    }),
+  };
+  queue.renewal = renewal;
+  return renewal.result;
+}
+
 export class AccountManager {
   private readonly quotaJobs = new Map<string, Promise<AccountRecord | null>>();
-  private readonly quotaWaiters: Array<() => void> = [];
-  private activeQuotaJobs = 0;
   private bulkQuotaJob?: Promise<{ refreshed: number; failed: number; accounts: AccountRecord[] }>;
   private readonly defaultUsageReader: UsageReader = createUsageReader({
     readCredentials: readOAuthCredentials,
@@ -988,7 +1084,25 @@ export class AccountManager {
   /**
    * 刷新探测账号出口 IP 及真实可用性（OAuth 刷新 + agy.exe 轻量 ping 核对）
    */
-  async refreshAccount(accountId: string): Promise<AccountRecord | null> {
+  refreshAccount(accountId: string): Promise<AccountRecord | null> {
+    return withAccountAuthLock(accountId, async (queue) => {
+      const probeStartedAt = Date.now();
+      const cooldownProbe: CooldownProbe = { before: findGlobalCooldown(accountId, probeStartedAt), rewritten: false };
+      activeCooldownProbes.set(accountId, cooldownProbe);
+      try {
+        return await this.refreshAccountNow(accountId, queue, probeStartedAt, cooldownProbe);
+      } finally {
+        activeCooldownProbes.delete(accountId);
+      }
+    });
+  }
+
+  private async refreshAccountNow(
+    accountId: string,
+    queue: AccountAuthQueue,
+    probeStartedAt: number,
+    cooldownProbe: CooldownProbe,
+  ): Promise<AccountRecord | null> {
     const acc = store.getAccount(accountId);
     if (!acc) return null;
 
@@ -1021,14 +1135,14 @@ export class AccountManager {
       );
     }
 
-    const now = Date.now();
-
+    const exitProbedAt = Date.now();
     const saveResult = (
       status: AccountStatus,
       statusReason: string,
       detectedTier?: AccountTier | null,
       quotaSnapshot?: AccountQuotaSnapshot | null,
-      preserveExitBaseline = false
+      preserveExitBaseline = false,
+      probeSucceeded = false,
     ): AccountRecord | null => {
       const latest = store.getAccount(accountId);
       if (!latest || latest.homeDir !== acc.homeDir) return null;
@@ -1062,14 +1176,17 @@ export class AccountManager {
         exitCountry: shouldUpdateExit ? (probe.exitCountry || latest.exitCountry) : latest.exitCountry,
         status: effectiveStatus,
         statusReason: effectiveReason,
-        lastVerifiedAt: shouldUpdateExit ? now : latest.lastVerifiedAt,
-        updatedAt: now,
+        lastVerifiedAt: shouldUpdateExit ? exitProbedAt : latest.lastVerifiedAt,
+        updatedAt: Date.now(),
       };
       store.upsertAccount(updated);
-      if (effectiveStatus === "ready") {
-        const deleted = store.deleteCooldown(latest.id, "*", "global");
-        if (deleted) {
-          eventBus.emit("cooldowns", store.listCooldowns(now));
+      const before = cooldownProbe.before;
+      if (probeSucceeded && effectiveStatus === "ready" && before && !cooldownProbe.rewritten) {
+        const current = findGlobalCooldown(latest.id, probeStartedAt);
+        if (current && current.untilMs === before.untilMs && current.reason === before.reason &&
+            current.consecutiveFailures === before.consecutiveFailures && current.lastError === before.lastError &&
+            store.deleteCooldown(latest.id, "*", "global")) {
+          eventBus.emit("cooldowns", store.listCooldowns());
         }
       }
       this.emitAccounts();
@@ -1094,9 +1211,8 @@ export class AccountManager {
     let detectedTier: AccountTier | null = null;
     let quotaSnapshot: AccountQuotaSnapshot | undefined;
     try {
-      const tokens = await exchangeOAuthRefreshToken(refreshToken, proxy);
-      if (store.getAccount(accountId)?.homeDir !== acc.homeDir) return null;
-      writeIsolatedAgyOAuthToken(acc.homeDir, tokens);
+      const tokens = await renewAccountOAuth(queue, acc, refreshToken, proxy);
+      if (!tokens) return null;
 
       // 拿到新 access_token 后顺带真实探测账号等级（仅在显式开启遗留直连开关时才拉取内部配额接口）
       detectedTier = await detectAccountTier(tokens.accessToken, proxy);
@@ -1130,8 +1246,15 @@ export class AccountManager {
       }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      const reason = msg.startsWith("OAuth refresh failed:") ? msg : `OAuth refresh error: ${msg}`;
-      return saveResult("auth_required", reason.slice(0, 200));
+      if (err instanceof OAuthRefreshError && err.kind === "permanent") {
+        return saveResult("auth_required", msg.slice(0, 200));
+      }
+      const latest = store.getAccount(accountId);
+      if (!latest || latest.homeDir !== acc.homeDir) return null;
+      const code = err instanceof OAuthRefreshError && err.kind === "transient"
+        ? "OAUTH_REFRESH_TRANSIENT"
+        : "OAUTH_REFRESH_ERROR";
+      return { ...latest, statusReason: `${code}: ${msg}`.slice(0, 200) };
     }
 
     // 3. 使用 agy.exe (AcpConnection) 做真实连接与极短 prompt 核对
@@ -1221,7 +1344,7 @@ export class AccountManager {
         updateErrorPromise,
       ]);
 
-      return saveResult("ready", "", detectedTier, quotaSnapshot);
+      return saveResult("ready", "", detectedTier, quotaSnapshot, false, true);
     } catch (err) {
       const classified = classifyAcpProbeError(err, acc.status);
       return saveResult(classified.status, classified.reason, detectedTier, quotaSnapshot);
@@ -1260,7 +1383,9 @@ export class AccountManager {
       statusChanged = true;
     };
 
-    const runOne = async (acc: AccountRecord): Promise<void> => {
+    const runOne = (accountId: string): Promise<void> => withAccountAuthLock(accountId, async (queue) => {
+      const acc = store.getAccount(accountId);
+      if (!acc) return;
       if (acc.status === "disabled") {
         details.push({
           id: acc.id,
@@ -1291,67 +1416,9 @@ export class AccountManager {
 
       const proxy = resolveEffectiveProxy(acc.proxyUrl, cfg) ?? resolveOutboundProxy();
       try {
-        const tokenFetchInit: RequestInit & { proxy?: string } = {
-          method: "POST",
-          headers: { "Content-Type": "application/x-www-form-urlencoded" },
-          body: new URLSearchParams({
-            client_id: GOOGLE_CLIENT_ID,
-            client_secret: GOOGLE_CLIENT_SECRET,
-            refresh_token: refreshToken,
-            grant_type: "refresh_token",
-          }),
-          signal: AbortSignal.timeout(10000),
-        };
-        if (proxy) tokenFetchInit.proxy = proxy;
-
-        const tokenResp = await fetch(GOOGLE_TOKEN_URL, tokenFetchInit);
-        const tokenJson = (await tokenResp.json().catch(() => ({}))) as Record<string, unknown>;
-        if (!tokenResp.ok || typeof tokenJson.access_token !== "string") {
-          const errCode = typeof tokenJson.error === "string" ? tokenJson.error.trim() : "";
-          const errDesc =
-            typeof tokenJson.error_description === "string"
-              ? tokenJson.error_description.trim()
-              : "";
-          const detailSuffix = errCode
-            ? errDesc
-              ? `${errCode}: ${errDesc}`
-              : errCode
-            : `HTTP ${tokenResp.status}`;
-          const reason = `OAuth refresh failed (${detailSuffix})`;
-
-          if (
-            errCode === "invalid_grant" ||
-            tokenResp.status === 400 ||
-            tokenResp.status === 401
-          ) {
-            markAuthRequired(acc, `${reason}; please re-login`);
-          }
-
-          details.push({
-            id: acc.id,
-            label: acc.label,
-            email: acc.email,
-            ok: false,
-            tier: acc.tier,
-            reason,
-          });
-          failed++;
-          return;
-        }
-
-        const accessToken = tokenJson.access_token;
-        const nextRefresh =
-          typeof tokenJson.refresh_token === "string" && tokenJson.refresh_token.trim()
-            ? tokenJson.refresh_token.trim()
-            : refreshToken;
-        const expiresIn =
-          typeof tokenJson.expires_in === "number" && Number.isFinite(tokenJson.expires_in)
-            ? tokenJson.expires_in
-            : 3600;
-
-        writeIsolatedAgyOAuthToken(acc.homeDir, { accessToken, refreshToken: nextRefresh, expiresIn });
-
-        const detectedTier = await detectAccountTier(accessToken, proxy);
+        const tokens = await renewAccountOAuth(queue, acc, refreshToken, proxy);
+        if (!tokens) return;
+        const detectedTier = await detectAccountTier(tokens.accessToken, proxy);
         if (!detectedTier) {
           details.push({
             id: acc.id,
@@ -1379,6 +1446,9 @@ export class AccountManager {
           tier: detectedTier,
         });
       } catch (err) {
+        if (err instanceof OAuthRefreshError && err.kind === "permanent") {
+          markAuthRequired(acc, `${err.message}; please re-login`);
+        }
         details.push({
           id: acc.id,
           label: acc.label,
@@ -1389,7 +1459,7 @@ export class AccountManager {
         });
         failed++;
       }
-    };
+    });
 
     const workerCount = Math.min(concurrency, accounts.length);
     await Promise.all(
@@ -1397,7 +1467,7 @@ export class AccountManager {
         while (cursor < accounts.length) {
           const acc = accounts[cursor++];
           if (!acc) break;
-          await runOne(acc);
+          await runOne(acc.id);
         }
       })
     );
@@ -1410,28 +1480,48 @@ export class AccountManager {
   refreshAccountQuota(accountId: string): Promise<AccountRecord | null> {
     const existing = this.quotaJobs.get(accountId);
     if (existing) return existing;
-    const job = this.withQuotaSlot(() => this.refreshAccountQuotaNow(accountId))
-      .finally(() => { this.quotaJobs.delete(accountId); });
+    const job = this.withQuotaSlot(
+      (holdSlotUntil) => withAccountAuthLock(accountId, (queue) =>
+        this.refreshAccountQuotaNow(accountId, queue, holdSlotUntil)),
+      () => { this.quotaJobs.delete(accountId); },
+    );
     this.quotaJobs.set(accountId, job);
     return job;
   }
 
-  private async withQuotaSlot<T>(work: () => Promise<T>): Promise<T> {
-    if (this.activeQuotaJobs >= MAX_QUOTA_CONCURRENCY) {
-      await new Promise<void>((resolve) => this.quotaWaiters.push(resolve));
+  private async withQuotaSlot<T>(
+    work: (holdSlotUntil: (completion: Promise<unknown>) => void) => Promise<T>,
+    onRelease: () => void,
+  ): Promise<T> {
+    if (activeQuotaJobs >= MAX_QUOTA_CONCURRENCY) {
+      await new Promise<void>((resolve) => quotaWaiters.push(resolve));
     } else {
-      this.activeQuotaJobs++;
+      activeQuotaJobs++;
     }
-    try {
-      return await work();
-    } finally {
-      const next = this.quotaWaiters.shift();
+    const release = () => {
+      onRelease();
+      const next = quotaWaiters.shift();
       if (next) next(); // 直接移交并发槽位，避免新任务插队。
-      else this.activeQuotaJobs--;
+      else activeQuotaJobs--;
+    };
+    let backgroundCompletion: Promise<unknown> | undefined;
+    try {
+      return await work((completion) => {
+        backgroundCompletion = completion.catch((err) => {
+          console.error("[quota] Background usage check failed:", err);
+        });
+      });
+    } finally {
+      if (backgroundCompletion) void backgroundCompletion.then(release);
+      else release();
     }
   }
 
-  private async refreshAccountQuotaNow(accountId: string): Promise<AccountRecord | null> {
+  private async refreshAccountQuotaNow(
+    accountId: string,
+    queue: AccountAuthQueue,
+    holdSlotUntil: (completion: Promise<unknown>) => void,
+  ): Promise<AccountRecord | null> {
     const acc = store.getAccount(accountId);
     if (!acc) return null;
 
@@ -1495,9 +1585,8 @@ export class AccountManager {
       let usageResult = await runUsage(credentials);
       if (usageResult.status === "DUE_FOR_RENEWAL" && credentials?.refreshToken) {
         try {
-          const tokens = await exchangeOAuthRefreshToken(credentials.refreshToken, proxy);
-          if (store.getAccount(accountId)?.homeDir !== acc.homeDir) return null;
-          writeIsolatedAgyOAuthToken(acc.homeDir, tokens);
+          const tokens = await renewAccountOAuth(queue, acc, credentials.refreshToken, proxy);
+          if (!tokens) return null;
           const renewed = readOAuthCredentials(acc.homeDir) ?? {
             accessToken: tokens.accessToken,
             refreshToken: tokens.refreshToken || credentials.refreshToken,
@@ -1515,6 +1604,7 @@ export class AccountManager {
         return persistQuota(merged);
       }
       if (usageResult.status === "STILL_READING") {
+        if (usageResult.backgroundCompletion) holdSlotUntil(usageResult.backgroundCompletion);
         return failure(usageResult.message ?? "STILL_READING: usage check continuing in background");
       }
       if (usageResult.status === "DUE_FOR_RENEWAL") {
@@ -1543,9 +1633,8 @@ export class AccountManager {
       }
       if (!refreshToken) return failure("Missing or expired OAuth access token");
 
-      const tokens = await exchangeOAuthRefreshToken(refreshToken, proxy);
-      if (store.getAccount(accountId)?.homeDir !== acc.homeDir) return null;
-      writeIsolatedAgyOAuthToken(acc.homeDir, tokens);
+      const tokens = await renewAccountOAuth(queue, acc, refreshToken, proxy);
+      if (!tokens) return null;
       result = await fetchQuota(tokens.accessToken);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);

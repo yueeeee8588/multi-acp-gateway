@@ -2,7 +2,7 @@ import { describe, expect, spyOn, test } from "bun:test";
 import { appendFileSync, existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { AgySessionWorker, classifyUpstreamError, type AcpTransport, type WorkerOptions } from "./worker";
+import { AgySessionWorker, classifyUpstreamError, type AcpTransport, type AcpTransportFactory, type WorkerOptions } from "./worker";
 import { LoopbackMcpServer } from "./loopback-mcp";
 import type { AccountRecord, GeminiGenerateRequest, GeminiPart } from "../types";
 
@@ -1042,6 +1042,182 @@ describe("AgySessionWorker slot B optimizations", () => {
       expect(
         worker.canReuse(nextReq, undefined, { ...baseAccount, homeDir: "C:/homes/acc-2" }),
       ).toBe(false);
+    } finally {
+      await worker.resetAndClose();
+      await mcpServer.stop();
+    }
+  });
+});
+
+describe("AgySessionWorker bindSessionPersistence", () => {
+  test("binds stickyKey and onSessionStateChange for subsequent turns after starting stateless", async () => {
+    const snapshots: Array<{ stickyKey?: string; sessionId: string; committedCount?: number } | null> = [];
+    const mcpServer = new LoopbackMcpServer();
+    await mcpServer.start();
+
+    let sid = "";
+    const mockFactory: AcpTransportFactory = ({ onUpdate }): AcpTransport => {
+      let alive = true;
+      return {
+        initialize: async () => ({ ok: true }),
+        newSession: async () => {
+          sid = "sess-bind-1";
+          return { sessionId: sid };
+        },
+        setModel: async () => ({}),
+        prompt: async () => {
+          onUpdate({
+            sessionId: sid,
+            update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "hi" } },
+          });
+          return { stopReason: "end_turn" };
+        },
+        cancel: async () => {},
+        close: async () => {
+          alive = false;
+        },
+        isAlive: () => alive,
+      };
+    };
+
+    const worker = new AgySessionWorker({
+      account: {
+        id: "acc-bind",
+        label: "acc-bind",
+        email: "acc-bind@example.com",
+        source: "test",
+        homeDir: "",
+        proxyUrl: "",
+        status: "ready",
+        tier: "standard",
+        statusReason: "",
+        exitIp: "",
+        exitCountry: "",
+        concurrencyLimit: 1,
+        activeWorkers: 0,
+        lastVerifiedAt: null,
+        createdAt: 0,
+        updatedAt: 0,
+      },
+      model: "gemini-4-hydrogen",
+      agyPath: process.execPath,
+      workspaceDir: tmpdir(),
+      mcpServer,
+      transportFactory: mockFactory,
+    });
+
+    try {
+      await worker.executePrompt({ contents: [{ role: "user", parts: [{ text: "one" }] }] });
+      expect(snapshots).toHaveLength(0);
+
+      worker.bindSessionPersistence("acc-bind:sess-1", (snap) => {
+        snapshots.push(
+          snap
+            ? { stickyKey: snap.stickyKey, sessionId: snap.sessionId, committedCount: snap.committedCount }
+            : null,
+        );
+      });
+
+      await worker.executePrompt({
+        contents: [
+          { role: "user", parts: [{ text: "one" }] },
+          { role: "model", parts: [{ text: "hi" }] },
+          { role: "user", parts: [{ text: "two" }] },
+        ],
+      });
+      expect(snapshots.length).toBeGreaterThan(0);
+      expect(snapshots[snapshots.length - 1]).toEqual({
+        stickyKey: "acc-bind:sess-1",
+        sessionId: "sess-bind-1",
+        committedCount: 3,
+      });
+    } finally {
+      await worker.resetAndClose();
+      await mcpServer.stop();
+    }
+  });
+
+  test("clears stickyKey and onSessionStateChange on recycleSession so new stateless sessions do not inherit old binding", async () => {
+    const snapshots: Array<{ stickyKey?: string; sessionId: string } | null> = [];
+    const mcpServer = new LoopbackMcpServer();
+    await mcpServer.start();
+
+    let sid = "";
+    let seq = 0;
+    const mockFactory: AcpTransportFactory = ({ onUpdate }): AcpTransport => {
+      let alive = true;
+      return {
+        initialize: async () => ({ ok: true }),
+        newSession: async () => {
+          sid = `sess-rec-${++seq}`;
+          return { sessionId: sid };
+        },
+        closeSession: async () => {},
+        setModel: async () => ({}),
+        prompt: async () => {
+          onUpdate({
+            sessionId: sid,
+            update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "ok" } },
+          });
+          return { stopReason: "end_turn" };
+        },
+        cancel: async () => {},
+        close: async () => {
+          alive = false;
+        },
+        isAlive: () => alive,
+      };
+    };
+
+    const worker = new AgySessionWorker({
+      account: {
+        id: "acc-rec",
+        label: "acc-rec",
+        email: "acc-rec@example.com",
+        source: "test",
+        homeDir: "",
+        proxyUrl: "",
+        status: "ready",
+        tier: "standard",
+        statusReason: "",
+        exitIp: "",
+        exitCountry: "",
+        concurrencyLimit: 1,
+        activeWorkers: 0,
+        lastVerifiedAt: null,
+        createdAt: 0,
+        updatedAt: 0,
+      },
+      model: "gemini-4-hydrogen",
+      agyPath: process.execPath,
+      workspaceDir: tmpdir(),
+      mcpServer,
+      transportFactory: mockFactory,
+      stickyKey: "acc-rec:sess-old",
+      onSessionStateChange: (snap) => {
+        snapshots.push(snap ? { stickyKey: snap.stickyKey, sessionId: snap.sessionId } : null);
+      },
+    });
+
+    try {
+      await worker.executePrompt({ contents: [{ role: "user", parts: [{ text: "turn1" }] }] });
+      expect(snapshots.length).toBeGreaterThan(0);
+      expect(snapshots[snapshots.length - 1]).toEqual({
+        stickyKey: "acc-rec:sess-old",
+        sessionId: "sess-rec-1",
+      });
+      const countBefore = snapshots.length;
+
+      expect(await worker.recycleSession()).toBe(true);
+      const internal = worker as unknown as {
+        stickyKey?: string;
+        onSessionStateChange?: unknown;
+      };
+      expect(internal.stickyKey).toBeUndefined();
+      expect(internal.onSessionStateChange).toBeUndefined();
+
+      await worker.executePrompt({ contents: [{ role: "user", parts: [{ text: "new-stateless" }] }] });
+      expect(snapshots).toHaveLength(countBefore);
     } finally {
       await worker.resetAndClose();
       await mcpServer.stop();

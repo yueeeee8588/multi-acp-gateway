@@ -1,7 +1,12 @@
 import { describe, expect, it, spyOn } from 'bun:test';
-import { LoopbackMcpServer } from './loopback-mcp';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { AcpConnection } from './connection';
+import { LoopbackMcpServer, SessionToolBroker } from './loopback-mcp';
 import { AcpWorkerPool, DEFAULT_WORKER_IDLE_TTL_MS } from './pool';
-import { store } from '../db/store';
+import { GatewayStore, store } from '../db/store';
+import { createApp } from '../server';
 import type { AcpTransport, AcpTransportFactory } from './worker';
 import type { AccountRecord, GeminiGenerateRequest } from '../types';
 
@@ -36,6 +41,105 @@ function makeRequest(text: string): GeminiGenerateRequest {
 const dummyTransportFactory: AcpTransportFactory = () => {
   throw new Error('Transport should not be spawned in pool unit tests');
 };
+
+describe('8048 drain', () => {
+  it('rejects new generation requests and keeps management routes available', async () => {
+    const controller = new AbortController();
+    const inFlightControllers = new Map([['pending', controller]]);
+    const app = createApp({ geminiDeps: { inFlightControllers } });
+
+    const drain = app.drain();
+    const [openAi, gemini, status, repeatDrain] = await Promise.all([
+      app.fetch(new Request('http://localhost/v1/chat/completions', { method: 'POST' })),
+      app.fetch(new Request('http://localhost/v1beta/models/gemini:generateContent', { method: 'POST' })),
+      app.fetch(new Request('http://localhost/api/status')),
+      app.fetch(new Request('http://localhost/api/drain', { method: 'POST' })),
+    ]);
+    expect(openAi.status).toBe(503);
+    expect(gemini.status).toBe(503);
+    expect(status.status).toBe(200);
+    expect(repeatDrain.status).toBe(200);
+    expect(await repeatDrain.json()).toEqual({ ok: true, ...await drain });
+    expect(controller.signal.aborted).toBe(true);
+    expect(await drain).toMatchObject({ drained: true, abortedInFlight: 1 });
+    expect((await app.fetch(new Request('http://localhost/v1/messages', { method: 'POST' }))).status).toBe(503);
+  });
+
+  it('rejects both worker acquisition overloads once shutdown starts', async () => {
+    const mcpServer = new LoopbackMcpServer({ port: 0 });
+    const pool = new AcpWorkerPool({
+      mcpServer,
+      prewarmPerAccount: 0,
+      transportFactory: dummyTransportFactory,
+    });
+    const account = makeAccount('acc-shutdown');
+    const request = makeRequest('hello');
+    const model = 'gemini-4-hydrogen';
+    const shutdown = pool.shutdownAll();
+    try {
+      expect(() => pool.acquireWorker(account, model, request)).toThrow('ACP worker pool is shutting down');
+      await expect(pool.acquireWorker(account, model, request, undefined, { stateless: true }))
+        .rejects.toThrow('ACP worker pool is shutting down');
+      expect(pool.getActiveCount(account.id)).toBe(0);
+    } finally {
+      await shutdown;
+      mcpServer.stop();
+    }
+  });
+
+  it('keeps the loopback MCP listener stopped after a late registration', () => {
+    const mcpServer = new LoopbackMcpServer({ port: 0 });
+    const broker = new SessionToolBroker({ tools: [] });
+    expect(mcpServer.port).toBeGreaterThan(0);
+    mcpServer.stop();
+    try {
+      expect(() => mcpServer.registerSession(broker)).toThrow('Loopback MCP server stopped');
+      mcpServer.start();
+      expect(mcpServer.port).toBe(0);
+    } finally {
+      mcpServer.stop();
+    }
+  });
+});
+
+describe('ACP stdout reader', () => {
+  it('ignores primitive frames and continues after frame and update callback errors', async () => {
+    const updates: number[] = [];
+    const callbackError = new Error('update callback failed');
+    const connection = new AcpConnection({
+      binaryPath: '',
+      args: [],
+      cwd: '',
+      env: {},
+      onUpdate: ({ index }) => {
+        if (index === 0) throw callbackError;
+        updates.push(index as number);
+      },
+    });
+    const encoder = new TextEncoder();
+    const update = (index: number) => JSON.stringify({ method: 'session/update', params: { index } });
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoder.encode([
+          'null', 'false', '42', '"text"', update(0),
+          '{"id":{"valueOf":null,"toString":null}}', update(1), '',
+        ].join('\n')));
+        controller.enqueue(encoder.encode(update(2)));
+        controller.close();
+      },
+    });
+    const warn = spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      await connection['readStdoutLoop'](stream);
+      expect(updates).toEqual([1, 2]);
+      expect(warn).toHaveBeenCalledTimes(2);
+      expect(warn).toHaveBeenCalledWith('[acp-connection] session/update callback failed:', callbackError);
+      expect(warn).toHaveBeenCalledWith('[acp-connection] failed to handle stdout frame:', expect.any(TypeError));
+    } finally {
+      warn.mockRestore();
+    }
+  });
+});
 
 describe('AcpWorkerPool keepalive & unified sessionKey', () => {
   it('defaults idleTtlMs to 30 minutes and keeps idle workers alive until 30m elapses', async () => {
@@ -246,6 +350,223 @@ describe('AcpWorkerPool prewarm & in-memory activeCounts', () => {
       expect(pool.getPrewarmCount(acc.id)).toBe(0);
     } finally {
       await pool.shutdownAll();
+    }
+  });
+});
+
+describe('AcpWorkerPool stateless-to-stateful promotion persistence', () => {
+  it('keeps unpromoted stateless workers off disk, persists promoted snapshots under stateful + compat keys, and disables/cleans up on invalidation', async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), 'acp-pool-promote-'));
+    const tempStore = new GatewayStore(join(tempDir, 'test.db'));
+    const getSpy = spyOn(store, 'getAcpSession').mockImplementation((k) => tempStore.getAcpSession(k));
+    const upsertSpy = spyOn(store, 'upsertAcpSession').mockImplementation((r) => tempStore.upsertAcpSession(r));
+    const deleteSpy = spyOn(store, 'deleteAcpSession').mockImplementation((k) => tempStore.deleteAcpSession(k));
+    const pruneSpy = spyOn(store, 'pruneAcpSessions').mockImplementation((ttl, now) => tempStore.pruneAcpSessions(ttl, now));
+
+    let sessionSeq = 0;
+    const mockFactory: AcpTransportFactory = ({ onUpdate }): AcpTransport => {
+      let alive = true;
+      let sid = '';
+      return {
+        initialize: async () => ({ ok: true }),
+        newSession: async () => {
+          sid = `sess-promote-${++sessionSeq}`;
+          return { sessionId: sid };
+        },
+        setModel: async () => ({}),
+        prompt: async () => {
+          onUpdate({
+            sessionId: sid,
+            update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'ok' } },
+          });
+          return { stopReason: 'end_turn' };
+        },
+        cancel: async () => {},
+        close: async () => {
+          alive = false;
+        },
+        isAlive: () => alive,
+      };
+    };
+
+    const mcpServer = new LoopbackMcpServer();
+    await mcpServer.start();
+    const pool = new AcpWorkerPool({
+      mcpServer,
+      agyPath: process.execPath,
+      cleanupIntervalMs: 60_000,
+      prewarmPerAccount: 0,
+      transportFactory: mockFactory,
+    });
+
+    try {
+      const account = makeAccount('acc-promote');
+      const model = 'gemini-4-hydrogen';
+      const sessionKey = 'shared-sess';
+      const stickyKey = `${account.id}:${sessionKey}`;
+      const compatLegacyKey = `${account.id}:${model}:${sessionKey}`;
+
+      // 1. Unpromoted stateless turn must NOT persist to store
+      const req1 = makeRequest('hello');
+      const statelessLease = await pool.acquireWorker(account, model, req1, sessionKey, { stateless: true });
+      const res1 = await statelessLease.worker.executePrompt(req1);
+      expect(res1.parts).toEqual([{ text: 'ok' }]);
+      statelessLease.release();
+      expect(tempStore.getAcpSession(stickyKey)).toBeNull();
+      expect(tempStore.getAcpSession(compatLegacyKey)).toBeNull();
+
+      // 2. Stateful request reuses & promotes the idle compatible stateless worker
+      const req2: GeminiGenerateRequest = {
+        contents: [
+          { role: 'user', parts: [{ text: 'hello' }] },
+          { role: 'model', parts: [{ text: 'ok' }] },
+          { role: 'user', parts: [{ text: 'follow up' }] },
+        ],
+      };
+      const statefulLease = pool.acquireWorker(account, model, req2, sessionKey);
+      expect(statefulLease.worker).toBe(statelessLease.worker);
+      const res2 = await statefulLease.worker.executePrompt(req2);
+      expect(res2.parts).toEqual([{ text: 'ok' }]);
+      statefulLease.release();
+
+      // Promoted worker must persist under stateful stickyKey and compatLegacyKey
+      const savedPrimary = tempStore.getAcpSession(stickyKey);
+      const savedCompat = tempStore.getAcpSession(compatLegacyKey);
+      expect(savedPrimary).not.toBeNull();
+      expect(savedPrimary?.sessionId).toBe('sess-promote-1');
+      expect(savedPrimary?.committedCount).toBe(3);
+      expect(savedCompat).not.toBeNull();
+      expect(savedCompat?.sessionId).toBe('sess-promote-1');
+
+      // 3. Invalidation callback (null) cleans up both stickyKey and compatLegacyKey
+      const workerBoundary = statefulLease.worker as unknown as {
+        onSessionStateChange?: (snapshot: unknown) => void;
+      };
+      workerBoundary.onSessionStateChange?.(null);
+      expect(tempStore.getAcpSession(stickyKey)).toBeNull();
+      expect(tempStore.getAcpSession(compatLegacyKey)).toBeNull();
+
+      // 4. Eviction/cleanup disables persistence callback so late snapshots do not write back
+      const res3 = await statefulLease.worker.executePrompt({
+        contents: [
+          ...req2.contents!,
+          { role: 'model', parts: [{ text: 'ok' }] },
+          { role: 'user', parts: [{ text: 'third turn' }] },
+        ],
+      });
+      expect(res3.parts).toEqual([{ text: 'ok' }]);
+      expect(tempStore.getAcpSession(stickyKey)).not.toBeNull();
+
+      await pool.evictAccountWorkers(account.id);
+      tempStore.deleteAcpSession(stickyKey);
+      tempStore.deleteAcpSession(compatLegacyKey);
+      workerBoundary.onSessionStateChange?.({
+        stickyKey,
+        sessionId: 'sess-promote-1',
+        accountId: account.id,
+        model,
+        systemHash: 's',
+        toolsHash: 't',
+        sensitiveFilterFingerprint: '',
+        committedHashes: [],
+        committedNormalized: [],
+        committedSummaries: [],
+        midTurn: false,
+        committedCount: 0,
+        midTurnMeta: null,
+        updatedAt: Date.now(),
+      });
+      expect(tempStore.getAcpSession(stickyKey)).toBeNull();
+      expect(tempStore.getAcpSession(compatLegacyKey)).toBeNull();
+    } finally {
+      await pool.shutdownAll();
+      await mcpServer.stop();
+      getSpy.mockRestore();
+      upsertSpy.mockRestore();
+      deleteSpy.mockRestore();
+      pruneSpy.mockRestore();
+      tempStore.db.close();
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('AcpWorkerPool legacy key cleanup on non-reused acquireLease', () => {
+  it('disables persistence, deletes, and retires an idle non-reused legacy-key entry while preserving busy entries', async () => {
+    const mcpServer = new LoopbackMcpServer();
+    await mcpServer.start();
+    const pool = new AcpWorkerPool({
+      mcpServer,
+      agyPath: process.execPath,
+      cleanupIntervalMs: 60_000,
+      prewarmPerAccount: 0,
+      transportFactory: dummyTransportFactory,
+    });
+
+    try {
+      const account = makeAccount('acc-legacy-clean');
+      const model = 'gemini-4-hydrogen';
+      const internalPool = pool as unknown as {
+        entries: Map<
+          string,
+          {
+            accountId: string;
+            model: string;
+            homeDir: string;
+            proxyUrl?: string;
+            stateless: boolean;
+            persistence?: { stickyKey: string; enabled: boolean; currentMirroredLegacyKey: string | null };
+            worker: { canReuse: () => boolean; resetAndClose: () => Promise<void> };
+            inUse: boolean;
+          }
+        >;
+      };
+
+      // 1. Idle non-reused legacy-key entry must be disabled, deleted, and retired
+      const idleSessionKey = 'legacy-idle';
+      const idlePrimaryKey = JSON.stringify([false, `${account.id}:${idleSessionKey}`]);
+      const idleLegacyKey = JSON.stringify([false, `${account.id}:${model}:${idleSessionKey}`]);
+      const lease1 = pool.acquireWorker(account, model, makeRequest('one'), idleSessionKey);
+      const idleEntry = internalPool.entries.get(idlePrimaryKey)!;
+      expect(idleEntry).toBeDefined();
+      idleEntry.worker.canReuse = () => false;
+      const idleCloseSpy = spyOn(lease1.worker, 'resetAndClose').mockImplementation(async () => {});
+      lease1.release();
+      internalPool.entries.delete(idlePrimaryKey);
+      internalPool.entries.set(idleLegacyKey, idleEntry);
+
+      const lease2 = pool.acquireWorker(account, model, makeRequest('two'), idleSessionKey);
+      await Promise.resolve();
+      expect(lease2.worker).not.toBe(lease1.worker);
+      expect(idleEntry.persistence?.enabled).toBe(false);
+      expect(internalPool.entries.has(idleLegacyKey)).toBe(false);
+      expect(idleCloseSpy).toHaveBeenCalledTimes(1);
+      lease2.release();
+
+      // 2. Busy legacy-key entry must NOT be disabled, deleted, or retired
+      const busySessionKey = 'legacy-busy';
+      const busyPrimaryKey = JSON.stringify([false, `${account.id}:${busySessionKey}`]);
+      const busyLegacyKey = JSON.stringify([false, `${account.id}:${model}:${busySessionKey}`]);
+      const lease3 = pool.acquireWorker(account, model, makeRequest('three'), busySessionKey);
+      const busyEntry = internalPool.entries.get(busyPrimaryKey)!;
+      expect(busyEntry).toBeDefined();
+      expect(busyEntry.inUse).toBe(true);
+      const busyCloseSpy = spyOn(lease3.worker, 'resetAndClose').mockImplementation(async () => {});
+      internalPool.entries.delete(busyPrimaryKey);
+      internalPool.entries.set(busyLegacyKey, busyEntry);
+
+      const lease4 = pool.acquireWorker(account, model, makeRequest('four'), busySessionKey);
+      await Promise.resolve();
+      expect(lease4.worker).not.toBe(lease3.worker);
+      expect(busyEntry.persistence?.enabled).toBe(true);
+      expect(internalPool.entries.has(busyLegacyKey)).toBe(true);
+      expect(busyCloseSpy).not.toHaveBeenCalled();
+
+      lease4.release();
+      lease3.release();
+    } finally {
+      await pool.shutdownAll();
+      await mcpServer.stop();
     }
   });
 });

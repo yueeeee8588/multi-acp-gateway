@@ -1356,7 +1356,8 @@ export function createGeminiHandler(deps: GeminiHandlerDeps = {}) {
 
       let firstSettled = false;
       let streamClosed = false;
-      let streamController: ReadableStreamDefaultController<Uint8Array> | null = null;
+      let stream: ReadableStream<Uint8Array> | undefined;
+      let streamController: ReadableStreamController<Uint8Array> | null = null;
       let keepaliveTimer: ReturnType<typeof setInterval> | null = null;
       let lastWriteAt = Date.now();
       let sentAnyChunk = false;
@@ -1364,6 +1365,17 @@ export function createGeminiHandler(deps: GeminiHandlerDeps = {}) {
       let outputTextLength = 0;
       let thoughtTextLength = 0;
       let jsonArrayFirst = true;
+
+      const writeStream = (payload: string) => {
+        if (!streamController || streamClosed || !payload) return;
+        try {
+          streamController.enqueue(encoder.encode(payload));
+          lastWriteAt = Date.now();
+        } catch (err) {
+          streamController.error(err);
+          stopStream();
+        }
+      };
 
       const writeChunkToStream = (chunk: GeminiGenerateResponse) => {
         if (!streamController || streamClosed) return;
@@ -1381,22 +1393,23 @@ export function createGeminiHandler(deps: GeminiHandlerDeps = {}) {
           }
         }
         sentAnyChunk = true;
-        lastWriteAt = Date.now();
-        try {
-          if (altSse) {
-            streamController.enqueue(encoder.encode(formatSseChunk(enriched)));
-          } else {
-            const prefix = jsonArrayFirst ? '[' : ',';
-            jsonArrayFirst = false;
-            streamController.enqueue(encoder.encode(`${prefix}${JSON.stringify(enriched)}`));
-          }
-        } catch {
-          streamClosed = true;
+        if (altSse) {
+          writeStream(formatSseChunk(enriched));
+        } else {
+          const prefix = jsonArrayFirst ? '[' : ',';
+          jsonArrayFirst = false;
+          writeStream(`${prefix}${JSON.stringify(enriched)}`);
         }
       };
 
       const streamThoughtImmediately = config.streamThoughtImmediately ?? true;
+      const MAX_BUFFERED_STREAM_BYTES = 2 * 1024 * 1024;
       const bufferedChunks: GeminiGenerateResponse[] = [];
+      let bufferedBytes = 0;
+      const clearBufferedChunks = () => {
+        bufferedChunks.length = 0;
+        bufferedBytes = 0;
+      };
       let executionFinished = false;
       let executionResult: { response?: GeminiGenerateResponse; errorResponse?: Response; accountLabel?: string } | null = null;
       let executionError: unknown = null;
@@ -1417,8 +1430,20 @@ export function createGeminiHandler(deps: GeminiHandlerDeps = {}) {
       const KEEPALIVE_INTERVAL_MS = 5000;
       let earlyReleased = false;
       let earlyReleaseReason = '';
-      let contentSettledByChunk = false;
+      let shouldFlushBufferedChunks = false;
       let bufferedFlushed = false;
+      const flushBufferedChunks = () => {
+        if (bufferedFlushed) return;
+        bufferedFlushed = true;
+        try {
+          for (const chunk of bufferedChunks) {
+            if (streamClosed) break;
+            writeChunkToStream(chunk);
+          }
+        } finally {
+          clearBufferedChunks();
+        }
+      };
       let earlyReleaseTimer: ReturnType<typeof setTimeout> | null = null;
       let contentOrDoneSettled = false;
       let resolveContentOrDone!: () => void;
@@ -1461,20 +1486,13 @@ export function createGeminiHandler(deps: GeminiHandlerDeps = {}) {
           ],
           usageMetadata: buildUsageMetadata(parsedReq, undefined, outputTextLength, thoughtTextLength),
         };
-        try {
-          if (altSse) {
-            // 先给 Gemini 系客户端一个标准终止帧，再补一个显式错误事件：两类客户端都能拿到明确失败。
-            streamController.enqueue(encoder.encode(formatSseChunk(enrichChunk(finishFrame, model, responseId))));
-            sawFinishReason = true;
-            streamController.enqueue(
-              encoder.encode(`event: error\ndata: ${JSON.stringify({ error: { code, message, status } })}\n\n`),
-            );
-          } else {
-            streamController.enqueue(encoder.encode(JSON.stringify({ error: { code, message, status } })));
-          }
-          lastWriteAt = Date.now();
-        } catch {
-          streamClosed = true;
+        if (altSse) {
+          // 先发 Gemini 终止帧，再发显式错误事件。
+          writeStream(formatSseChunk(enrichChunk(finishFrame, model, responseId)));
+          sawFinishReason = true;
+          writeStream(`event: error\ndata: ${JSON.stringify({ error: { code, message, status } })}\n\n`);
+        } else {
+          writeStream(JSON.stringify({ error: { code, message, status } }));
         }
       };
       const writeStreamErrorFrame = async (errorResponse: Response) => {
@@ -1507,32 +1525,37 @@ export function createGeminiHandler(deps: GeminiHandlerDeps = {}) {
       const runPromise = executeWithRetry(
         (chunk) => {
           if (streamClosed) return;
+          if (bufferedFlushed) {
+            writeChunkToStream(chunk);
+            return;
+          }
+
+          bufferedChunks.push(chunk);
+          bufferedBytes += Buffer.byteLength(JSON.stringify(chunk));
+          const atBufferLimit = bufferedBytes >= MAX_BUFFERED_STREAM_BYTES;
           if (!firstSettled) {
-            bufferedChunks.push(chunk);
-            if (hasEffectiveContent(chunk, streamThoughtImmediately)) {
-              // 真正拿到有效正文：这才是"已向客户端下发 data 块"的判定点。
+            if (hasEffectiveContent(chunk, streamThoughtImmediately) || atBufferLimit) {
               firstSettled = true;
-              contentSettledByChunk = true;
+              shouldFlushBufferedChunks = true;
               clearEarlyReleaseTimer();
               if (!earlyReleased) {
                 resolveFirst({ ok: true, firstChunk: chunk });
               }
               signalContentOrDone();
             } else if (earlyReleaseAllowed) {
-              // 只出思考、不出正文：先把 200 响应头放行 + 起 keepalive，让客户端不干等，
-              // 但 sentAnyChunk / firstSettled 保持 false —— 换号重试依旧无感。
               releaseStreamHeadersEarly('thought');
             }
-          } else if (streamController && bufferedFlushed) {
-            writeChunkToStream(chunk);
-          } else {
-            bufferedChunks.push(chunk);
+          }
+          if (atBufferLimit) {
+            // Start synchronously if needed so an upstream burst cannot grow the buffer further.
+            if (streamController) flushBufferedChunks();
+            else stream ??= createStream();
           }
         },
         () => sentAnyChunk || firstSettled,
         () => {
           if (!firstSettled) {
-            bufferedChunks.length = 0;
+            clearBufferedChunks();
           }
         }
       )
@@ -1586,59 +1609,30 @@ export function createGeminiHandler(deps: GeminiHandlerDeps = {}) {
         abortController.signal.addEventListener('abort', onFirstAbort, { once: true });
       }
 
-      const firstOutcome = await firstReadyPromise;
-      clearEarlyReleaseTimer();
-      abortController.signal.removeEventListener('abort', onFirstAbort);
-      if (!firstOutcome.ok) {
-        inFlight.delete(requestId);
-        req.signal?.removeEventListener('abort', onReqAbort);
-        return firstOutcome.errorResponse;
-      }
-
-      const stream = new ReadableStream<Uint8Array>({
+      const streamSource: UnderlyingSource<Uint8Array> = {
         async start(controller) {
           streamController = controller;
 
+          const writeKeepalive = () => {
+            writeStream(': keepalive\n\n');
+          };
           if (altSse) {
-            if (earlyReleased) {
-              // 响应头是提前放行的：立刻写一帧 SSE 注释，让 200 + 首字节马上到达客户端。
-              try {
-                controller.enqueue(encoder.encode(': keepalive\n\n'));
-                lastWriteAt = Date.now();
-              } catch {
-                // ignore if closed
-              }
+            if (earlyReleased) writeKeepalive();
+            if (!streamClosed) {
+              keepaliveTimer = setInterval(() => {
+                if (Date.now() - lastWriteAt >= KEEPALIVE_INTERVAL_MS) writeKeepalive();
+              }, 1000);
             }
-            keepaliveTimer = setInterval(() => {
-              if (streamClosed || !streamController) return;
-              if (Date.now() - lastWriteAt >= KEEPALIVE_INTERVAL_MS) {
-                try {
-                  controller.enqueue(encoder.encode(': keepalive\n\n'));
-                  lastWriteAt = Date.now();
-                } catch {
-                  // ignore if closed
-                }
-              }
-            }, 1000);
           }
 
           try {
-            // 提前放行后这里等"有效正文到达 / 执行结束"；其余路径 firstSettled 早已为 true，立即返回。
             if (!firstSettled && !streamClosed) {
               await contentOrDonePromise;
             }
             if (streamClosed) return;
 
-            // 整个 turn 从未出现有效正文（执行已结束）→ 缓冲的思考块作废。
-            if (!contentSettledByChunk && !sentAnyChunk) {
-              bufferedChunks.length = 0;
-            }
-            // Flush any chunks buffered before stream started
-            while (bufferedChunks.length > 0 && !streamClosed) {
-              const c = bufferedChunks.shift()!;
-              writeChunkToStream(c);
-            }
-            bufferedFlushed = true;
+            if (!shouldFlushBufferedChunks) clearBufferedChunks();
+            flushBufferedChunks();
 
             if (!executionFinished) {
               await runPromise;
@@ -1705,13 +1699,7 @@ export function createGeminiHandler(deps: GeminiHandlerDeps = {}) {
               }
             }
 
-            if (!altSse && !streamClosed) {
-              if (jsonArrayFirst) {
-                controller.enqueue(encoder.encode('[]'));
-              } else {
-                controller.enqueue(encoder.encode(']'));
-              }
-            }
+            if (!altSse) writeStream(jsonArrayFirst ? '[]' : ']');
           } catch (err) {
             if (!streamClosed) {
               const msg = err instanceof Error ? err.message : String(err);
@@ -1736,9 +1724,7 @@ export function createGeminiHandler(deps: GeminiHandlerDeps = {}) {
                 // 响应头已经 200 出去了却一个 data 块都没发：流内报错，避免客户端挂在半开流上等超时。
                 writeInlineStreamErrorFrame(502, msg.slice(0, 300), 'INTERNAL');
               }
-              if (!altSse && !jsonArrayFirst) {
-                controller.enqueue(encoder.encode(']'));
-              }
+              if (!altSse && !jsonArrayFirst) writeStream(']');
             }
           } finally {
             clearEarlyReleaseTimer();
@@ -1759,23 +1745,38 @@ export function createGeminiHandler(deps: GeminiHandlerDeps = {}) {
             }
           }
         },
-        cancel() {
-          streamClosed = true;
-          streamController = null;
-          bufferedChunks.length = 0;
-          clearEarlyReleaseTimer();
-          signalContentOrDone();
-          if (keepaliveTimer) {
-            clearInterval(keepaliveTimer);
-            keepaliveTimer = null;
-          }
-          abortController.abort();
-          inFlight.delete(requestId);
-          req.signal?.removeEventListener('abort', onReqAbort);
-        },
-      });
+        cancel: stopStream,
+      };
 
-      return new Response(stream, {
+      function createStream(): ReadableStream<Uint8Array> {
+        return new ReadableStream(streamSource);
+      }
+
+      function stopStream() {
+        streamClosed = true;
+        streamController = null;
+        clearBufferedChunks();
+        clearEarlyReleaseTimer();
+        signalContentOrDone();
+        if (keepaliveTimer) {
+          clearInterval(keepaliveTimer);
+          keepaliveTimer = null;
+        }
+        abortController.abort();
+        inFlight.delete(requestId);
+        req.signal?.removeEventListener('abort', onReqAbort);
+      }
+
+      const firstOutcome = await firstReadyPromise;
+      clearEarlyReleaseTimer();
+      abortController.signal.removeEventListener('abort', onFirstAbort);
+      if (!firstOutcome.ok) {
+        inFlight.delete(requestId);
+        req.signal?.removeEventListener('abort', onReqAbort);
+        return firstOutcome.errorResponse;
+      }
+
+      return new Response(stream ??= createStream(), {
         status: 200,
         headers: {
           'Content-Type': altSse ? 'text/event-stream; charset=utf-8' : 'application/json; charset=utf-8',

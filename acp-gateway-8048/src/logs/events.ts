@@ -3,6 +3,7 @@ import { store } from '../db/store';
 import type { AccountRecord, RequestAttempt, RequestLog, SseEventPayload, SseEventType } from '../types';
 
 const encoder = new TextEncoder();
+const MAX_PENDING_EVENTS = 32;
 
 function getMaxLogsRetained(): number {
   const raw = getConfig().maxLogsRetained;
@@ -61,22 +62,39 @@ export class EventBus {
     return encoder.encode(line);
   }
 
+  private disconnect(controller: ReadableStreamDefaultController<Uint8Array>): void {
+    this.unsubscribe(controller);
+    try {
+      controller.close();
+    } catch {
+      // The client may already have cancelled or closed the stream.
+    }
+  }
+
+  private enqueue(controller: ReadableStreamDefaultController<Uint8Array>, bytes: Uint8Array): void {
+    try {
+      const desiredSize = controller.desiredSize;
+      // The events stream uses the default count-based queuing strategy.
+      if (typeof desiredSize !== 'number' || desiredSize > 1 - MAX_PENDING_EVENTS) {
+        controller.enqueue(bytes);
+        return;
+      }
+    } catch {
+      // A disconnected client can reject writes before cancellation is observed.
+    }
+    this.disconnect(controller);
+  }
+
   private sendTo(
     controller: ReadableStreamDefaultController<Uint8Array>,
     type: SseEventType,
     data: unknown
-  ): boolean {
+  ): void {
+    if (!this.subscribers.has(controller)) return;
     try {
-      const bytes = this.formatSse({
-        type,
-        data,
-        timestamp: Date.now(),
-      });
-      controller.enqueue(bytes);
-      return true;
+      this.enqueue(controller, this.formatSse({ type, data, timestamp: Date.now() }));
     } catch {
-      this.subscribers.delete(controller);
-      return false;
+      this.disconnect(controller);
     }
   }
 
@@ -92,11 +110,7 @@ export class EventBus {
       timestamp: Date.now(),
     });
     for (const controller of this.subscribers) {
-      try {
-        controller.enqueue(bytes);
-      } catch {
-        this.subscribers.delete(controller);
-      }
+      this.enqueue(controller, bytes);
     }
   }
 

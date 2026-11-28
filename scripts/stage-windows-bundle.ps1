@@ -7,7 +7,7 @@ param(
 
     [string]$OutputDir = '',
 
-    [string]$BunVersion = '1.2.15',
+    [string]$BunVersion = '1.4.5',
 
     [string]$NodeVersion = '22.16.0',
 
@@ -104,6 +104,7 @@ function Ensure-PortableBun {
         [Parameter(Mandatory = $true)][string]$DestExePath
     )
     $knownHashes = @{
+        '1.4.5' = '815ab45ec7f549abf87e6869584b506eab088e24225683957b7e150b47d6de30'
         '1.2.15' = '3cbfc2668aebd86718b9414fd4a4b4b1ec34a21ca544517310833563a937272f'
     }
 

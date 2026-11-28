@@ -63,6 +63,9 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
 Name: "autostart"; Description: "Launch {#AppName} tray on Windows startup"; GroupDescription: "Startup:"
 
+[InstallDelete]
+Type: filesandordirs; Name: "{app}\services\acp-gateway-8048\src"
+
 [Files]
 Source: "{#SourceDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "app.ico"; DestDir: "{app}"; Flags: ignoreversion

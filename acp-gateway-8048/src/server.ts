@@ -25,6 +25,7 @@ import { WorkerError } from './acp/worker';
 import {
   getConfig,
   getPublicConfig,
+  resolveEffectiveProxy,
   updateConfig,
   validateRiskControlPatch,
   validateSensitiveFilterPatch,
@@ -294,7 +295,7 @@ export function createApp(options: AppOptions = {}) {
     : new AcpWorkerPool({
         mcpServer: mcpServer!,
         agyPath: config.agyPath || undefined,
-        softErrorCutoffMs: config.softErrorCutoffMs,
+        softErrorCutoffMs: () => getConfig().softErrorCutoffMs,
         tryAcquireWorkerSpawn: (accountId) =>
           (accountScheduler ?? globalAccountScheduler).tryConsumeWorkerSpawn(accountId),
       });
@@ -346,7 +347,7 @@ export function createApp(options: AppOptions = {}) {
     reason = 'Gateway restarting',
   ): Promise<{ drained: boolean; cancelledPending: number; abortedInFlight: number }> => {
     if (drainPromise) return drainPromise;
-    drainPromise = (async () => {
+    drainPromise = Promise.resolve().then(async () => {
       let abortedInFlight = 0;
       const controllers = Array.from(inFlightControllers.values());
       inFlightControllers.clear();
@@ -363,7 +364,7 @@ export function createApp(options: AppOptions = {}) {
       const cancelledPending = mcpServer ? mcpServer.stop(reason) : 0;
       await acpPool?.shutdownAll();
       return { drained: true, cancelledPending, abortedInFlight };
-    })();
+    });
     return drainPromise;
   };
 
@@ -402,6 +403,10 @@ export function createApp(options: AppOptions = {}) {
 
   async function routeRequest(req: Request): Promise<Response> {
     const url = new URL(req.url);
+
+    if (drainPromise && (url.pathname.startsWith('/v1/') || url.pathname.startsWith('/v1beta/'))) {
+      return Response.json({ error: 'Service Unavailable', message: 'Gateway is draining' }, { status: 503 });
+    }
 
     try {
       if (url.pathname.startsWith('/v1beta')) {
@@ -726,7 +731,10 @@ export function createApp(options: AppOptions = {}) {
             updatedAt: Date.now(),
           };
           store.upsertAccount(updated);
-          if (updated.status === 'ready' && (patch.status === 'ready' || !('modelAccessRule' in patch))) {
+          const becameReady = patch.status === 'ready' && existing.status !== 'ready';
+          const credentialsChanged = updated.homeDir !== existing.homeDir;
+          const proxyChanged = resolveEffectiveProxy(updated.proxyUrl) !== resolveEffectiveProxy(existing.proxyUrl);
+          if (becameReady || credentialsChanged || proxyChanged) {
             if (accountScheduler) {
               accountScheduler.clearCooldown(accountId, '*', 'global');
             } else {
@@ -1122,10 +1130,12 @@ if (import.meta.main) {
   // 认证自愈：出口网络恢复后，把因认证失败被下线的账号重新拉回可用池，
   // 避免网络抖动一次就把整池账号留在 auth_required。
   const authRecoveryManager = new AccountManager();
-  const authRecoveryTimer = setInterval(() => {
-    void (async () => {
+  let authRecoveryInFlight = false;
+  const authRecoveryTimer = setInterval(async () => {
+    if (authRecoveryInFlight) return;
+    authRecoveryInFlight = true;
+    try {
       const pending = store.listAccounts().filter((account) => account.status === 'auth_required');
-      if (pending.length === 0) return;
       for (const account of pending) {
         try {
           await authRecoveryManager.refreshAccount(account.id);
@@ -1133,7 +1143,11 @@ if (import.meta.main) {
           // 刷新失败就等下一轮，不影响主服务
         }
       }
-    })();
+    } catch (err) {
+      console.error('[acp-8048] auth recovery failed:', err);
+    } finally {
+      authRecoveryInFlight = false;
+    }
   }, 10 * 60_000);
   if (typeof authRecoveryTimer.unref === 'function') authRecoveryTimer.unref();
 

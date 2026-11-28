@@ -465,6 +465,15 @@ export class AcpConnection {
     const decoder = new TextDecoder("utf-8");
     let buffer = "";
 
+    const dispatchFrame = (line: string): void => {
+      if (!line) return;
+      try {
+        this.handleFrame(line);
+      } catch (err) {
+        console.warn("[acp-connection] failed to handle stdout frame:", err);
+      }
+    };
+
     try {
       while (true) {
         const { done, value } = await reader.read();
@@ -475,16 +484,11 @@ export class AcpConnection {
         while (newlineIdx !== -1) {
           const line = buffer.slice(0, newlineIdx).trim();
           buffer = buffer.slice(newlineIdx + 1);
-          if (line.length > 0) {
-            this.handleFrame(line);
-          }
+          dispatchFrame(line);
           newlineIdx = buffer.indexOf("\n");
         }
       }
-      const tail = (buffer + decoder.decode()).trim();
-      if (tail.length > 0) {
-        this.handleFrame(tail);
-      }
+      dispatchFrame((buffer + decoder.decode()).trim());
     } catch {
       // Stream closed or process terminated
     } finally {
@@ -525,12 +529,14 @@ export class AcpConnection {
   }
 
   private handleFrame(line: string): void {
-    let msg: Record<string, unknown>;
+    let parsed: unknown;
     try {
-      msg = JSON.parse(line) as Record<string, unknown>;
+      parsed = JSON.parse(line);
     } catch {
       return;
     }
+    if (!parsed || typeof parsed !== "object") return;
+    const msg = parsed as Record<string, unknown>;
 
     if (typeof msg.method === "string") {
       if (msg.id !== undefined && msg.id !== null) {
@@ -563,7 +569,11 @@ export class AcpConnection {
 
   private handleNotification(method: string, params: unknown): void {
     if (method === "session/update" && params && typeof params === "object") {
-      this.onUpdate?.(params as Record<string, unknown>);
+      try {
+        this.onUpdate?.(params as Record<string, unknown>);
+      } catch (err) {
+        console.warn("[acp-connection] session/update callback failed:", err);
+      }
     }
   }
 

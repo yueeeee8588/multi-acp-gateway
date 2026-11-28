@@ -4,14 +4,17 @@ import os from "node:os";
 import path from "node:path";
 import {
   ACP_PROBE_TIMEOUT_MS,
+  AccountManager,
   __setAcpProbeDepsForTest,
   __setTierDetectFetcher,
   accountManager,
   classifyAcpProbeError,
 } from "../src/accounts/manager";
+import { createUsageReader, type UsageExecOutput } from "../src/accounts/quota";
 import { AccountScheduler } from "../src/accounts/scheduler";
 import { invalidateConfigCache, updateConfig } from "../src/config/settings";
 import { store } from "../src/db/store";
+import { eventBus } from "../src/logs/events";
 import { createApp } from "../src/server";
 import type { AccountRecord, AccountStatus } from "../src/types";
 
@@ -19,14 +22,17 @@ const tempDirs: string[] = [];
 const createdAccountIds: string[] = [];
 const originalFetch = globalThis.fetch;
 
-function createTempAccount(status: AccountStatus = "ready"): AccountRecord {
+function createTempAccount(status: AccountStatus = "ready", accessToken?: string): AccountRecord {
   const id = `test-probe-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
   const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), "agy-probe-test-"));
   const oauthDir = path.join(homeDir, ".gemini", "antigravity-cli");
   fs.mkdirSync(oauthDir, { recursive: true });
   fs.writeFileSync(
     path.join(oauthDir, "antigravity-oauth-token"),
-    JSON.stringify({ refresh_token: "test-refresh-token" }),
+    JSON.stringify({
+      refresh_token: "test-refresh-token",
+      ...(accessToken ? { access_token: accessToken, expiry: new Date(Date.now() + 600_000).toISOString() } : {}),
+    }),
     "utf8"
   );
 
@@ -54,6 +60,21 @@ function createTempAccount(status: AccountStatus = "ready"): AccountRecord {
   tempDirs.push(homeDir);
   createdAccountIds.push(id);
   return acc;
+}
+
+function mockAcpProbe(onPrompt: () => void = () => {}): void {
+  __setAcpProbeDepsForTest({
+    probeExit: async () => ({ exitIp: "1.2.3.4", exitCountry: "JP" }),
+    createConnection: () => ({
+      async initialize() {},
+      async request<T = unknown>(method: string): Promise<T> {
+        if (method === "session/new") return { sessionId: "test-probe" } as T;
+        if (method === "session/prompt") onPrompt();
+        return {} as T;
+      },
+      close() {},
+    }),
+  });
 }
 
 function mockOAuthAndTierFetch(): void {
@@ -177,6 +198,166 @@ describe("AccountManager.updateAccount statusReason handling", () => {
     expect(updated).not.toBeNull();
     expect(updated!.status).toBe("disabled");
     expect(updated!.statusReason).toBe(reason);
+  });
+});
+
+describe("AccountManager OAuth renewal", () => {
+  it("shares a single token exchange across quota, account refresh, and tier detection", async () => {
+    const acc = createTempAccount();
+    const exchangeStarted = Promise.withResolvers<void>();
+    const finishExchange = Promise.withResolvers<void>();
+    const refreshTokens: string[] = [];
+    mockOAuthAndTierFetch();
+    mockAcpProbe();
+    globalThis.fetch = (async (_url: unknown, init: RequestInit) => {
+      refreshTokens.push(new URLSearchParams(String(init.body)).get("refresh_token")!);
+      exchangeStarted.resolve();
+      await finishExchange.promise;
+      return Response.json({ access_token: "new-access", refresh_token: "rotated-refresh", expires_in: 3600 });
+    }) as unknown as typeof fetch;
+    const listAccounts = spyOn(store, "listAccounts").mockImplementation(() => [store.getAccount(acc.id)!]);
+    const quotaManager = new AccountManager();
+    quotaManager.setUsageReaderForTest(createUsageReader({
+      resolveBinary: () => "agy.exe",
+      checkProxy: async () => ({ ok: true }),
+      executor: async () => ({ exitCode: 7, stdout: "", stderr: "usage child ran" }),
+    }));
+    const quota = quotaManager.refreshAccountQuota(acc.id);
+    try {
+      await exchangeStarted.promise;
+      const refresh = accountManager.refreshAccount(acc.id);
+      const tiers = new AccountManager().detectAllAccountTiers();
+      finishExchange.resolve();
+      const [quotaResult, refreshResult, tierResult] = await Promise.all([quota, refresh, tiers]);
+      expect(refreshTokens).toEqual(["test-refresh-token"]);
+      expect(quotaResult?.quota?.error).toContain("usage child ran");
+      expect(refreshResult?.status).toBe("ready");
+      expect(tierResult.updated).toBe(1);
+      const tokenFile = path.join(acc.homeDir, ".gemini", "antigravity-cli", "antigravity-oauth-token");
+      expect(JSON.parse(fs.readFileSync(tokenFile, "utf8")).token.refresh_token).toBe("rotated-refresh");
+    } finally {
+      finishExchange.resolve();
+      listAccounts.mockRestore();
+    }
+  });
+
+  it("publishes the newly required authentication status to an accounts stream", async () => {
+    const missing = createTempAccount();
+    fs.unlinkSync(path.join(missing.homeDir, ".gemini", "antigravity-cli", "antigravity-oauth-token"));
+    const revoked = createTempAccount();
+    globalThis.fetch = (async () => Response.json({ error: "invalid_grant" }, { status: 400 })) as unknown as typeof fetch;
+    const listAccounts = spyOn(store, "listAccounts").mockImplementation(() =>
+      [store.getAccount(missing.id)!, store.getAccount(revoked.id)!]);
+    let subscription!: ReadableStreamDefaultController<Uint8Array>;
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        subscription = controller;
+        eventBus.subscribe(controller);
+      },
+    });
+    try {
+      await accountManager.detectAllAccountTiers();
+      eventBus.unsubscribe(subscription);
+      subscription.close();
+      const updates = (await new Response(stream).text()).split("\n\n")
+        .filter((event) => event.startsWith("event: accounts\n"));
+      expect(updates).toHaveLength(2);
+      const updated = JSON.parse(updates[1].split("\ndata: ")[1]).data as AccountRecord[];
+      expect(updated.map(({ id, status }) => ({ id, status }))).toEqual([
+        { id: missing.id, status: "auth_required" },
+        { id: revoked.id, status: "auth_required" },
+      ]);
+    } finally {
+      eventBus.unsubscribe(subscription);
+      listAccounts.mockRestore();
+    }
+  });
+
+  it.each([
+    ["timeout", new DOMException("upstream timed out", "TimeoutError")],
+    ["network", new TypeError("ECONNRESET")],
+    ["HTTP 429", 429],
+    ["HTTP 500", 500],
+    ["HTTP 503", 503],
+  ] as const)("returns a transient result and preserves the stored account on %s", async (_label, failure) => {
+    globalThis.fetch = (async () => {
+      if (typeof failure !== "number") throw failure;
+      return Response.json({ error: "temporarily_unavailable" }, { status: failure });
+    }) as unknown as typeof fetch;
+    mockAcpProbe(() => { throw new Error("ACP probe must not run after failed renewal"); });
+
+    for (const status of ["ready", "restricted", "auth_required"] as const) {
+      const acc = createTempAccount(status);
+      const before = store.getAccount(acc.id);
+      const updated = await accountManager.refreshAccount(acc.id);
+      expect(updated?.status).toBe(status);
+      expect(updated?.statusReason).toStartWith("OAUTH_REFRESH_TRANSIENT:");
+      expect(store.getAccount(acc.id)).toEqual(before);
+    }
+  });
+
+  it.each([400, 401, 403])("marks the account auth_required on permanent OAuth HTTP %i", async (status) => {
+    const acc = createTempAccount();
+    globalThis.fetch = (async () => Response.json(
+      { error: status === 400 ? "invalid_grant" : "access_denied" }, { status },
+    )) as unknown as typeof fetch;
+    mockAcpProbe();
+
+    const updated = await accountManager.refreshAccount(acc.id);
+
+    expect(updated?.status).toBe("auth_required");
+    expect(updated?.statusReason).toContain("OAuth refresh failed");
+    expect(store.getAccount(acc.id)?.status).toBe("auth_required");
+  });
+});
+
+describe("AccountManager quota slots", () => {
+  it("holds four slots after foreground timeout until a background check ends", async () => {
+    const accounts = Array.from({ length: 5 }, () => createTempAccount("ready", "valid-access"));
+    const start = accounts.map(() => Promise.withResolvers<void>());
+    const finish = accounts.map(() => Promise.withResolvers<UsageExecOutput>());
+    const output = { exitCode: 1, stdout: "", stderr: "usage child finished" };
+    let started = 0;
+    let active = 0;
+    let peak = 0;
+    const reader = createUsageReader({
+      foregroundWaitMs: 15,
+      resolveBinary: () => "agy.exe",
+      checkProxy: async () => ({ ok: true }),
+      executor: async () => {
+        const index = started++;
+        active++;
+        peak = Math.max(peak, active);
+        start[index].resolve();
+        try {
+          return await finish[index].promise;
+        } finally {
+          active--;
+        }
+      },
+    });
+    const firstManager = new AccountManager();
+    const secondManager = new AccountManager();
+    firstManager.setUsageReaderForTest(reader);
+    secondManager.setUsageReaderForTest(reader);
+    const jobs = accounts.map((acc, index) =>
+      (index === 4 ? secondManager : firstManager).refreshAccountQuota(acc.id));
+    try {
+      const foreground = await Promise.all(jobs.slice(0, 4));
+      for (const result of foreground) expect(result?.quota?.error).toStartWith("STILL_READING:");
+      expect(started).toBe(4);
+      expect(active).toBe(4);
+      expect(firstManager.refreshAccountQuota(accounts[0].id)).toBe(jobs[0]);
+
+      finish[0].resolve({ ...output, timedOut: true });
+      await start[4].promise;
+      expect(peak).toBe(4);
+      finish[4].resolve(output);
+      expect((await jobs[4])?.quota?.error).toContain("usage child finished");
+    } finally {
+      finish.forEach(({ resolve }) => resolve(output));
+      await Promise.allSettled(jobs);
+    }
   });
 });
 
@@ -346,6 +527,48 @@ describe("AccountManager.refreshAccount ACP probe", () => {
     expect(updated).not.toBeNull();
     expect(updated!.status).toBe("restricted");
     expect(updated!.statusReason).toBe(tosWarning);
+  });
+
+  it.each([false, true])("preserves a global cooldown written during a successful probe (preexisting: %s)", async (preexisting) => {
+    const acc = createTempAccount("restricted");
+    mockOAuthAndTierFetch();
+    const cooldown = {
+      accountId: acc.id,
+      family: "*",
+      scopeType: "global" as const,
+      reason: "RESTRICTED",
+      untilMs: Date.now() + 6 * 60 * 60 * 1000,
+      consecutiveFailures: 1,
+      lastError: "HTTP 403 Forbidden",
+    };
+    if (preexisting) store.upsertCooldown(cooldown);
+    mockAcpProbe(() => store.upsertCooldown(cooldown));
+
+    const updated = await accountManager.refreshAccount(acc.id);
+
+    expect(updated?.status).toBe("ready");
+    expect(store.listCooldowns().find((entry) => entry.accountId === acc.id)).toEqual(cooldown);
+  });
+
+  it("preserves the old global cooldown when an ACP failure leaves the status ready", async () => {
+    const acc = createTempAccount();
+    mockOAuthAndTierFetch();
+    store.upsertCooldown({
+      accountId: acc.id,
+      family: "*",
+      scopeType: "global",
+      reason: "RESTRICTED",
+      untilMs: Date.now() + 60_000,
+      consecutiveFailures: 1,
+      lastError: "HTTP 403 Forbidden",
+    });
+    mockAcpProbe(() => { throw new Error("ECONNRESET socket hang up"); });
+
+    const updated = await accountManager.refreshAccount(acc.id);
+
+    expect(updated?.status).toBe("ready");
+    expect(updated?.statusReason).toContain("ECONNRESET");
+    expect(store.listCooldowns().some((entry) => entry.accountId === acc.id)).toBe(true);
   });
 
   it("clears 6h *:global cooldown and allows immediate acquireAccountLease when refreshAccount recovers to ready", async () => {
